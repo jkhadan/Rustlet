@@ -1,0 +1,14 @@
+[package]
+name = "rustlet"
+version = "0.1.0"
+edition = "2024"
+authors = ["Seth Linares <sethlinares1@gmail.com>"]
+description = "A TUI file explorer for generating directory trees for LLMs"
+license = "MIT"
+repository = "https://github.com/seth-linares/RepoViewer"
+homepage = "https://github.com/seth-linares/RepoViewer"
+readme = "README.md"
+keywords = ["tui", "file-explorer", "llm", "directory-tree", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
