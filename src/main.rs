@@ -38,12 +38,13 @@ fn drop_dangerous_capabilities() -> Result<(), caps::errors::CapsError> {
         Capability::CAP_SETUID,
     ].into_iter().collect();
 
-    // clear all capabilities
-    caps::clear(None, CapSet::Effective)?;
-    caps::clear(None, CapSet::Permitted)?;
+    // Clear inheritable (we don't want children to inherit capabilities)
     caps::clear(None, CapSet::Inheritable)?;
-
-    // Set the capabilities all at once
+    
+    // Set both permitted and effective to our keep_caps
+    // Permitted defines what we're allowed to have
+    // Effective defines what we can actually use
+    caps::set(None, CapSet::Permitted, &keep_caps)?;
     caps::set(None, CapSet::Effective, &keep_caps)?;
 
     Ok(())
