@@ -40,6 +40,9 @@ fn drop_dangerous_capabilities() -> Result<(), caps::errors::CapsError> {
 
     // Clear inheritable (we don't want children to inherit capabilities)
     caps::clear(None, CapSet::Inheritable)?;
+    caps::clear(None, CapSet::Permitted)?;
+    caps::clear(None, CapSet::Inheritable)?;
+    
     
     // Set both permitted and effective to our keep_caps
     // Permitted defines what we're allowed to have
