@@ -1,4 +1,5 @@
 use std::ffi::CString;
+use std::fs::write;
 use caps::{CapSet, Capability, CapsHashSet};
 use nix::
 {
@@ -6,7 +7,6 @@ use nix::
     sched::{CloneFlags, clone}, 
     unistd::Pid, sys::signal::Signal
 };
-use std::fs::write;
 
 fn create_pid() -> isize {
     println!("New process created with PID: {}", std::process::id());
@@ -18,38 +18,33 @@ fn create_pid() -> isize {
     0
 }
 
+fn setup_user_namespace(pid: Pid) -> Result<(), Box<dyn std::error::Error>> {
+    let uid_map = format!("0 {} 1", nix::unistd::getuid());
+    let gid_map = format!("0 {} 1", nix::unistd::getgid());
+
+    write(format!("/proc/{}/uid_map", pid), uid_map)?;
+    write(format!("/proc/{}/setgroups", pid), "deny")?; // Prevent privilege escalation
+    write(format!("/proc/{}/gid_map", pid), gid_map)?;
+
+    Ok(())
+}
+
 fn drop_dangerous_capabilities() -> Result<(), caps::errors::CapsError> {
-    let keep_caps = vec![
+    let keep_caps: CapsHashSet = [
         Capability::CAP_CHOWN,
         Capability::CAP_DAC_OVERRIDE,
         Capability::CAP_FOWNER,
         Capability::CAP_SETGID,
         Capability::CAP_SETUID,
-    ];
+    ].iter().cloned().collect();
 
     // clear all capabilities
     caps::clear(None, CapSet::Effective)?;
     caps::clear(None, CapSet::Permitted)?;
     caps::clear(None, CapSet::Inheritable)?;
 
-    /*
-        CapsHashSet is a type alias: 
-            - `pub type CapsHashSet = std::collections::HashSet<Capability>`
-        
-        The Capability enum is defined by caps and contains privileges that a process
-        can possess (which we can add to our CapsHashSet).
-
-        Examples:
-            - CAP_SYS_ADMIN: Used for a wide range of administrative operations.
-            - CAP_NET_BIND_SERVICE: Allows a process to bind to privileged TCP/UDP ports (those below 1024).
-            - CAP_KILL: Allows a process to send signals to any other process. 
-    */
-    let caps: CapsHashSet = CapsHashSet::new(); 
-
-    // Add back essential capabilities
-    for cap in keep_caps {
-        caps::set(None, CapSet::Effective, &caps)?;
-    }
+    // Set the capabilities all at once
+    caps::set(None, CapSet::Effective, &keep_caps)?;
 
     Ok(())
 }
