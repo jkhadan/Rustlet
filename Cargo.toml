@@ -12,4 +12,6 @@ keywords = ["", "", "", "", ""]
 categories = ["", ""]
 
 [dependencies]
-nix = { version = "0.29", features = ["process", "mount", "sched", "signal", "user"] }
+nix = { version = "0.30.1", features = ["process", "mount", "sched", "signal", "user", "term"] }
+caps = "0.5.5"
+thiserror = "2.0.16"

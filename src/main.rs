@@ -1,9 +1,11 @@
-use nix::sched::{CloneFlags, clone};
-use nix::unistd::Pid;
-use nix::sys::signal::Signal;
 use std::ffi::CString;
-use caps::{CapSet, Capability}
-use nix::pty::{openpty, PtyMaster};
+use caps::{CapSet, Capability, CapsHashSet};
+use nix::
+{
+    pty::{openpty, PtyMaster}, 
+    sched::{CloneFlags, clone}, 
+    unistd::Pid, sys::signal::Signal
+};
 use std::fs::write;
 
 fn create_pid() -> isize {
@@ -30,9 +32,23 @@ fn drop_dangerous_capabilities() -> Result<(), caps::errors::CapsError> {
     caps::clear(None, CapSet::Permitted)?;
     caps::clear(None, CapSet::Inheritable)?;
 
+    /*
+        CapsHashSet is a type alias: 
+            - `pub type CapsHashSet = std::collections::HashSet<Capability>`
+        
+        The Capability enum is defined by caps and contains privileges that a process
+        can possess (which we can add to our CapsHashSet).
+
+        Examples:
+            - CAP_SYS_ADMIN: Used for a wide range of administrative operations.
+            - CAP_NET_BIND_SERVICE: Allows a process to bind to privileged TCP/UDP ports (those below 1024).
+            - CAP_KILL: Allows a process to send signals to any other process. 
+    */
+    let caps: CapsHashSet = CapsHashSet::new(); 
+
     // Add back essential capabilities
     for cap in keep_caps {
-        caps::set(None, CapSet::Effective, cap)?;
+        caps::set(None, CapSet::Effective, &caps)?;
     }
 
     Ok(())
