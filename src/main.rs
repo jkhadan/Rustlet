@@ -36,7 +36,7 @@ fn drop_dangerous_capabilities() -> Result<(), caps::errors::CapsError> {
         Capability::CAP_FOWNER,
         Capability::CAP_SETGID,
         Capability::CAP_SETUID,
-    ].iter().cloned().collect();
+    ].into_iter().collect();
 
     // clear all capabilities
     caps::clear(None, CapSet::Effective)?;
