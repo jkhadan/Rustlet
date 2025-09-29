@@ -11,11 +11,9 @@ pub fn setup_secure_rootfs(container_root: &str) -> Result<(), AppError> {
         return Err(AppError::ContainerDNE(container_root.to_string()))
     }
 
-    // Mount new root filesystem
     mount(Some(container_root), "/mnt", 
           Some("bind"), MsFlags::MS_BIND, None::<&str>)?;
 
-    // Create old root directory
     create_dir_all("/mnt/old_root")?;
 
     // Change to new root before pivot_root

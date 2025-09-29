@@ -31,7 +31,7 @@ pub fn create_pid(container_root: &str) -> isize {
         return -1;
     }
 
-    // Debug: List contents of key directories
+    // List contents of key directories
     println!("Debug: Checking filesystem after pivot_root...");
     println!("Contents of /:");
     if let Ok(entries) = std::fs::read_dir("/") {
@@ -106,12 +106,11 @@ pub fn create_container(container_root: &str) -> Result<Pid, AppError> {
     | CloneFlags::CLONE_NEWNET 
     | CloneFlags::CLONE_NEWCGROUP;
 
-    // Capture container_root for the closure
     let container_root = container_root.to_string();
     
     let pid = unsafe {
         clone(
-            Box::new(move || create_pid(&container_root)), // Using move to capture container_root
+            Box::new(move || create_pid(&container_root)),
             &mut stack,
             flags,
             Some(Signal::SIGCHLD as i32) // to notify the parent of the child's termination (prevent zombies)
@@ -121,7 +120,6 @@ pub fn create_container(container_root: &str) -> Result<Pid, AppError> {
     let container_pid = pid?;
     println!("Created new PID namespace with PID: {}", container_pid);
 
-    // Setup user namespace mapping from parent process
     if let Err(e) = security::setup_user_namespace(container_pid) {
         eprintln!("Failed to setup user namespace: {}", e);
     }

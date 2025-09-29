@@ -6,7 +6,6 @@ use crate::app_error::AppError;
 pub fn setup_container_filesystem(container_root: &str) -> Result<(), AppError> {
     println!("Setting up container filesystem at {}", container_root);
     
-    // Create directory structure
     let dirs = [
         "bin", "lib", "lib64", "proc", "sys", "dev", "etc", "tmp", "usr/bin"
     ];
@@ -17,7 +16,6 @@ pub fn setup_container_filesystem(container_root: &str) -> Result<(), AppError> 
         println!("Created directory: {}", path.display());
     }
 
-    // List of essential binaries to copy
     let binaries = ["/bin/bash", "/bin/sh", "/bin/ls", "/bin/cat", "/bin/echo"];
     
     for binary in &binaries {
@@ -68,8 +66,6 @@ pub fn copy_shared_libraries(binary: &str, container_root: &str) -> Result<(), A
 
     // Parse ldd output to extract library paths
     for line in stdout.lines() {
-        // Look for lines like: "libreadline.so.8 => /lib/x86_64-linux-gnu/libreadline.so.8 (0x...)"
-        // or: "/lib64/ld-linux-x86-64.so.2 (0x...)"
         if let Some(path) = extract_library_path(line) {
             if Path::new(&path).exists() {
                 libraries.insert(path);
@@ -102,7 +98,6 @@ fn extract_library_path(line: &str) -> Option<String> {
             let path = line[..space_pos].trim();
             return Some(path.to_string());
         }
-        // Handle lines that might not have spaces (shouldn't happen with ldd, but just in case)
         if line.starts_with('/') && !line.contains('(') {
             return Some(line.to_string());
         }
@@ -122,7 +117,6 @@ fn extract_library_path(line: &str) -> Option<String> {
         }
     }
     
-    // Handle VDSO and other special cases by ignoring them
     if line.contains("linux-vdso.so") || line.contains("(0x") && !line.contains(" => ") {
         return None;
     }
