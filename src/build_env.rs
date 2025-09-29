@@ -24,7 +24,6 @@ pub fn setup_container_filesystem(container_root: &str) -> Result<(), AppError> 
         if Path::new(binary).exists() {
             let dest = Path::new(container_root).join(&binary[1..]); // Remove leading '/'
             
-            // Create parent directory if it doesn't exist
             if let Some(parent) = dest.parent() {
                 create_dir_all(parent)?;
             }
@@ -36,10 +35,8 @@ pub fn setup_container_filesystem(container_root: &str) -> Result<(), AppError> 
         }
     }
 
-    // Copy shared library dependencies
     copy_shared_libraries("/bin/bash", container_root)?;
 
-    // Create basic /etc files
     create_etc_files(container_root)?;
 
     println!("Container filesystem setup completed successfully");

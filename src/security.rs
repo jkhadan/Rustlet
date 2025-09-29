@@ -15,7 +15,7 @@ pub fn setup_user_namespace(pid: Pid) -> Result<(), AppError> {
 }
 
 pub fn drop_dangerous_capabilities() -> Result<(), AppError> {
-    // Clear inheritable (we don't want children to inherit capabilities)
+    // Clear inheritable (we don't want children to inherit capabilities, and non-root users shouldn't have any capabilities)
     caps::clear(None, CapSet::Inheritable)?;
     caps::clear(None, CapSet::Permitted)?;
     caps::clear(None, CapSet::Inheritable)?;
