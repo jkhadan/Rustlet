@@ -2,16 +2,15 @@
 name = "rustlet"
 version = "0.1.0"
 edition = "2024"
-authors = ["Seth Linares <sethlinares1@gmail.com>", "James Khadan <jameskhadan@gmail.com>"]
-description = ""
-license = ""
+authors = ["James Khadan <jameskhadan@gmail.com>"]
+description = "An OCI-Compliant Rust-based containerization software"
+license = "MIT"
 repository = "https://github.com/jkhadan/Rustlet"
 homepage = "https://github.com/jkhadan/Rustlet"
 readme = "README.md"
-keywords = ["", "", "", "", ""]
-categories = ["", ""]
+keywords = ["Containerization", "OCI-Compliant"]
 
 [dependencies]
 nix = { version = "0.30.1", features = ["process", "mount", "sched", "signal", "user", "term", "fs"] }
 caps = "0.5.5"
-thiserror = "2.0.16"
+thiserror = "2.0.17"
