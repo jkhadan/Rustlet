@@ -8,7 +8,7 @@ use nix::{
     sys::wait::{waitpid, WaitStatus}
 };
 use crate::app_error::AppError;
-use crate::{isolate_filesystem, security};
+use crate::{isolate_filesystem, security, cgroups};
 
 pub fn create_pid(container_root: &str) -> isize {
     println!("New process created with PID: {}", std::process::id());
@@ -106,6 +106,9 @@ pub fn create_container(container_root: &str) -> Result<Pid, AppError> {
     | CloneFlags::CLONE_NEWNET 
     | CloneFlags::CLONE_NEWCGROUP;
 
+    // Generate a unique container ID
+    let container_id = format!("{}", std::process::id());
+
     // Capture container_root for the closure
     let container_root = container_root.to_string();
     
@@ -126,6 +129,23 @@ pub fn create_container(container_root: &str) -> Result<Pid, AppError> {
         eprintln!("Failed to setup user namespace: {}", e);
     }
 
+    // Setup cgroups for resource limits
+    let cgroup_manager = match cgroups::setup_container_cgroup(&container_id, container_pid) {
+        Ok(manager) => {
+            println!("Successfully configured cgroup resource limits");
+            Some(manager)
+        }
+        Err(e) => {
+            eprintln!("Failed to setup cgroups: {}. Container will run without resource limits.", e);
+            None
+        }
+    };
+
+    // Monitor resources periodically
+    if let Some(ref cgroup) = cgroup_manager {
+        cgroups::monitor_resources(cgroup).ok();
+    }
+
     // Wait for container process
     match waitpid(container_pid, None) {
         Ok(WaitStatus::Exited(_, exit_code)) => {
@@ -137,6 +157,12 @@ pub fn create_container(container_root: &str) -> Result<Pid, AppError> {
         Err(e) => {
             eprintln!("Error waiting for container: {}", e);
         }
+    }
+
+    // Cleanup will happen automatically when cgroup_manager is dropped
+    if let Some(cgroup) = cgroup_manager {
+        println!("Cleaning up container resources...");
+        cgroup.cleanup().ok();
     }
 
     Ok(container_pid)
