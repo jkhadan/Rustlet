@@ -12,6 +12,10 @@ use nix::{
     sys::wait::{waitpid, WaitStatus}
 };
 
+use crate::app_error::AppError;
+
+mod app_error;
+
 const CONTAINER_ROOT: &str = "/home/jkhadan/projects/Rustlet/container";
 
 fn create_pid() -> isize {
@@ -98,7 +102,7 @@ fn create_pid() -> isize {
     }
 }
 
-fn setup_container_filesystem() -> Result<(), Box<dyn std::error::Error>> {
+fn setup_container_filesystem() -> Result<(), AppError> {
     println!("Setting up container filesystem at {}", CONTAINER_ROOT);
     
     // Create directory structure
@@ -141,7 +145,7 @@ fn setup_container_filesystem() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn copy_shared_libraries(binary: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn copy_shared_libraries(binary: &str) -> Result<(), AppError> {
     println!("Finding and copying shared libraries for {}", binary);
     
     let output = Command::new("ldd")
@@ -228,7 +232,7 @@ fn extract_library_path(line: &str) -> Option<String> {
     None
 }
 
-fn create_etc_files() -> Result<(), Box<dyn std::error::Error>> {
+fn create_etc_files() -> Result<(), AppError> {
     let etc_path = Path::new(CONTAINER_ROOT).join("etc");
     create_dir_all(&etc_path)?;
 
@@ -247,10 +251,10 @@ fn create_etc_files() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn setup_secure_rootfs() -> Result<(), Box<dyn std::error::Error>> {
+fn setup_secure_rootfs() -> Result<(), AppError> {
     // Check if container root exists
     if !Path::new(CONTAINER_ROOT).exists() {
-        return Err(format!("Container root {} does not exist", CONTAINER_ROOT).into());
+        return Err(AppError::ContainerDNE(CONTAINER_ROOT.to_string()))
     }
 
     // Mount new root filesystem
@@ -276,7 +280,7 @@ fn setup_secure_rootfs() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn mount_essential_fs() -> Result<(), nix::Error> {
+fn mount_essential_fs() -> Result<(), AppError> {
     // Create mount points if they don't exist
     create_dir_all("/proc").ok();
     create_dir_all("/sys").ok();
@@ -300,7 +304,7 @@ fn mount_essential_fs() -> Result<(), nix::Error> {
     Ok(())
 }
 
-fn setup_user_namespace(pid: Pid) -> Result<(), Box<dyn std::error::Error>> {
+fn setup_user_namespace(pid: Pid) -> Result<(), AppError> {
     let uid_map = format!("0 {} 1", nix::unistd::getuid());
     let gid_map = format!("0 {} 1", nix::unistd::getgid());
 
@@ -311,7 +315,7 @@ fn setup_user_namespace(pid: Pid) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn drop_dangerous_capabilities() -> Result<(), caps::errors::CapsError> {
+fn drop_dangerous_capabilities() -> Result<(), AppError> {
     // Clear inheritable (we don't want children to inherit capabilities)
     caps::clear(None, CapSet::Inheritable)?;
     caps::clear(None, CapSet::Permitted)?;
@@ -321,7 +325,7 @@ fn drop_dangerous_capabilities() -> Result<(), caps::errors::CapsError> {
     Ok(())
 }
 
-fn create_container() -> Result<Pid, nix::Error> {
+fn create_container() -> Result<Pid, AppError> {
     const STACK_SIZE: usize = 1024 * 1024; // 1MB
     let mut stack = vec![0u8; STACK_SIZE];
 
