@@ -192,7 +192,7 @@ struct ExecCli {
     /// Add a supplementary group (repeatable).
     #[arg(short = 'g', long, value_name = "GID")]
     additional_gids: Vec<u32>,
-    /// Add a capability (repeatable), e.g. NET_RAW.
+    /// Add a capability (repeatable), e.g. NET_RAW: to bounding, effective and permitted (never inheritable).
     #[arg(short, long, value_name = "CAP")]
     cap: Vec<String>,
     /// Set no_new_privs for the process.

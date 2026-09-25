@@ -120,8 +120,12 @@ pub struct ExecArgs {
     pub user: Option<(u32, Option<u32>)>,
     /// Added to the container's additional gids.
     pub additional_gids: Vec<u32>,
-    /// Added to bounding, effective and permitted; for a non-root user also
-    /// to inheritable and ambient, the only sets that survive its `execve`.
+    /// Added to bounding, effective and permitted, never to inheritable
+    /// (CVE-2022-29162); to ambient only where the container's inheritable
+    /// set already has it. So for a non-root user, whose capabilities only
+    /// survive `execve` through ambient, `--cap` alone gives nothing: that
+    /// takes a `process.json` (or container spec) with the capability in
+    /// inheritable and ambient.
     pub caps: Vec<String>,
     /// Force `noNewPrivileges` on.
     pub no_new_privs: bool,
@@ -351,11 +355,10 @@ fn exec_process(spec: &Spec, how: &ExecProcess, tty: bool) -> Result<Process> {
                 gids.extend(&a.additional_gids);
                 user.set_additional_gids(Some(gids));
             }
-            let non_root = user.uid() != 0;
             p.set_user(user);
             if !a.caps.is_empty() {
                 let mut caps = p.capabilities().clone().unwrap_or_default();
-                add_caps(&mut caps, &a.caps, non_root)?;
+                add_caps(&mut caps, &a.caps)?;
                 p.set_capabilities(Some(caps));
             }
             if a.no_new_privs {
@@ -371,7 +374,13 @@ fn exec_process(spec: &Spec, how: &ExecProcess, tty: bool) -> Result<Process> {
     Ok(p)
 }
 
-fn add_caps(caps: &mut LinuxCapabilities, names: &[String], non_root: bool) -> Result<()> {
+/// `exec --cap`, as runc does it since CVE-2022-29162: runc used to put
+/// `--cap` capabilities into the *inheritable* set too, and a non-empty
+/// inheritable set lets any binary with matching inheritable *file*
+/// capabilities gain them at `execve`. So: bounding, effective and
+/// permitted; ambient only for capabilities the spec already made
+/// inheritable (the kernel refuses ambient ones that aren't).
+fn add_caps(caps: &mut LinuxCapabilities, names: &[String]) -> Result<()> {
     let parsed: Vec<Capability> = names
         .iter()
         .map(|n| {
@@ -386,17 +395,18 @@ fn add_caps(caps: &mut LinuxCapabilities, names: &[String], non_root: bool) -> R
             "exec --cap MKNOD: not supported until Phase 2c (the eBPF device filter that makes it safe)",
         ));
     }
-    let add = |set: &Option<Capabilities>| -> Option<Capabilities> {
+    let add = |set: &Option<Capabilities>, which: &[Capability]| -> Option<Capabilities> {
         let mut s = set.clone().unwrap_or_default();
-        s.extend(parsed.iter().copied());
+        s.extend(which.iter().copied());
         Some(s)
     };
-    caps.set_bounding(add(caps.bounding()));
-    caps.set_effective(add(caps.effective()));
-    caps.set_permitted(add(caps.permitted()));
-    if non_root {
-        caps.set_inheritable(add(caps.inheritable()));
-        caps.set_ambient(add(caps.ambient()));
+    caps.set_bounding(add(caps.bounding(), &parsed));
+    caps.set_effective(add(caps.effective(), &parsed));
+    caps.set_permitted(add(caps.permitted(), &parsed));
+    let inheritable = caps.inheritable().clone().unwrap_or_default();
+    let ambient: Vec<Capability> = parsed.iter().copied().filter(|c| inheritable.contains(c)).collect();
+    if !ambient.is_empty() {
+        caps.set_ambient(add(caps.ambient(), &ambient));
     }
     Ok(())
 }
@@ -636,8 +646,13 @@ mod tests {
         });
         assert_eq!((p.user().uid(), p.user().gid()), (1000, 0));
         let c = p.capabilities().clone().unwrap();
-        for set in [c.bounding(), c.effective(), c.permitted(), c.inheritable(), c.ambient()] {
+        for set in [c.bounding(), c.effective(), c.permitted()] {
             assert!(set.as_ref().unwrap().contains(&Capability::NetRaw));
+        }
+        // Never inheritable (CVE-2022-29162), so not ambient either: the
+        // default spec's inheritable set is empty.
+        for set in [c.inheritable(), c.ambient()] {
+            assert!(!set.as_ref().is_some_and(|s| s.contains(&Capability::NetRaw)));
         }
         let e = exec_process(
             &default_spec(),

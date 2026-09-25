@@ -394,23 +394,24 @@ fn ex_cap_adds_a_capability_for_root() {
     assert_eq!(status_hex(out.ok(), "CapAmb"), 0, "{out:#?}");
 }
 
-/// For a non-root user `--cap` also goes into inheritable and ambient, so the
-/// capability survives execve: uid 1000 can listen on port 80.
+/// `--cap` never touches the inheritable set (runc's fix for
+/// CVE-2022-29162), so for a non-root user, whose capabilities only survive
+/// `execve` through ambient, it adds nothing: uid 1000 still can't listen on
+/// port 80.
 #[test]
 #[ignore = "needs root: run with `cargo xtask itest`"]
-fn ex_cap_reaches_a_non_root_user_through_ambient() {
+fn ex_cap_never_adds_inheritable_so_a_non_root_user_gains_nothing() {
     let c = sleeper("ex-cap-user");
     let out = c.exec_in(
         &["-u", "1000:1000", "--cap", "CAP_NET_BIND_SERVICE"],
         &["sh", "-c", &format!("{STATUS}; {LISTEN_ON_80}")],
     );
     let text = out.ok();
-    let nbs = cap_bit("CAP_NET_BIND_SERVICE");
     for set in ["CapInh", "CapPrm", "CapEff", "CapAmb"] {
-        assert_eq!(status_hex(text, set), nbs, "{set}: {out:#?}");
+        assert_eq!(status_hex(text, set), 0, "{set}: {out:#?}");
     }
-    assert_eq!(status_hex(text, "CapBnd"), DEFAULT_CAP_MASK, "{out:#?}");
-    assert!(text.lines().any(|l| l == "listening"), "{out:#?}");
+    assert_eq!(status_hex(text, "CapBnd"), DEFAULT_CAP_MASK | cap_bit("CAP_NET_BIND_SERVICE"), "{out:#?}");
+    assert!(!text.lines().any(|l| l == "listening"), "{out:#?}");
 }
 
 /// `--cap CAP_MKNOD` would sidestep the create-time refusal (no device

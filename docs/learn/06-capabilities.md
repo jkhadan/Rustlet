@@ -265,14 +265,15 @@ file-capability binary clears the set, and so does a uid switch away from 0
 (§4). Ambient doesn't come from the file, so NNP leaves it alone. It is the only
 way for a non-root process under NNP to keep a capability.
 
-`exec -u 1000 --cap NET_BIND_SERVICE` puts the capability in all five sets
-(`exec_process` adds inheritable and ambient only for non-root users). In a
-running default container `web`, with `L='grep Cap /proc/self/status; nc -l -p
-80 </dev/null & sleep 0.3; netstat -ltn | grep :80 || echo "not listening";
-kill $!'`:
+In a running default container `web`, with `L='grep Cap /proc/self/status; nc
+-l -p 80 </dev/null & sleep 0.3; netstat -ltn | grep :80 || echo "not
+listening"; kill $!'`, uid 1000 can't bind port 80, and `--cap` doesn't change
+that. `exec --cap` never touches the inheritable set (runc's fix for
+CVE-2022-29162, see chapter 08), so it can't make the capability ambient
+either, and for a non-root user nothing else survives `execve`:
 
 ```text
-$ $R exec -u 1000 web sh -c "$L"
+$ $R exec -u 1000 --cap NET_BIND_SERVICE web sh -c "$L"
 CapInh:	0000000000000000
 CapPrm:	0000000000000000
 CapEff:	0000000000000000
@@ -280,7 +281,15 @@ CapBnd:	00000000800405fb
 CapAmb:	0000000000000000
 nc: bind: Permission denied
 not listening
-$ $R exec -u 1000 --cap NET_BIND_SERVICE web sh -c "$L"
+```
+
+Ambient has to be asked for explicitly, with the capability in inheritable too.
+A `process.json` for `exec -p` (or the container's own `process`) with `"user":
+{"uid": 1000, "gid": 1000}` and effective, permitted, inheritable and ambient
+all `["CAP_NET_BIND_SERVICE"]`, running the same `$L`:
+
+```text
+$ $R exec -p web80.json web
 CapInh:	0000000000000400
 CapPrm:	0000000000000400
 CapEff:	0000000000000400
@@ -289,9 +298,8 @@ CapAmb:	0000000000000400
 tcp        0      0 :::80                   :::*                    LISTEN
 ```
 
-(After that, busybox `nc` announces its SIGTERM with `punt!`.) The exec child
-had made the container's eleven capabilities permitted, and none of them
-survived `execve`: ambient held one bit, and that one bit is all that came out. From the
+(After that, busybox `nc` announces its SIGTERM with `punt!`.) Ambient held one
+bit, and that one bit is all that came out of `execve`. From the
 host, `getpcaps` shows such a process as `339918: cap_net_bind_service=eip`.
 Its text format has no field for ambient, so check `CapAmb` in
 `/proc/339918/status`. In `config.json` the same thing is `"user": {"uid":
@@ -548,8 +556,10 @@ warning, as in runc, so a spec from a newer kernel still runs
 and the exec child runs the same `switch_identity` after its `setns`. So `$R
 exec web grep Cap /proc/self/status` prints init's five lines from §2, and NNP
 and the filter come along too (`ex_inherits_capabilities_no_new_privs_and_seccomp`).
-`--cap` adds to bounding, effective and permitted, and for a non-root user to
-inheritable and ambient too (§3):
+`--cap` adds to bounding, effective and permitted, never to inheritable, and to
+ambient only where the spec's inheritable set already has the capability (§3;
+`ex_cap_never_adds_inheritable_so_a_non_root_user_gains_nothing`). For root
+that is enough:
 
 ```text
 $ $R exec --cap NET_RAW web sh -c 'grep -E "CapEff|CapBnd" /proc/self/status; ping -c1 -W1 127.0.0.1'
@@ -588,8 +598,12 @@ $R exec web grep Cap /proc/self/status; capsh --decode=800405fb
 getpcaps $($R state web | jq .pid)
 $R exec web sh -c 'mknod /dev/shm/n c 1 3; ip link set lo down; hostname x'    # three EPERMs
 $R exec -u 1000 web nc -l -p 80                                                 # Permission denied
-$R exec -u 1000 --cap NET_BIND_SERVICE web sh -c \
-   'nc -l -p 80 </dev/null & sleep 0.3; netstat -ltn; grep Cap /proc/$!/status; kill $!'
+$R exec -u 1000 --cap NET_BIND_SERVICE web nc -l -p 80                          # still denied: no ambient
+jq '.process | .user = {uid: 1000, gid: 1000} | .args = ["nc", "-l", "-p", "80"]
+    | .capabilities.effective = ["CAP_NET_BIND_SERVICE"] | .capabilities.permitted = ["CAP_NET_BIND_SERVICE"]
+    | .capabilities.inheritable = ["CAP_NET_BIND_SERVICE"] | .capabilities.ambient = ["CAP_NET_BIND_SERVICE"]' \
+   /tmp/caps/config.json > /tmp/caps/web80.json
+$R exec -d -p /tmp/caps/web80.json web; $R exec web netstat -ltn              # listening on :80
 $R exec --cap NET_RAW web ping -c1 127.0.0.1
 $R exec --cap SYS_ADMIN web mount -t tmpfs none /mnt        # still denied: seccomp
 $R exec --cap MKNOD web true                                # refused until Phase 2c
