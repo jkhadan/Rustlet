@@ -1,0 +1,36 @@
+[Unit]
+Description=Rustlets container daemon
+Documentation=file:///usr/share/doc/rustlets/architecture.md
+After=network-online.target nftables.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/bin/rustletd
+Restart=on-failure
+RestartSec=2
+
+# cgroups: systemd delegates the whole rustletd.service subtree to us.
+# The daemon itself runs in the `daemon` leaf; containers get leaves under
+# `containers/<id>` (a process may not sit in an inner node that has
+# controllers enabled, the "no internal processes" rule).
+Delegate=yes
+DelegateSubgroup=daemon
+
+# Shims and containers must survive `systemctl restart rustletd`:
+# only the main process is signalled on stop.
+KillMode=process
+
+# The default TasksMax (15% of pid_max) would count every shim and every
+# container process against the daemon. Per-container pids.max applies instead.
+TasksMax=infinity
+LimitNOFILE=1048576
+OOMScoreAdjust=-500
+
+# Deliberately NO PrivateTmp / ProtectSystem / ProtectHome / PrivateMounts:
+# overlay mounts and netns pins must land in the *host* mount namespace,
+# where the host and scripts/cleanup.sh can see (and remove) them.
+
+[Install]
+WantedBy=multi-user.target

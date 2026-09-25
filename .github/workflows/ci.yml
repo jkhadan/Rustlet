@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: taiki-e/install-action@nextest
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: unit tests (unprivileged)
+        run: cargo nextest run --workspace
+      - name: unsafe stays inside rustlet-sys
+        run: |
+          # every crate but rustlet-sys must forbid unsafe at the crate root
+          for f in $(git ls-files 'crates/*/src/lib.rs' 'crates/*/src/main.rs' xtask/src/main.rs tests/src/lib.rs | grep -v rustlet-sys); do
+            grep -q '#!\[forbid(unsafe_code)\]' "$f" || { echo "missing forbid(unsafe_code): $f"; exit 1; }
+          done
+
+  itest:
+    # Privileged integration tests need root, cgroup v2 delegation and a
+    # recent kernel; GitHub's runners provide sudo on ubuntu-24.04.
+    runs-on: ubuntu-24.04
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - run: sudo apt-get update && sudo apt-get install -y runc strace
+      - run: cargo xtask rootfs
+      - run: cargo xtask itest

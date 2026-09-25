@@ -1,0 +1,45 @@
+# /etc/sudoers.d/rustlet-dev: passwordless sudo for Rustlets development only.
+#
+# Install:  sudo install -m 0440 -o root -g root packaging/dev/sudoers-rustlet-dev /etc/sudoers.d/rustlet-dev
+# Remove:   sudo rm /etc/sudoers.d/rustlet-dev
+#
+# Be aware: this is effectively passwordless root for james. The build outputs
+# under target/ and scripts/cleanup.sh are writable by james; systemd-run,
+# strace, runc and `ip netns exec` run arbitrary commands; and a `*` in
+# arguments also matches `..` (cat /run/rustlet/../../etc/shadow). That is
+# acceptable on a throwaway, snapshotted development VM, not on a machine you
+# care about.
+# The list still keeps privileged actions to a known, auditable set, and
+# nothing here needs a password typed into a script.
+
+Cmnd_Alias RUSTLET_BUILD = \
+    /home/james/Documents/projects/Rustlet/target/debug/*, \
+    /home/james/Documents/projects/Rustlet/target/debug/deps/*, \
+    /home/james/Documents/projects/Rustlet/target/debug/examples/*, \
+    /home/james/Documents/projects/Rustlet/target/release/*, \
+    /home/james/Documents/projects/Rustlet/scripts/cleanup.sh, \
+    /home/james/Documents/projects/Rustlet/scripts/cleanup.sh *
+
+# Tests run inside a limited, delegated systemd scope (docs/architecture.md §4.6).
+Cmnd_Alias RUSTLET_SCOPE = /usr/bin/systemd-run
+
+Cmnd_Alias RUSTLET_SERVICE = \
+    /usr/bin/systemctl daemon-reload, \
+    /usr/bin/systemctl start rustletd, \
+    /usr/bin/systemctl stop rustletd, \
+    /usr/bin/systemctl restart rustletd, \
+    /usr/bin/systemctl status rustletd, \
+    /usr/bin/systemctl status rustletd *, \
+    /usr/bin/journalctl -u rustletd *
+
+# Inspection and reference tools used while debugging.
+Cmnd_Alias RUSTLET_TOOLS = \
+    /usr/sbin/nft, /usr/sbin/nft *, \
+    /usr/sbin/ip, /usr/sbin/ip *, \
+    /usr/sbin/runc, /usr/sbin/runc *, \
+    /usr/bin/strace *, \
+    /usr/sbin/losetup *, \
+    /usr/bin/cat /run/rustlet/*, \
+    /usr/bin/cat /var/lib/rustlet/*
+
+james ALL=(root) NOPASSWD: RUSTLET_BUILD, RUSTLET_SCOPE, RUSTLET_SERVICE, RUSTLET_TOOLS

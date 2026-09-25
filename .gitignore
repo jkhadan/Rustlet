@@ -1,0 +1,12 @@
+/target
+/desktop/node_modules
+/desktop/dist
+/desktop/src-tauri/target
+/desktop/src-tauri/gen
+# generated test bundles and cached images (`cargo xtask rootfs`)
+/.rustlet-dev
+*.snap.new
+*.pending-snap
+
+# personal Claude Code settings
+/.claude/settings.local.json

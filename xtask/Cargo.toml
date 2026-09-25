@@ -1,0 +1,19 @@
+[package]
+name = "xtask"
+description = "Development tasks: `cargo xtask <rootfs|itest|dev-storage|check-host>`."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+rustlet-runtime.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+flate2.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true

@@ -1,0 +1,127 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rustlet-sys",
+    "crates/rustlet-spec",
+    "crates/rustlet-runtime",
+    "crates/rustlet-runc",
+    "crates/rustlet-shim",
+    "crates/rustlet-image",
+    "crates/rustlet-net",
+    "crates/rustlet-build",
+    "crates/rustlet-compose",
+    "crates/rustlet-client",
+    "crates/rustletd",
+    "crates/rustlet-cli",
+    "xtask",
+    "tests",
+]
+# `desktop/src-tauri` is its own workspace member once Phase 6 lands; it is kept
+# out of `default-members` so a plain `cargo build` never needs webkit2gtk.
+default-members = [
+    "crates/rustlet-sys",
+    "crates/rustlet-spec",
+    "crates/rustlet-runtime",
+    "crates/rustlet-runc",
+    "crates/rustlet-shim",
+    "crates/rustlet-image",
+    "crates/rustlet-net",
+    "crates/rustlet-build",
+    "crates/rustlet-compose",
+    "crates/rustlet-client",
+    "crates/rustletd",
+    "crates/rustlet-cli",
+    "xtask",
+    "tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://example.invalid/rustlets"
+authors = ["Rustlets contributors"]
+
+# Shared lints. Every crate except `rustlet-sys` inherits these, which forbids
+# `unsafe` outright. `rustlet-sys` declares its own table (see its Cargo.toml).
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unsafe_op_in_unsafe_fn = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "warn"
+todo = "warn"
+
+[workspace.dependencies]
+# internal
+rustlet-sys = { path = "crates/rustlet-sys" }
+rustlet-spec = { path = "crates/rustlet-spec" }
+rustlet-runtime = { path = "crates/rustlet-runtime" }
+rustlet-image = { path = "crates/rustlet-image" }
+rustlet-net = { path = "crates/rustlet-net" }
+rustlet-build = { path = "crates/rustlet-build" }
+rustlet-compose = { path = "crates/rustlet-compose" }
+rustlet-client = { path = "crates/rustlet-client" }
+
+# syscalls
+libc = "0.2"
+nix = { version = "0.31", features = [
+    "dir", "env", "event", "fs", "hostname", "ioctl", "mount", "net", "poll",
+    "process", "pthread", "resource", "sched", "signal", "socket", "term",
+    "uio", "user", "zerocopy",
+] }
+bitflags = "2"
+
+# async + api
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io", "codec"] }
+axum = { version = "0.8", features = ["ws", "macros"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+http = "1"
+tokio-tungstenite = "0.30"
+futures = "0.3"
+bytes = "1"
+
+# serialization + oci
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+oci-spec = { version = "0.10", default-features = false, features = ["runtime", "image"] }
+oci-client = { version = "0.18", default-features = false, features = ["rustls-tls"] }
+
+# layers
+sha2 = "0.11"
+hex = "0.4"
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
+zstd = "0.14"
+
+# cli + terminal
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = "0.29"
+
+# storage, dns, types, errors, logging
+rusqlite = { version = "0.40", features = ["bundled"] }
+hickory-proto = { version = "0.26", default-features = false }
+ts-rs = "12"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+serde_yaml_ng = "0.10"
+toml = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+rand = "0.10"
+
+# tests
+insta = { version = "1", features = ["json", "yaml"] }
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "debuginfo"

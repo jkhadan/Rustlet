@@ -1,0 +1,26 @@
+[package]
+name = "rustlet-sys"
+description = "The safety boundary: the only Rustlets crate allowed to contain `unsafe`. Syscall and kernel-ABI wrappers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# rustlet-sys does *not* inherit `[workspace.lints]` (which forbids unsafe).
+# It allows unsafe code but requires every block to be justified.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+
+[dependencies]
+libc.workspace = true
+nix.workspace = true
+bitflags.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

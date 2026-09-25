@@ -1,0 +1,26 @@
+[package]
+name = "rustlet-itests"
+description = "Privileged integration tests (run with `cargo xtask itest`)."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# A glibc helper for syscalls busybox can't make (clone3, AF_VSOCK sockets…);
+# the seccomp tests run it inside Alpine through the host's dynamic loader.
+# `test = false`: it has no unit tests for `cargo xtask itest` to run.
+[[bin]]
+name = "rustlet-probe"
+path = "src/bin/rustlet-probe.rs"
+test = false
+doc = false
+
+[dependencies]
+rustlet-runtime.workspace = true
+rustlet-sys.workspace = true
+# `personality`: for the probe's seccomp argument-filter checks.
+nix = { workspace = true, features = ["personality"] }
+tempfile.workspace = true
+serde_json.workspace = true

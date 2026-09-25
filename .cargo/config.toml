@@ -1,0 +1,3 @@
+[alias]
+# `cargo xtask <cmd>`: itest | rootfs | image-run | gen-ts | dev-storage | check-host
+xtask = "run --quiet --package xtask --"

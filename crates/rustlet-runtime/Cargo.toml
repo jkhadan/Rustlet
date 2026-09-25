@@ -1,0 +1,26 @@
+[package]
+name = "rustlet-runtime"
+description = "The Rustlets OCI runtime library: namespaces, rootfs, cgroups v2, capabilities, seccomp, state."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustlet-sys.workspace = true
+chrono.workspace = true
+oci-spec.workspace = true
+nix.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+tempfile.workspace = true
