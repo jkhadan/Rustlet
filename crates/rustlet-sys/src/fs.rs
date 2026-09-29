@@ -120,6 +120,9 @@ impl Statx {
     pub fn is_char_device(&self) -> bool {
         self.file_type() == libc::S_IFCHR
     }
+    pub fn is_block_device(&self) -> bool {
+        self.file_type() == libc::S_IFBLK
+    }
 }
 
 /// `statx(dirfd, path, flags)`. Pass an empty path plus `AT_EMPTY_PATH` in
