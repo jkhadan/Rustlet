@@ -104,26 +104,32 @@ Commands follow the OCI runtime spec: `create`, `start`, `state`, `kill`, `delet
    - `root.path` resolving to `/`
    - sysctls that aren't namespaced (`kernel.core_pattern`, `vm.*`, …)
    - user mount targets under `/proc` or `/sys`
-   - until Phase 2c: `--device`, `CAP_MKNOD`, `--privileged`
+   - joining a **user** namespace by path (§2.2.1)
+   - with a new user namespace (`userns.rs`, `sysctl.rs`): maps the kernel would refuse, or that map host uid or gid 0; uid/gid 0, the process's ids or a filesystem's `uid=`/`gid=` left unmapped; no new PID namespace; mqueue, cgroup2 or sysctls in a namespace the user namespace doesn't own; `kernel.domainname`
+   - until the device filter (Phase 2c, part 2): `--device`, `CAP_MKNOD`, `--privileged`
 2. **Cgroup.** Create the cgroup at `linux.cgroupsPath`, which the daemon places inside its delegated subtree. Write the limits and open the cgroup dirfd for `CLONE_INTO_CGROUP`.
 3. **Sync channels.** Create a `socketpair(SOCK_SEQPACKET)` for sync messages. Create `exec.fifo` and open it `O_PATH`; the child inherits the fd because the path is unreachable after `pivot_root`.
 4. **Namespaces, in this order:**
-   1. Join a user namespace given by path first, then `setns` into every other namespace given by path. This happens in the parent; for pid, it sets the namespace that children are born into.
+   0. **Open the host side of every mount** (`rootfs::HostTrees`) while the parent is still only in the host's namespaces. The rootfs becomes a detached recursive copy (`open_tree(OPEN_TREE_CLONE|AT_RECURSIVE)`, with `nodev` on every mount of it), and each bind source a detached copy of its own. Init inherits the fds and only attaches them. There are three reasons. In a user namespace, init is host uid 1000000 and may not even be able to reach the bundle (a `0750` home directory). Only a detached mount can be idmapped. And each host path is resolved exactly once, by the privileged side, before any container process exists. The parent also reads its own and host init's mount-namespace ids here, for step 5.1.
+   1. `setns` into every namespace given by path (a user namespace given by path is refused, §2.2.1). This happens in the parent; for pid, it sets the namespace that children are born into.
    2. `clone3` with the new namespaces **except cgroup**, plus `CLONE_INTO_CGROUP | CLONE_PIDFD`. When `CLONE_NEWUSER` is combined with other `CLONE_NEW*` flags, the kernel creates the user namespace first.
-   3. If a user namespace is new, the child blocks while the parent writes `uid_map`/`gid_map`.
+   3. **The parent's part of init's setup**, done for every container while init waits for a `Proceed` message:
+      - With a new user namespace, write `uid_map`/`gid_map` through the `IdMapper` trait (§2.10), leaving `setgroups` at `allow`. Then idmap the bind trees that ask for it (`idmap`/`ridmap`, `mount_setattr(MOUNT_ATTR_IDMAP)` with init's user namespace).
+      - Set init's rlimits (`prlimit`) and `oom_score_adj`. In a user namespace, init could not raise a hard limit or lower its OOM score itself, because both need `CAP_SYS_RESOURCE` in the initial user namespace.
+      - Send `Proceed`. If init has a user namespace, the first thing it does is `become_root`: `setgroups([])`, `setresgid(0)`, `setresuid(0)`.
    4. The child closes the cgroup dirfd, then calls `unshare(CLONE_NEWCGROUP)`, rooting the namespace at the cgroup it was placed in. (The original reasoning was that passing the flag to `clone3` would root it at the *parent's* cgroup, because namespaces are copied before placement. On kernel 7.0 a combined `clone3` gets it right too, as measured in chapter 04. Unsharing after placement is correct on every kernel.) **Test:** `/proc/self/cgroup` reads `0::/`.
 5. **Container init:**
-   1. **Hard safety check (release builds too):** `/proc/self/ns/mnt` must differ from `/proc/1/ns/mnt` (compare dev + inode), or abort.
+   1. **Hard safety check (release builds too):** `/proc/self/ns/mnt` must differ from both the parent's mount namespace and host init's (`/proc/1/ns/mnt`), compared as dev + inode, or init aborts. The parent reads both in step 4.0 and passes them to init, because in a user namespace init may not look at PID 1's namespaces.
    2. `mount("/", MS_REC|MS_PRIVATE)` **first**. Then parse mountinfo and verify nothing is still shared.
-   3. **Mounts are fd-based:** bind the rootfs onto itself; for every other mount, resolve the target with `openat2(RESOLVE_IN_ROOT|RESOLVE_NO_MAGICLINKS)` and attach with `move_mount(…, MOVE_MOUNT_T_EMPTY_PATH)`. The path is never resolved a second time, which closes the race class behind CVE-2019-19921, CVE-2021-30465, and runc's 2025 CVEs.
+   3. **Mounts are fd-based:** attach the parent's rootfs tree (step 4.0) on top of `/` with `move_mount`. That makes it the mount point `pivot_root` needs, without init ever looking up the rootfs's host path. For every other mount (a new filesystem from `fsopen`/`fsmount`, or the parent's tree for a bind mount), resolve the target with `openat2(RESOLVE_IN_ROOT|RESOLVE_NO_MAGICLINKS)` and attach with `move_mount(…, MOVE_MOUNT_T_EMPTY_PATH)`. The path is never resolved a second time, which closes the race class behind CVE-2019-19921, CVE-2021-30465, and runc's 2025 CVEs.
       - `/proc`: a new instance via `fsopen("proc")`.
-      - `/sys`: sysfs read-only. Under a user namespace with a host-owned netns, use a read-only rbind of the host `/sys` instead.
+      - `/sys`: sysfs read-only. Under a user namespace with a host-owned netns (only the netns's owner may mount sysfs), use a read-only rbind of the host `/sys` instead. Init makes the rbind itself, so the kernel keeps its submounts locked.
       - `/sys/fs/cgroup`: cgroup2 **read-only** unless privileged. With `nsdelegate` (as on this host), the kernel already refuses writes to the namespace root's own limit files (`EPERM`). The read-only mount is a second barrier, and it covers hosts mounted without `nsdelegate`, where container root could raise its own `memory.max` or `pids.max`.
       - `/dev`: a tmpfs holding null, zero, full, random, urandom and tty (bind-mounted from the host when inside a user namespace, since mknod is denied there).
-      - `/dev/pts`: devpts `newinstance`, `ptmxmode=0666`, `mode=0620`, with `gid=5` only if gid 5 is mapped.
+      - `/dev/pts`: devpts `newinstance`, `ptmxmode=0666`, `mode=0620`, `gid=5`. Under a user namespace, the `gid=` (or any filesystem's `uid=`/`gid=`) must be mapped, or `create` refuses.
       - Symlinks: `/dev/ptmx → pts/ptmx`, `/dev/fd`, `/dev/std{in,out,err}`.
       - `/dev/shm`: its own tmpfs, or a bind of container X's shm for `--ipc=container:X`.
-      - `/dev/mqueue`, user volumes, and the generated `/etc/{hosts,hostname,resolv.conf}`.
+      - `/dev/mqueue` (under a user namespace, only with a new IPC namespace), user volumes, and the generated `/etc/{hosts,hostname,resolv.conf}`.
    4. **Sysctls:** written through a private proc handle (checked with `fstatfs` = `PROC_SUPER_MAGIC`), *before* `/proc/sys` becomes read-only.
    5. **Switch root:**
       - `pivot_root(".", ".")`, then `umount2(".", MNT_DETACH)`; the `pivot_root(2)` man-page trick needs no put_old directory.
@@ -138,7 +144,7 @@ Commands follow the OCI runtime spec: `create`, `start`, `state`, `kill`, `delet
       - Masked paths (`/proc/kcore`, `/proc/keys`, `/proc/timer_list`, `/sys/firmware`, …) get a bind of `/dev/null`, after `fstat` confirms it is char device 1:3; masked directories get a read-only tmpfs.
       - Read-only paths: `/proc/sys`, `/proc/sysrq-trigger`, `/proc/irq`, `/proc/bus`.
       - Optionally, remount the rootfs read-only.
-   8. **Process setup:** `sethostname`, rlimits, `oom_score_adj`. Then `close_range(3 + preserved, ~0, CLOSE_RANGE_CLOEXEC)`, before any seccomp filter is loaded (a profile may not allow `close_range`); the runtime's own fds are all close-on-exec from birth.
+   8. **Process setup:** `sethostname` (and `setdomainname`). The parent already set rlimits and `oom_score_adj`, in step 4.3. Then `close_range(3 + preserved, ~0, CLOSE_RANGE_CLOEXEC)`, before any seccomp filter is loaded (a profile may not allow `close_range`); the runtime's own fds are all close-on-exec from birth.
    9. If `noNewPrivileges` is false, load seccomp **now**, while `CAP_SYS_ADMIN` is still held.
    10. **Switch identity**, in this order:
        1. drop the bounding set
@@ -151,11 +157,11 @@ Commands follow the OCI runtime spec: `create`, `start`, `state`, `kill`, `delet
    13. If `noNewPrivileges` is true: `PR_SET_NO_NEW_PRIVS`, then load seccomp **last**, so only `execve` still needs to be allowed. (As built, NNP is set here, after the gate, rather than before it; the effect is the same.)
    14. `execve`, with `args` resolved through the container's `PATH`.
 6. **`exec`** (as built in Phase 2b):
-   1. Lock the container; it must be `created` or `running` (`paused` only with `--ignore-paused`). The process is built from the copy of `config.json` kept in the state directory at `create`, plus the CLI's overrides.
+   1. Lock the container; it must be `created` or `running` (`paused` only with `--ignore-paused`). The process is built from the copy of `config.json` kept in the state directory at `create`, plus the CLI's overrides. With a user namespace, the process's ids must be mapped in it.
    2. Open the container's cgroup dirfd (or, without `cgroupsPath`, the cgroup init was born in), and a pidfd for init.
-   3. Compare init's namespace inodes with the caller's. The **parent** joins only the PID (and time) namespace with `setns(pidfd, …)`: those only affect children, so `rustlet-runc` itself never enters the container's filesystem. Never pass `CLONE_NEWUSER` for the caller's own user namespace; that returns EINVAL.
+   3. Compare init's namespace inodes with the caller's. The **parent** joins only the PID namespace with `setns(pidfd, …)`. That only affects children, so `rustlet-runc` itself never enters the container's filesystem. (A time namespace switches the caller's own clocks too, so the child joins that one.) Never pass `CLONE_NEWUSER` for the caller's own user namespace; that returns EINVAL.
    4. `clone3(CLONE_INTO_CGROUP | CLONE_PIDFD)`: the child is born in the PID namespace and the cgroup. The lock is released as soon as the child is placed.
-   5. In the child, still on the host's filesystem: rlimits, `oom_score_adj` through a private procfs, the session keyring. Then `setns(pidfd, MNT|UTS|IPC|NET|CGROUP)` in one call. After that, no container path is trusted and `/proc` isn't used.
+   5. In the child, still on the host's filesystem: rlimits, and `oom_score_adj` through a private procfs. Then `setns(pidfd, USER|MNT|UTS|IPC|NET|CGROUP|TIME)` (the ones init doesn't share) in one call; the kernel enters the user namespace first. With a user namespace, the child then calls `become_root`, as init did. Only after that does it join the session keyring by name, because keyring names are per user namespace and the container's keyring belongs to container root. From the `setns` on, no container path is trusted and `/proc` isn't used.
    6. The same identity, caps, NNP and seccomp setup as init, then `execve`. The child stays non-dumpable until then (CVE-2016-9962).
 
 #### 2.2.1 Namespace modes (translated to OCI `namespaces` by the daemon)
@@ -168,7 +174,7 @@ Commands follow the OCI runtime spec: `create`, `start`, `state`, `kill`, `delet
 | ipc | new | `--ipc=host` | `--ipc=container:X` | `/dev/shm` is separate; bind X's shm for sharing |
 | uts | new | `--uts=host` | — | hostname is set only when new |
 | cgroup | new (unshared after placement) | `--cgroupns=host` | — | container sees its own cgroup as `/` |
-| user | off (rootful default) | — | — | `--userns=remap` uses a dedicated `rustlet` subordinate range (e.g. 1000000:65536) |
+| user | off (rootful default) | — | — | `--userns=remap` uses a dedicated `rustlet` subordinate range (e.g. 1000000:65536) and needs a new pid ns; joining by path is refused (the parent would have to `setns` into it before `clone3`, losing its host privileges for the rest of `create`) |
 | time | off | — | — | stretch: `--timens` |
 
 #### 2.2.2 Security defaults
@@ -441,7 +447,28 @@ Host resources, all prefixed so they're easy to find and remove:
 
 ## 5. Roadmap. Each phase ends with a demo, a `docs/learn` chapter, and a walkthrough.
 
-**Status (2026-09-25):** Phases 0, 1, 2a and 2b are done (chapter 08 is still to be written). `cargo xtask itest` runs 178 privileged tests, and all pass; `cargo test --workspace` runs 191 unit tests. `cargo xtask demo --memory 64M --pids 64` gives an interactive shell with job control and cgroup limits.
+**Status (2026-09-29):** Phases 0, 1, 2a and 2b are done (chapter 08 is still to be written). Phase 2c part 1, user namespaces, is built; part 2, the device filter, is still to come. `cargo xtask itest` runs 196 privileged tests, and all pass; `cargo test --workspace` runs 194 unit tests. `cargo xtask demo --memory 64M --pids 64` gives an interactive shell with job control and cgroup limits, and `cargo xtask demo --userns` gives one in a user namespace.
+
+Phase 2c part 1, as built (user namespaces; chapter 09):
+- **Maps:** a new user namespace comes from `linux.uidMappings`/`gidMappings` (`userns.rs`). The remap range is `0 1000000 65536` (`spec::REMAP_HOST_ID`, `REMAP_SIZE`), so container root is host uid 1000000. The parent writes the maps through the `IdMapper` trait (`DirectIdMapper` now, `newuidmap` in Phase 8).
+- **The parent opens the host side of every mount** (`rootfs::HostTrees`, §2.2 step 4.0): the rootfs and each bind source, as detached `open_tree` copies. Init attaches the rootfs tree on top of `/` and pivots into it. This is done for every container, not only those with a user namespace, so there is one code path.
+- **The parent's part before `Proceed`** (step 4.3): the maps, idmaps, rlimits and `oom_score_adj`. Init's first act is `become_root`.
+- **In a user namespace:**
+  - `/dev` nodes are bind mounts of the host's, since `mknod` is never allowed there.
+  - `/sys` is a locked, read-only rbind of the host's when the network namespace isn't the container's own.
+  - `exec` joins the user namespace in its one `setns` and becomes root before joining the session keyring.
+- **Refused at `create`:**
+  - unmapped process ids or devpts `gid=`;
+  - a shared PID namespace;
+  - mqueue, cgroup2 or sysctls in namespaces the user namespace doesn't own;
+  - `kernel.domainname` (the spec's `domainname` field works);
+  - joining a user namespace by path.
+- **Deliberate difference from runc:** maps that put host uid or gid 0 in the container are refused, although OCI allows them. Container root would be host root to everything that checks ids rather than capabilities.
+- **Mounts** accept `idmap`/`ridmap`, with the container's own mappings only.
+- **Tooling:** `cargo xtask rootfs --remap` builds `bundles/alpine-remap`, a copy of the Alpine rootfs owned by host ids 1000000 and up. The chown needs root, so it re-runs itself under sudo. `cargo xtask demo --userns` runs a shell in it.
+- **Tests:** `tests/tests/userns.rs` has 18 privileged tests (`cargo xtask itest -- us_`). All 196 itests and 194 unit tests pass.
+- **Known nit:** `/dev/mqueue` shows as owned by `nobody` (65534) inside. `clone3` creates the IPC namespace, and with it the mqueue superblock, while init is still host uid 0, which the namespace doesn't map.
+- **Still to come:** part 2, the eBPF device filter (`--device`, `CAP_MKNOD`, `--privileged`, chapter 10), and an independent review of part 1.
 
 Phase 2b, as built:
 - **Defaults** (`rustlet-runc spec`, the dev bundle): Podman's 11 capabilities (`CapBnd` = `800405fb`, inheritable and ambient empty), `noNewPrivileges`, Docker's seccomp profile resolved for those capabilities, and Docker's masked and read-only paths. A spec without `process.capabilities` is refused; `CAP_MKNOD` waits for Phase 2c.
