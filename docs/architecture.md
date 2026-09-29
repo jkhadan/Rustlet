@@ -115,8 +115,8 @@ Commands follow the OCI runtime spec: `create`, `start`, `state`, `kill`, `delet
    2. `clone3` with the new namespaces **except cgroup**, plus `CLONE_INTO_CGROUP | CLONE_PIDFD`. When `CLONE_NEWUSER` is combined with other `CLONE_NEW*` flags, the kernel creates the user namespace first.
    3. **The parent's part of init's setup**, done for every container while init waits for a `Proceed` message:
       - With a new user namespace, write `uid_map`/`gid_map` through the `IdMapper` trait (§2.10), leaving `setgroups` at `allow`. Then idmap the bind trees that ask for it (`idmap`/`ridmap`, `mount_setattr(MOUNT_ATTR_IDMAP)` with init's user namespace).
-      - Set init's rlimits (`prlimit`) and `oom_score_adj`. In a user namespace, init could not raise a hard limit or lower its OOM score itself, because both need `CAP_SYS_RESOURCE` in the initial user namespace.
       - Send `Proceed`. If init has a user namespace, the first thing it does is `become_root`: `setgroups([])`, `setresgid(0)`, `setresuid(0)`.
+      - Later, when init's setup as root is done (step 5.8), init sends `SetLimits`. The parent sets init's rlimits (`prlimit`) and `oom_score_adj`, then sends `Proceed` again. In a user namespace, init could not raise a hard limit or lower its OOM score itself, because both need `CAP_SYS_RESOURCE` in the initial user namespace. Not earlier, so that init's own setup (an fd per mount, …) doesn't run under the container's limits; runc sets them at the same point (`procReady`). Not later, because `RLIMIT_NPROC` is checked when the uid changes.
    4. The child closes the cgroup dirfd, then calls `unshare(CLONE_NEWCGROUP)`, rooting the namespace at the cgroup it was placed in. (The original reasoning was that passing the flag to `clone3` would root it at the *parent's* cgroup, because namespaces are copied before placement. On kernel 7.0 a combined `clone3` gets it right too, as measured in chapter 04. Unsharing after placement is correct on every kernel.) **Test:** `/proc/self/cgroup` reads `0::/`.
 5. **Container init:**
    1. **Hard safety check (release builds too):** `/proc/self/ns/mnt` must differ from both the parent's mount namespace and host init's (`/proc/1/ns/mnt`), compared as dev + inode, or init aborts. The parent reads both in step 4.0 and passes them to init, because in a user namespace init may not look at PID 1's namespaces.
@@ -144,7 +144,7 @@ Commands follow the OCI runtime spec: `create`, `start`, `state`, `kill`, `delet
       - Masked paths (`/proc/kcore`, `/proc/keys`, `/proc/timer_list`, `/sys/firmware`, …) get a bind of `/dev/null`, after `fstat` confirms it is char device 1:3; masked directories get a read-only tmpfs.
       - Read-only paths: `/proc/sys`, `/proc/sysrq-trigger`, `/proc/irq`, `/proc/bus`.
       - Optionally, remount the rootfs read-only.
-   8. **Process setup:** `sethostname` (and `setdomainname`). The parent already set rlimits and `oom_score_adj`, in step 4.3. Then `close_range(3 + preserved, ~0, CLOSE_RANGE_CLOEXEC)`, before any seccomp filter is loaded (a profile may not allow `close_range`); the runtime's own fds are all close-on-exec from birth.
+   8. **Process setup:** `sethostname` (and `setdomainname`). Then init sends `SetLimits` and waits while the parent sets its rlimits and `oom_score_adj` (step 4.3). Then `close_range(3 + preserved, ~0, CLOSE_RANGE_CLOEXEC)`, before any seccomp filter is loaded (a profile may not allow `close_range`); the runtime's own fds are all close-on-exec from birth.
    9. If `noNewPrivileges` is false, load seccomp **now**, while `CAP_SYS_ADMIN` is still held.
    10. **Switch identity**, in this order:
        1. drop the bounding set
@@ -447,12 +447,12 @@ Host resources, all prefixed so they're easy to find and remove:
 
 ## 5. Roadmap. Each phase ends with a demo, a `docs/learn` chapter, and a walkthrough.
 
-**Status (2026-09-29):** Phases 0, 1, 2a and 2b are done (chapter 08 is still to be written). Phase 2c part 1, user namespaces, is built; part 2, the device filter, is still to come. `cargo xtask itest` runs 196 privileged tests, and all pass; `cargo test --workspace` runs 194 unit tests. `cargo xtask demo --memory 64M --pids 64` gives an interactive shell with job control and cgroup limits, and `cargo xtask demo --userns` gives one in a user namespace.
+**Status (2026-09-29):** Phases 0, 1, 2a and 2b are done (chapter 08 is still to be written). Phase 2c part 1, user namespaces, is built; part 2, the device filter, is still to come. `cargo xtask itest` runs 203 privileged tests, and all pass; `cargo test --workspace` runs 195 unit tests. `cargo xtask demo --memory 64M --pids 64` gives an interactive shell with job control and cgroup limits, and `cargo xtask demo --userns` gives one in a user namespace.
 
 Phase 2c part 1, as built (user namespaces; chapter 09):
 - **Maps:** a new user namespace comes from `linux.uidMappings`/`gidMappings` (`userns.rs`). The remap range is `0 1000000 65536` (`spec::REMAP_HOST_ID`, `REMAP_SIZE`), so container root is host uid 1000000. The parent writes the maps through the `IdMapper` trait (`DirectIdMapper` now, `newuidmap` in Phase 8).
 - **The parent opens the host side of every mount** (`rootfs::HostTrees`, §2.2 step 4.0): the rootfs and each bind source, as detached `open_tree` copies. Init attaches the rootfs tree on top of `/` and pivots into it. This is done for every container, not only those with a user namespace, so there is one code path.
-- **The parent's part before `Proceed`** (step 4.3): the maps, idmaps, rlimits and `oom_score_adj`. Init's first act is `become_root`.
+- **The parent's part** (step 4.3): the maps and idmaps before the first `Proceed`, after which init's first act is `become_root`; rlimits and `oom_score_adj` when init asks for them (`SetLimits`), once its setup as root is done.
 - **In a user namespace:**
   - `/dev` nodes are bind mounts of the host's, since `mknod` is never allowed there.
   - `/sys` is a locked, read-only rbind of the host's when the network namespace isn't the container's own.
@@ -462,13 +462,22 @@ Phase 2c part 1, as built (user namespaces; chapter 09):
   - a shared PID namespace;
   - mqueue, cgroup2 or sysctls in namespaces the user namespace doesn't own;
   - `kernel.domainname` (the spec's `domainname` field works);
-  - joining a user namespace by path.
+  - joining a user namespace by path;
+  - proc/sysfs flags the kernel refuses in a user namespace: an atime option on a new proc or sysfs, and `suid`/`dev`/`exec` or an atime option on the host's sysfs copy (its mounts' flags are locked);
+  - a map of a page (4096 bytes) or more of text.
 - **Deliberate difference from runc:** maps that put host uid or gid 0 in the container are refused, although OCI allows them. Container root would be host root to everything that checks ids rather than capabilities.
 - **Mounts** accept `idmap`/`ridmap`, with the container's own mappings only.
 - **Tooling:** `cargo xtask rootfs --remap` builds `bundles/alpine-remap`, a copy of the Alpine rootfs owned by host ids 1000000 and up. The chown needs root, so it re-runs itself under sudo. `cargo xtask demo --userns` runs a shell in it.
-- **Tests:** `tests/tests/userns.rs` has 18 privileged tests (`cargo xtask itest -- us_`). All 196 itests and 194 unit tests pass.
+- **Tests:** `tests/tests/userns.rs` has 20 privileged tests (`cargo xtask itest -- us_`). All 203 itests and 195 unit tests pass.
 - **Known nit:** `/dev/mqueue` shows as owned by `nobody` (65534) inside. `clone3` creates the IPC namespace, and with it the mqueue superblock, while init is still host uid 0, which the namespace doesn't map.
-- **Still to come:** part 2, the eBPF device filter (`--device`, `CAP_MKNOD`, `--privileged`, chapter 10), and an independent review of part 1.
+- **Independent review:** no high-severity findings. The medium one: the parent set init's rlimits before init had mounted anything, so init's own setup ran under the container's limits (`RLIMIT_NOFILE` 8 failed with `EMFILE`). Init now asks for them once its setup as root is done. Also fixed:
+  - proc/sysfs flags and maps the kernel refuses, which used to fail halfway through init, are refused at `create`;
+  - the sync socket now outlives the create guard, so a failed create can't also print init's "rustlet-runc went away";
+  - an idmapped mount's own mappings are compared after merging, not line by line;
+  - a read-only-paths test that couldn't fail now checks mountinfo.
+
+  `tests/tests/review_regressions.rs` covers each finding, and CI's itest job now builds the remap rootfs.
+- **Still to come:** part 2, the eBPF device filter (`--device`, `CAP_MKNOD`, `--privileged`, chapter 10).
 
 Phase 2b, as built:
 - **Defaults** (`rustlet-runc spec`, the dev bundle): Podman's 11 capabilities (`CapBnd` = `800405fb`, inheritable and ambient empty), `noNewPrivileges`, Docker's seccomp profile resolved for those capabilities, and Docker's masked and read-only paths. A spec without `process.capabilities` is refused; `CAP_MKNOD` waits for Phase 2c.

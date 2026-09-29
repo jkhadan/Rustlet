@@ -22,7 +22,7 @@ Code: [`userns.rs`](../../crates/rustlet-runtime/src/userns.rs) (maps, checks, `
 [`exec.rs`](../../crates/rustlet-runtime/src/exec.rs), [`sysctl.rs`](../../crates/rustlet-runtime/src/sysctl.rs),
 [`namespaces.rs`](../../crates/rustlet-runtime/src/namespaces.rs), [`sync.rs`](../../crates/rustlet-runtime/src/sync.rs), and
 [`xtask/src/rootfs.rs`](../../xtask/src/rootfs.rs) (`--remap`). Tests: [`userns.rs`](../../tests/tests/userns.rs)
-(`cargo xtask itest -- us_`, 18 tests). Design: [architecture.md §2.2](../architecture.md#22-rustlet-runtime-library--rustlet-runc-binary--the-oci-runtime)
+(`cargo xtask itest -- us_`, 20 tests). Design: [architecture.md §2.2](../architecture.md#22-rustlet-runtime-library--rustlet-runc-binary--the-oci-runtime)
 steps 4.0, 4.3, 5.1, 5.3 and exec step 5, and [§2.2.1](../architecture.md#221-namespace-modes-translated-to-oci-namespaces-by-the-daemon).
 
 All transcripts are real runs on this host (kernel 7.0.0-34-generic). `$R`
@@ -213,43 +213,54 @@ which check `/etc/subuid` first. A privileged writer doesn't have to deny
 `[2000]`, and the host sees `Groups: 1002000`.
 
 **The handshake.** Init must not do anything until the parent has written
-the maps, so every container's init now waits for a `Proceed` message on
-the sync socket (chapter 05) before it starts. While init waits, the
-parent does the parts only it can do. Here is `sudo strace -f -s 80 -e
-trace=clone3,open_tree,mount_setattr,move_mount,pivot_root,umount2,openat,write,prlimit64,sendto,sendmsg,recvfrom,recvmsg,setgroups,setresgid,setresuid,unshare,fchdir,execve`
+the maps, so every container's init waits for a `Proceed` message on the
+sync socket (chapter 05) before it starts. Later it asks the parent for
+a second thing only the parent can do, its rlimits and `oom_score_adj`,
+and waits for a second `Proceed`. Here is `sudo strace -f -s 80 -e
+trace=clone3,open_tree,mount_setattr,openat,write,prlimit64,sendto,recvfrom,setgroups,setresgid,setresuid,unshare,execve`
 of `$R run` on a bundle that adds `RLIMIT_RTPRIO` 5/5 and `oomScoreAdj:
--500` (540140 is `rustlet-runc`, 540141 is init):
+-500` (647377 is `rustlet-runc`, 647378 is init):
 
 ```text
-540140 open_tree(AT_FDCWD, "/home/james/…/alpine-remap/rootfs", OPEN_TREE_CLONE|OPEN_TREE_CLOEXEC|AT_RECURSIVE) = 6
-540140 mount_setattr(6, "", AT_EMPTY_PATH|AT_RECURSIVE, {attr_set=MOUNT_ATTR_NODEV, attr_clr=0, propagation=MS_PRIVATE, userns_fd=0}, 32) = 0
-540140 clone3({flags=CLONE_PIDFD|CLONE_NEWNS|CLONE_NEWUTS|CLONE_NEWIPC|CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNET, …} => {pidfd=[9]}, 88) = 540141
-540141 recvfrom(8,  <unfinished ...>
+647377 open_tree(AT_FDCWD, "/home/james/…/alpine-remap/rootfs", OPEN_TREE_CLONE|OPEN_TREE_CLOEXEC|AT_RECURSIVE) = 8
+647377 mount_setattr(8, "", AT_EMPTY_PATH|AT_RECURSIVE, {attr_set=MOUNT_ATTR_NODEV, attr_clr=0, propagation=MS_PRIVATE, userns_fd=0}, 32) = 0
+647377 clone3({flags=CLONE_PIDFD|CLONE_NEWNS|CLONE_NEWUTS|CLONE_NEWIPC|CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNET, …} => {pidfd=[9]}, 88) = 647378
 …                                                       (state.json: init's pid and start time)
-540140 openat(AT_FDCWD, "/proc/540141/uid_map", O_WRONLY|O_CLOEXEC) = 8
-540140 write(8, "0 1000000 65536\n", 16) = 16
-540140 openat(AT_FDCWD, "/proc/540141/gid_map", O_WRONLY|O_CLOEXEC) = 8
-540140 write(8, "0 1000000 65536\n", 16) = 16
-540140 prlimit64(540141, RLIMIT_NOFILE, {rlim_cur=1024, rlim_max=1024}, NULL) = 0
-540140 prlimit64(540141, RLIMIT_RTPRIO, {rlim_cur=5, rlim_max=5}, NULL) = 0
-540140 openat(AT_FDCWD, "/proc/540141/oom_score_adj", O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0666) = 8
-540140 write(8, "-500", 4)              = 4
-540140 sendto(7, "{\"type\":\"proceed\"}", 18, MSG_NOSIGNAL, NULL, 0) = 18
-540141 <... recvfrom resumed>"{\"type\":\"proceed\"}", 65536, 0, NULL, NULL) = 18
-540141 setgroups(0, [])                 = 0
-540141 setresgid(0, 0, 0)               = 0
-540141 setresuid(0, 0, 0)               = 0
-540141 unshare(CLONE_NEWCGROUP)         = 0
+647377 openat(AT_FDCWD, "/proc/647378/uid_map", O_WRONLY|O_CLOEXEC) = 7
+647377 write(7, "0 1000000 65536\n", 16) = 16
+647377 openat(AT_FDCWD, "/proc/647378/gid_map", O_WRONLY|O_CLOEXEC) = 7
+647377 write(7, "0 1000000 65536\n", 16) = 16
+647377 sendto(4, "{\"type\":\"proceed\"}", 18, MSG_NOSIGNAL, NULL, 0) = 18
+647378 recvfrom(5, "{\"type\":\"proceed\"}", 65536, 0, NULL, NULL) = 18
+647378 setgroups(0, [])                 = 0
+647378 setresgid(0, 0, 0)               = 0
+647378 setresuid(0, 0, 0)               = 0
+647378 unshare(CLONE_NEWCGROUP)         = 0
+…                                                       (init's mounts, pivot_root, sysctls, masked paths)
+647378 sendto(5, "{\"type\":\"set_limits\"}", 21, MSG_NOSIGNAL, NULL, 0) = 21
+647378 recvfrom(5,  <unfinished ...>
+647377 recvfrom(4, "{\"type\":\"set_limits\"}", 65536, 0, NULL, NULL) = 21
+647377 prlimit64(647378, RLIMIT_NOFILE, {rlim_cur=1024, rlim_max=1024}, NULL) = 0
+647377 prlimit64(647378, RLIMIT_RTPRIO, {rlim_cur=5, rlim_max=5}, NULL) = 0
+647377 openat(AT_FDCWD, "/proc/647378/oom_score_adj", O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0666) = 7
+647377 write(7, "-500", 4)              = 4
+647377 sendto(4, "{\"type\":\"proceed\"}", 18, MSG_NOSIGNAL, NULL, 0) = 18
+647378 <... recvfrom resumed>"{\"type\":\"proceed\"}", 65536, 0, NULL, NULL) = 18
+647378 setgroups(0, [])                 = 0
+647378 setresgid(0, 0, 0)               = 0
+647378 setresuid(0, 0, 0)               = 0
 ```
 
-The last four lines are `become_root`, then the cgroup namespace
-(chapter 04). Until `setresuid`, init is host uid 0, which the namespace
-doesn't map. A file it created would have an owner the kernel can't write
-down (`EOVERFLOW`). The namespace's capabilities, which `clone3` gave it,
-allow switching to ids that *are* mapped. Becoming the namespace's root
-keeps them. `setgroups([])` drops the host's supplementary groups, which
-aren't mapped either. Without a user namespace, init skips
-`become_root`, but it still waits for `Proceed`: one code path.
+The four lines after the first `Proceed` are `become_root`, then the
+cgroup namespace (chapter 04). Until `setresuid`, init is host uid 0, which
+the namespace doesn't map. A file it created would have an owner the
+kernel can't write down (`EOVERFLOW`). The namespace's capabilities, which
+`clone3` gave it, allow switching to ids that *are* mapped. Becoming the
+namespace's root keeps them. `setgroups([])` drops the host's
+supplementary groups, which aren't mapped either. The last three lines are
+the identity switch to `process.user` (chapter 06), uid 0 here. Without a
+user namespace, init skips `become_root`, but it still waits for the parent
+at both points: one code path.
 
 **Why the parent sets rlimits and `oom_score_adj`.** Raising a hard limit
 and lowering an OOM score both need `CAP_SYS_RESOURCE` in the *initial*
@@ -271,10 +282,18 @@ sh: write error: Permission denied
 Raising the score is still allowed from inside: in the same bundle
 without the extra capability, `echo 0 > /proc/self/oom_score_adj`
 succeeded. My own shell's `RTPRIO` hard limit is 0, and inside it was 5,
-so the parent really raised it. The parent sets
-them for every container, before init changes its uid. That timing
-matters for `RLIMIT_NPROC`, which the kernel checks against the new user's
-process count when the uid changes.
+so the parent really raised it.
+
+**When.** The parent sets them for every container, when init asks with
+`set_limits`: after init's setup as root, before its identity switch. The
+first version set them before the first `Proceed`, and the independent
+review of this phase found what that broke. All of init's setup then ran
+under the container's limits, and every mount costs init an fd, so
+`RLIMIT_NOFILE` 8 failed at `mount devpts` with `EMFILE`
+(`rr_rlimits_are_set_after_init_setup`). It is also where runc sets them
+(`procReady`). Before the identity switch still matters for
+`RLIMIT_NPROC`, which the kernel checks against the new user's process
+count when the uid changes.
 
 ## 4. The rootfs, opened by the parent
 
@@ -586,12 +605,25 @@ rustlet-runc: error: invalid config.json: sysctl kernel.domainname can't be set 
 rustlet-runc: error: invalid config.json: linux.uidMappings/gidMappings are set, but linux.namespaces has no new `user` namespace to apply them to (add {"type": "user"})
 == overlap      .linux.uidMappings += [{"containerID": 5, "hostID": 2000000, "size": 1}]
 rustlet-runc: error: invalid config.json: linux.uidMappings: `0 1000000 65536` and `5 2000000 1` overlap on the container side
+== longmap      .linux.uidMappings += [range(199) | {"containerID": (1000000000 + 2*.), "hostID": (2000000000 + 2*.), "size": 1}]
+rustlet-runc: error: invalid config.json: linux.uidMappings: the map is 4792 bytes as text; the kernel takes at most 4095 (fewer lines, or smaller numbers)
+== noatime      /proc's options += ["noatime"]
+rustlet-runc: error: invalid config.json: mount proc on /proc: with a user namespace the kernel refuses `noatime`, `strictatime` and `nodiratime` (a new proc or sysfs must keep the host's atime mode)
+== hostsysexec  no network namespace, /sys's options += ["exec"]
+rustlet-runc: error: invalid config.json: mount rbind of the host's /sys on /sys: with a user namespace the kernel refuses `suid`, `dev` and `exec` (the host's sysfs mounts keep their flags, locked)
 ```
 
 `userns::validate` checks a map the way the kernel will: at most 340
-lines, no size 0, nothing reaching `u32::MAX` (which means "no id"), no
-overlap on either side. That way a bad map fails with a reason rather
-than an `EINVAL` from writing `uid_map`. **Joining a user namespace by
+lines, less than a page (4096 bytes) of text in all, since the whole map
+is one `write`, no size 0, nothing reaching `u32::MAX` (which means "no
+id"), no overlap on either side. That way a bad map fails with a reason
+rather than an `EINVAL` from writing `uid_map`. The two mount refusals come
+from how the kernel treats proc and sysfs in a user namespace (§6): a new
+instance may not show more than the host's visible one, and the kernel
+compares their flags, atime mode included. The host's `/sys` copied in
+without a network namespace was copied into a less privileged mount
+namespace, and that locks every flag its mounts have, so `exec` (clearing
+`noexec`) fails. **Joining a user namespace by
 path** is refused because the parent would have to `setns` into it before
 `clone3`, and would then have lost its host privileges for everything it
 still has to do after that: the state files, and init's rlimits and
@@ -607,25 +639,28 @@ shares user namespaces, so nothing needs it.
   away for a container with `CAP_SYS_ADMIN`. The point of the remap is
   that container root isn't host root.
 - **Every container gets its rootfs from the parent's tree**, and waits
-  for `Proceed`, with or without a user namespace.
+  for the parent at the same two points, with or without a user namespace.
 - **`/dev/mqueue` shows as `nobody`** (§6).
 
-**Tests.** [`tests/tests/userns.rs`](../../tests/tests/userns.rs) has 18
+**Tests.** [`tests/tests/userns.rs`](../../tests/tests/userns.rs) has 20
 black-box tests. They cover the maps as seen inside and from the host,
 the rootfs owners, unchanged caps and seccomp, and rlimits and
-`oom_score_adj` set from outside. Also: the `/dev` binds, masked paths,
-sysctls, both sysfs cases and the idmapped mount. Then `exec`'s user
-namespace and keyring, the terminal, and the refusals above. Here:
+`oom_score_adj` set from outside. Also: the `/dev` binds, masked and
+read-only paths, sysctls, both sysfs cases, the idmapped mount and the
+flags of the parent's trees once attached. Then `exec`'s user namespace
+and keyring, the terminal, `exec -u` with an unmapped uid, and the
+refusals above. The review's findings each have an `rr_` test in
+[`review_regressions.rs`](../../tests/tests/review_regressions.rs). Here:
 
 ```text
 $ cargo xtask itest -- us_
 itest: kernel 7.0.0-34-generic (11 test binaries)
 …
-running 18 tests
-test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+running 20 tests
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
 ```
 
-The full suite is 196 privileged tests and 194 unit tests, and all pass.
+The full suite is 203 privileged tests and 195 unit tests, and all pass.
 
 ## 10. Try it
 
@@ -666,9 +701,10 @@ shown next to each one.
 2. Why must the maps be written by the parent, not by init? What do
    `unshare -Ur`'s `groups=…65534(nogroup)` and its `setgroups` file tell
    you, and why do Rustlets' containers not have that problem?
-3. Init waits for `Proceed` even without a user namespace. What does the
-   parent do in that window, and why couldn't init do it itself in a user
-   namespace, even with `CAP_SYS_RESOURCE` in all its sets?
+3. Init waits for the parent twice, even without a user namespace. What
+   does the parent do each time? Why couldn't init set its own limits in a
+   user namespace, even with `CAP_SYS_RESOURCE` in all its sets, and why
+   does the parent wait until init's mounts are done?
 4. Why is the rootfs opened by the parent and attached on top of `/`,
    rather than bound onto itself by init as in Phase 1? Why may init
    detach the old root after `pivot_root`, although the kernel locked it?
