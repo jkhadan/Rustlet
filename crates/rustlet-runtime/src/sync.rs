@@ -7,10 +7,12 @@
 //! The conversation, from container init's side:
 //!
 //! ```text
-//!   ◄── Proceed               the parent has finished its part: the user
-//!                             namespace's maps, idmapped mounts, rlimits
-//!                             and oom_score_adj (see `create`)
-//!   setup (mounts, pivot_root, tty, identity, $PATH lookup) …
+//!   ◄── Proceed               the parent has finished its first part: the
+//!                             user namespace's maps and idmapped mounts
+//!   setup as root (mounts, pivot_root, tty, sysctls, masked paths) …
+//!   ──► SetLimits             "set my rlimits and oom_score_adj"
+//!   ◄── Proceed               done (see `create`)
+//!   identity, $PATH lookup …
 //!   ──► Ready                 "created": now blocking on exec.fifo
 //!   … `start` opens exec.fifo, init writes one byte, then execve …
 //!   ──► EOF                   the channel's fd is O_CLOEXEC, so a
@@ -36,8 +38,12 @@ use crate::error::{Context, Error, Result};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum SyncMsg {
     /// Parent → init, the only message in that direction: go ahead with the
-    /// setup.
+    /// setup (sent twice: after the maps, and after the limits).
     Proceed,
+    /// Init has done its setup as root and asks the parent for its rlimits
+    /// and `oom_score_adj`. They are set this late so that init's own setup
+    /// (one fd per mount, …) doesn't count against the container's limits.
+    SetLimits,
     /// Init is fully set up and about to block on `exec.fifo`.
     Ready,
     /// Init failed before (or at) `execve`. `exec` says whether it was the
@@ -68,7 +74,7 @@ impl SyncMsg {
                 Error::Exec { message, errno: Errno::from_raw(errno.unwrap_or(libc::EIO)) }
             }
             SyncMsg::Error { message, errno, .. } => Error::Init { message, errno },
-            SyncMsg::Ready | SyncMsg::Proceed => {
+            SyncMsg::Ready | SyncMsg::Proceed | SyncMsg::SetLimits => {
                 Error::Init { message: format!("unexpected {self:?} from container init"), errno: None }
             }
         }
@@ -93,6 +99,12 @@ pub(crate) fn pair() -> Result<(SyncSocket, SyncSocket)> {
 }
 
 impl SyncSocket {
+    /// Init side: asks the parent to set our limits, and waits until it has.
+    pub(crate) fn request_limits(&self) -> Result<()> {
+        self.send(&SyncMsg::SetLimits)?;
+        self.wait_proceed()
+    }
+
     /// Init side: waits for the parent's [`SyncMsg::Proceed`].
     pub(crate) fn wait_proceed(&self) -> Result<()> {
         match self.recv()? {

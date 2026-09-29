@@ -71,6 +71,7 @@ use nix::fcntl::OFlag;
 use nix::sys::stat::Mode;
 use nix::unistd::{Gid, Pid, Uid};
 use oci_spec::runtime::{Linux, LinuxIdMapping};
+use rustlet_sys::mount::MountAttr;
 use rustlet_sys::process::CloneFlags;
 
 use crate::error::{Context, Error, Result, Unsupported};
@@ -151,6 +152,9 @@ impl UsernsPlan {
 /// The most lines a map may have (the kernel's `UID_GID_MAP_MAX_EXTENTS`).
 const MAX_EXTENTS: usize = 340;
 
+/// A map file must be written in one `write` of less than a page.
+const MAX_MAP_TEXT: usize = 4095;
+
 /// Parent side, at plan time: `linux.uidMappings` and `gidMappings`, checked
 /// against whether `linux.namespaces` asks for a new user namespace. `None`:
 /// the container stays in the runtime's user namespace.
@@ -217,6 +221,12 @@ fn validate(field: &str, maps: &[IdMap]) -> Result<Vec<IdMap>> {
             )));
         }
     }
+    let text = map_text(maps).len();
+    if text > MAX_MAP_TEXT {
+        return Err(bad(format!(
+            "the map is {text} bytes as text; the kernel takes at most {MAX_MAP_TEXT} (fewer lines, or smaller numbers)"
+        )));
+    }
     let overlap = |a: u32, b: u32, a_size: u32, b_size: u32| {
         u64::from(a) < u64::from(b) + u64::from(b_size) && u64::from(b) < u64::from(a) + u64::from(a_size)
     };
@@ -249,7 +259,8 @@ pub(crate) fn check_mounts(mounts: &mut [MountEntry], userns: Option<&UsernsPlan
                     m.describe()
                 )));
             };
-            let own = |given: &[IdMap], ours: &[IdMap]| given.is_empty() || given == ours;
+            // The same mapping may be written as different lines.
+            let own = |given: &[IdMap], ours: &[IdMap]| given.is_empty() || merged(given) == merged(ours);
             if !own(&idmap.uids, &u.uids) || !own(&idmap.gids, &u.gids) {
                 return Err(Error::Unsupported(vec![Unsupported {
                     field: format!("mount {}: uidMappings/gidMappings other than the container's own", m.describe()),
@@ -259,6 +270,7 @@ pub(crate) fn check_mounts(mounts: &mut [MountEntry], userns: Option<&UsernsPlan
         }
         let Some(u) = userns else { continue };
         let MountKind::Fs { fstype, options, .. } = &m.kind else { continue };
+        let proc_or_sys = matches!(fstype.as_str(), "proc" | "sysfs");
         let refuse = |why: &str| Err(Error::invalid(format!("mount {}: {why}", m.describe())));
         match fstype.as_str() {
             "mqueue" if !ns.clone_flags.contains(CloneFlags::NEWIPC) => {
@@ -295,8 +307,67 @@ pub(crate) fn check_mounts(mounts: &mut [MountEntry], userns: Option<&UsernsPlan
             // The kernel lets only the network namespace's owner mount sysfs.
             m.kind = MountKind::HostSysfs;
         }
+        if proc_or_sys {
+            check_locked_flags(m)?;
+        }
     }
     Ok(())
+}
+
+/// Mount flags the kernel won't let a proc or sysfs have in a user
+/// namespace, refused here rather than halfway through init:
+///
+/// * A new proc or sysfs may not reveal more than the host's visible one,
+///   and the kernel compares their flags too: the atime mode must be the
+///   host's (the default, relatime), so `noatime`, `strictatime` and
+///   `nodiratime` fail with `EPERM`.
+/// * The host's `/sys` copied in instead ([`MountKind::HostSysfs`]) is
+///   stricter still. Copying mounts into a less privileged mount namespace
+///   locks their flags, so `suid`, `dev` and `exec` (which clear what the
+///   host set) fail, and so does any atime option.
+fn check_locked_flags(m: &MountEntry) -> Result<()> {
+    use MountAttr as A;
+    let set = m.set | m.rec_set;
+    let clear = m.clear | m.rec_clear;
+    let words = if matches!(m.kind, MountKind::HostSysfs) {
+        if clear.intersects(A::NOSUID | A::NODEV | A::NOEXEC) {
+            Some("`suid`, `dev` and `exec` (the host's sysfs mounts keep their flags, locked)")
+        } else if (set | clear).intersects(A::ATIME_MASK | A::NODIRATIME) {
+            Some("atime options (the host's sysfs mounts keep their atime mode, locked)")
+        } else {
+            None
+        }
+    } else if set.intersects(A::NOATIME | A::STRICTATIME | A::NODIRATIME) {
+        Some("`noatime`, `strictatime` and `nodiratime` (a new proc or sysfs must keep the host's atime mode)")
+    } else {
+        None
+    };
+    match words {
+        Some(what) => {
+            Err(Error::invalid(format!("mount {}: with a user namespace the kernel refuses {what}", m.describe())))
+        }
+        None => Ok(()),
+    }
+}
+
+/// `maps` sorted, with lines that continue each other on both sides joined:
+/// `0 1000 10` + `10 1010 5` is `0 1000 15`.
+fn merged(maps: &[IdMap]) -> Vec<IdMap> {
+    let mut sorted = maps.to_vec();
+    sorted.sort_by_key(|m| m.container);
+    let mut out: Vec<IdMap> = Vec::with_capacity(sorted.len());
+    for m in sorted {
+        match out.last_mut() {
+            Some(last)
+                if u64::from(last.container) + u64::from(last.size) == u64::from(m.container)
+                    && u64::from(last.host) + u64::from(last.size) == u64::from(m.host) =>
+            {
+                last.size += m.size;
+            }
+            _ => out.push(m),
+        }
+    }
+    out
 }
 
 /// The text of a map file: one `container host size` line per range.
@@ -396,10 +467,21 @@ mod tests {
             (vec![m(0, 1_000_000, 10), m(5, 2_000_000, 10)], "container side"),
             (vec![m(0, 1_000_000, 10), m(100, 1_000_005, 10)], "host side"),
             ((0..341).map(|i| m(i, 1_000_000 + i, 1)).collect(), "at most 340"),
+            // 200 lines of 10-digit ids: fewer than 340, but over a page.
+            ((0..200).map(|i| m(1_000_000_000 + 2 * i, 2_000_000_000 + 2 * i, 1)).collect(), "at most 4095"),
         ];
         for (maps, why) in bad {
             let msg = validate("uidMappings", &maps).unwrap_err().to_string();
             assert!(msg.contains(why), "{maps:?}: {msg}");
         }
+    }
+
+    #[test]
+    fn maps_written_differently_merge_to_the_same() {
+        let one = [m(0, 1_000_000, 65536)];
+        let split = [m(100, 1_000_100, 65436), m(0, 1_000_000, 100)];
+        assert_eq!(merged(&split), one);
+        // Continuing on one side only is a different mapping.
+        assert_eq!(merged(&[m(0, 1_000_000, 100), m(100, 2_000_000, 10)]).len(), 2);
     }
 }

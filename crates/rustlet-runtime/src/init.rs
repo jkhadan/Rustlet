@@ -13,8 +13,9 @@
 //! `run`) opens the other end. Phase 2b added the hardening: a session
 //! keyring, sysctls, masked and read-only paths, capabilities and seccomp.
 //! Phase 2c added user namespaces: init first waits for the parent to map
-//! it (and to set its rlimits, which it might not be allowed to raise
-//! itself), then becomes root of its namespace.
+//! it, then becomes root of its namespace. Later, when its setup as root is
+//! done, it asks the parent to set its rlimits, which it might not be
+//! allowed to raise itself.
 
 use std::convert::Infallible;
 use std::io::Write;
@@ -92,8 +93,8 @@ fn try_init(ctx: InitContext<'_>) -> Result<Infallible> {
     nix::sys::stat::umask(Mode::empty());
 
     // ── namespaces ────────────────────────────────────────────────────────
-    // The parent maps our user namespace, idmaps mounts and sets our rlimits
-    // and oom_score_adj; nothing here may run before that.
+    // The parent maps our user namespace and idmaps mounts; nothing here
+    // may run before that.
     sync.wait_proceed()?;
     if plan.namespaces.new_user() {
         userns::become_root()?;
@@ -105,9 +106,8 @@ fn try_init(ctx: InitContext<'_>) -> Result<Infallible> {
     }
     // Hard stop before the first mount: never touch the host's mount table.
     namespaces::assert_new_mount_ns(parent_mnt_ns, host_init_mnt_ns)?;
-    // A procfs instance of our own, attached nowhere: sysctls and
-    // oom_score_adj are written through it, so no mount in the container
-    // can redirect those writes.
+    // A procfs instance of our own, attached nowhere: sysctls are written
+    // through it, so no mount in the container can redirect those writes.
     let proc = ProcHandle::new()?;
     if !no_new_keyring {
         proc_setup::join_session_keyring(&plan.id)?;
@@ -139,8 +139,12 @@ fn try_init(ctx: InitContext<'_>) -> Result<Infallible> {
         bring_up_loopback()?;
     }
     paths::apply(&plan.paths)?;
-    // (rlimits and oom_score_adj were set by the parent, before Proceed.)
     drop(proc);
+    // The parent sets our rlimits and oom_score_adj now: late enough that
+    // the setup above (an fd per mount, …) didn't run under the container's
+    // limits, and before the identity switch, which RLIMIT_NPROC is
+    // checked against.
+    sync.request_limits()?;
 
     // ── identity ──────────────────────────────────────────────────────────
     // Mark every fd above stderr and the preserved ones close-on-exec:

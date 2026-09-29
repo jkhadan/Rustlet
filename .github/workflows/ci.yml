@@ -39,5 +39,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - run: sudo apt-get update && sudo apt-get install -y runc strace
-      - run: cargo xtask rootfs
+      # --remap also builds the user-namespace test rootfs (chowned via sudo).
+      - run: cargo xtask rootfs --remap
       - run: cargo xtask itest

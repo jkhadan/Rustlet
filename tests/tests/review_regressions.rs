@@ -1,10 +1,15 @@
-//! Regression tests for the Phase 2a code review findings. Each test names
-//! the failure it pins down. Run with `cargo xtask itest -- rr_`.
+//! Regression tests for the code review findings (Phases 2a, 2b and 2c
+//! part 1). Each test names the failure it pins down. Run with
+//! `cargo xtask itest -- rr_`.
 
+use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
 use rustlet_itests::e2e::*;
 use rustlet_itests::*;
+use rustlet_runtime::oci_spec::runtime::{
+    LinuxIdMappingBuilder, LinuxNamespaceType, PosixRlimitBuilder, PosixRlimitType, Spec,
+};
 
 /// A `create` SIGKILLed after init was spawned but before it wrote the final
 /// state leaves `status: creating` with a live init and cgroup. `delete` must
@@ -278,4 +283,131 @@ fn rr_exec_tty_ignores_a_replaced_dev_ptmx() {
     wait_until("/dev/ptmx to be a FIFO", PROMPT, || c.exec_in(&[], &["test", "-p", "/dev/ptmx"]).status == 0);
     let out = exec_input(c.exec_command(&["-t"], &["tty"]), None, PROMPT);
     assert!(out.stdout.contains("/dev/pts/"), "{out:#?}");
+}
+
+// ── Phase 2c part 1 review ───────────────────────────────────────────────────
+
+fn set_nofile(s: &mut Spec, limit: u64) {
+    edit_process(s, |p| {
+        let rl = PosixRlimitBuilder::default().typ(PosixRlimitType::RlimitNofile).soft(limit).hard(limit);
+        p.set_rlimits(Some(vec![rl.build().unwrap()]));
+    });
+}
+
+/// A small `RLIMIT_NOFILE` must not break init's own setup. The parent used
+/// to set the limits before init mounted anything, so init's fds (one per
+/// bind mount, …) counted against it: with 8, `mount devpts` failed with
+/// EMFILE. Now init asks for its limits once its setup as root is done.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn rr_rlimits_are_set_after_init_setup() {
+    let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    for userns in [false, true] {
+        let mut s = if userns { userns_sh("ulimit -n") } else { sh("ulimit -n") };
+        set_nofile(&mut s, 8);
+        for (i, d) in dirs.iter().enumerate() {
+            std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            add_mount(&mut s, &format!("/mnt/{i}"), "bind", d.path().to_str().unwrap(), &["bind", "ro"]);
+        }
+        assert_eq!(run(&s).ok(), "8\n", "userns: {userns}");
+    }
+}
+
+/// When the parent fails to set init's limits, `create` reports that one
+/// error. The parent's end of the sync socket used to close before init was
+/// killed, so init, waiting on it, could print a second, misleading
+/// "rustlet-runc went away during create". That race was narrow (it never
+/// showed in these runs); this pins down the property, and the socket is
+/// now created before the guard, so the guard's kill comes first by
+/// construction.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn rr_a_failed_prlimit_reports_one_error() {
+    for _ in 0..5 {
+        let mut s = sh("true");
+        // Above fs.nr_open: even root's prlimit gets EPERM.
+        set_nofile(&mut s, 1 << 30);
+        let mut c = Container::new(&s);
+        let out = c.create(&[]);
+        out.refused("prlimit");
+        let errors = out.stderr.lines().filter(|l| l.starts_with("rustlet-runc")).count();
+        assert_eq!(errors, 1, "{}", out.stderr);
+        c.assert_gone();
+    }
+}
+
+/// With a user namespace, the kernel refuses a new proc or sysfs whose
+/// atime mode differs from the host's, and any flag change on the host's
+/// sysfs copied in without a network namespace (its mounts' flags are
+/// locked). These failed halfway through init with EPERM; now `create`
+/// refuses them up front.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn rr_locked_proc_and_sysfs_flags_are_refused_up_front() {
+    let with_option = |dest: &str, word: &str, own_netns: bool| {
+        let mut s = userns_sh("true");
+        if !own_netns {
+            without_namespace(&mut s, LinuxNamespaceType::Network);
+        }
+        let mut mounts = s.mounts().clone().unwrap();
+        let m = mounts.iter_mut().find(|m| m.destination().to_str() == Some(dest)).unwrap();
+        let mut options = m.options().clone().unwrap_or_default();
+        options.push(word.to_owned());
+        m.set_options(Some(options));
+        s.set_mounts(Some(mounts));
+        s
+    };
+    let cases = [
+        ("/proc", "noatime", true, "a new proc or sysfs must keep the host's atime mode"),
+        ("/sys", "strictatime", true, "a new proc or sysfs must keep the host's atime mode"),
+        ("/sys", "exec", false, "`suid`, `dev` and `exec`"),
+        ("/sys", "noatime", false, "atime options"),
+    ];
+    for (dest, word, own_netns, needle) in cases {
+        let mut c = Container::new(&with_option(dest, word, own_netns));
+        c.create(&[]).refused(needle);
+        c.assert_gone();
+    }
+    // What the kernel does allow still works.
+    run(&with_option("/proc", "relatime", true)).ok();
+    run(&with_option("/sys", "ro", false)).ok();
+}
+
+/// A map the kernel can't take in one write (a page or more of text) is
+/// refused at `create`, not by an EINVAL from writing `uid_map`.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn rr_a_map_longer_than_a_page_is_refused() {
+    let mut s = userns_sh("true");
+    let long: Vec<_> = std::iter::once((0u32, 1_000_000u32, 1u32))
+        .chain((0..199).map(|i| (1_000_000_000 + 2 * i, 2_000_000_000 + 2 * i, 1)))
+        .map(|(c, h, n)| LinuxIdMappingBuilder::default().container_id(c).host_id(h).size(n).build().unwrap())
+        .collect();
+    edit_linux(&mut s, |l| {
+        l.set_uid_mappings(Some(long));
+    });
+    let mut c = Container::new(&s);
+    c.create(&[]).refused("at most 4095");
+    c.assert_gone();
+}
+
+/// An idmapped mount's own `uidMappings` may be the container's mapping
+/// written as different lines; it used to be compared line by line and
+/// refused as "not planned".
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn rr_idmap_accepts_the_containers_mapping_in_other_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.path().join("f"), "x").unwrap();
+    let mut s = userns_sh("stat -c '%u' /mnt/f");
+    add_mount(&mut s, "/mnt", "bind", dir.path().to_str().unwrap(), &["bind", "idmap"]);
+    let split = [(0u32, 1_000_000u32, 100u32), (100, 1_000_100, 65_436)]
+        .map(|(c, h, n)| LinuxIdMappingBuilder::default().container_id(c).host_id(h).size(n).build().unwrap());
+    let mut mounts = s.mounts().clone().unwrap();
+    let m = mounts.last_mut().unwrap();
+    m.set_uid_mappings(Some(split.to_vec()));
+    m.set_gid_mappings(Some(split.to_vec()));
+    s.set_mounts(Some(mounts));
+    assert_eq!(run(&s).ok(), "0\n");
 }

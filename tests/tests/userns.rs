@@ -197,12 +197,22 @@ fn us_dev_nodes_are_bind_mounts_of_the_hosts() {
     );
 }
 
-/// Masked and read-only paths still apply inside the user namespace.
+/// Masked and read-only paths still apply inside the user namespace. The
+/// read-only half is checked in mountinfo: a write to, say,
+/// `/proc/sysrq-trigger` would fail anyway, because the file belongs to host
+/// root, which the namespace doesn't map.
 #[test]
 #[ignore = "needs root: run with `cargo xtask itest`"]
 fn us_masked_and_readonly_paths_still_apply() {
-    let out = run(&userns_sh("wc -c < /proc/kcore; (echo h > /proc/sysrq-trigger) 2>/dev/null || echo sysrq-refused"));
-    assert_eq!(norm_lines(out.ok()), ["0", "sysrq-refused"]);
+    let out = run(&userns_sh(
+        "wc -c < /proc/kcore; \
+         awk '$5 ~ /^\\/proc\\/(bus|fs|irq|sys|sysrq-trigger)$/ { split($6, o, \",\"); print $5, o[1] }' \
+         /proc/self/mountinfo | sort",
+    ));
+    assert_eq!(
+        norm_lines(out.ok()),
+        ["0", "/proc/bus ro", "/proc/fs ro", "/proc/irq ro", "/proc/sys ro", "/proc/sysrq-trigger ro"]
+    );
 }
 
 /// Namespaced sysctls work in namespaces the user namespace owns, and the
@@ -419,6 +429,10 @@ fn us_unowned_namespaces_are_refused() {
     assert_refused(&s, "mqueue can only be mounted in a new `ipc` namespace");
 
     let mut s = userns_spec(&["true"]);
+    without_namespace(&mut s, LinuxNamespaceType::Cgroup);
+    assert_refused(&s, "cgroup2 can only be mounted in a new `cgroup` namespace");
+
+    let mut s = userns_spec(&["true"]);
     without_namespace(&mut s, LinuxNamespaceType::Network);
     edit_linux(&mut s, |l| {
         l.set_sysctl(Some([("net.ipv4.ip_forward".to_owned(), "1".to_owned())].into_iter().collect()));
@@ -430,4 +444,40 @@ fn us_unowned_namespaces_are_refused() {
         l.set_sysctl(Some([("kernel.domainname".to_owned(), "x".to_owned())].into_iter().collect()));
     });
     assert_refused(&s, "`domainname` field");
+}
+
+/// `exec -u` with a uid the namespace doesn't map is refused, before
+/// anything joins the container.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn us_exec_with_an_unmapped_uid_is_refused() {
+    let c = Container::started(&userns_spec(&["sleep", "3600"]));
+    c.exec_in(&["-u", "70000"], &["true"]).refused("70000 is not mapped");
+    assert_eq!(c.exec_in(&["-u", "65535"], &["id", "-u"]).ok(), "65535\n");
+}
+
+/// The flags of the mounts the parent opened (§2.2 step 4.0) hold once init
+/// attaches them in the user namespace: the rootfs is `nodev` (and `ro`,
+/// as `root.readonly` asks), a read-only bind is `ro`.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn us_mount_flags_hold_in_a_user_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut s = userns_sh("awk '$5 == \"/\" || $5 == \"/mnt\" { print $5, $6 }' /proc/self/mountinfo");
+    add_mount(&mut s, "/mnt", "bind", dir.path().to_str().unwrap(), &["bind", "ro", "nosuid"]);
+    let out = run(&s);
+    let options = |mount_point: &str| -> Vec<String> {
+        let line = out.stdout.lines().find(|l| l.split(' ').next() == Some(mount_point)).unwrap_or_else(|| {
+            panic!("no mount on {mount_point} in {:?}", out.stdout);
+        });
+        line.split(' ').nth(1).unwrap().split(',').map(str::to_owned).collect()
+    };
+    let (root, mnt) = (options("/"), options("/mnt"));
+    for flag in ["ro", "nodev"] {
+        assert!(root.iter().any(|o| o == flag), "/ is not {flag}: {root:?}");
+    }
+    for flag in ["ro", "nosuid"] {
+        assert!(mnt.iter().any(|o| o == flag), "/mnt is not {flag}: {mnt:?}");
+    }
 }

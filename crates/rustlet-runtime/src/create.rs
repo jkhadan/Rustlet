@@ -134,9 +134,14 @@ pub(crate) fn spawn(opts: &CreateOptions, foreground: bool) -> Result<Spawned> {
     rustlet_sys::prctl::set_dumpable(false).context("PR_SET_DUMPABLE")?;
 
     // From here on, a SIGTERM/SIGINT aborts the create cleanly (see
-    // `wait_ready`) instead of killing us halfway.
+    // `wait_for`) instead of killing us halfway.
     let sfd = block_signals()?;
 
+    // The sync channel exists before the guard, so it is dropped after it:
+    // when a create fails, the guard kills init while this end is still
+    // open. (Closed first, init would see EOF, report "rustlet-runc went
+    // away" on the same stderr, and so add a second, misleading error.)
+    let (parent_sock, child_sock) = sync::pair()?;
     let mut dir = StateDir::new(&opts.root, &opts.id)?;
     let lock = dir.create()?;
     let mut guard = CreateGuard { dir: dir.clone(), cgroup: None, pidfd: None, in_parent: true, armed: true };
@@ -204,7 +209,6 @@ pub(crate) fn spawn(opts: &CreateOptions, foreground: bool) -> Result<Spawned> {
     let parent_mnt_ns = namespaces::current_mnt_ns()?;
     let host_init_mnt_ns = namespaces::host_init_mnt_ns()?;
     namespaces::join_all(&plan.namespaces)?;
-    let (parent_sock, child_sock) = sync::pair()?;
 
     let mut clone = Clone3::new().flags(plan.namespaces.clone_flags | CloneFlags::PIDFD);
     if let Some(fd) = &cgroup_fd {
@@ -286,7 +290,13 @@ pub(crate) fn spawn(opts: &CreateOptions, foreground: bool) -> Result<Spawned> {
             // Init holds its own copies of the trees until it attaches them.
             drop(trees);
             proceed(&parent_sock)?;
-            if let Some(msg) = wait_ready(&parent_sock, &sfd)? {
+            let mut failed = wait_for(&parent_sock, &sfd, &SyncMsg::SetLimits)?;
+            if failed.is_none() {
+                set_limits(&plan, pid)?;
+                proceed(&parent_sock)?;
+                failed = wait_for(&parent_sock, &sfd, &SyncMsg::Ready)?;
+            }
+            if let Some(msg) = failed {
                 // Init exits after reporting; reap it, then let the guard
                 // remove the cgroup and the state directory.
                 let _ = process::waitid(WaitTarget::PidFd(pidfd.as_fd()), false);
@@ -314,16 +324,10 @@ pub(crate) fn spawn(opts: &CreateOptions, foreground: bool) -> Result<Spawned> {
     }
 }
 
-/// The parent's part of init's setup, done while init waits for `Proceed`:
-///
-/// * the user namespace's maps (only a process outside the namespace may
-///   write them), then the idmapped mounts, which need the mapped namespace;
-/// * rlimits and `oom_score_adj`. In a user namespace, init could lower its
-///   limits but not raise a hard one, nor lower its OOM score: both need
-///   `CAP_SYS_RESOURCE` in the *initial* user namespace. So they are set
-///   from outside, for every container (one code path), and before init
-///   changes its uid, which matters for `RLIMIT_NPROC`: the kernel checks it
-///   against the new user's process count at that moment.
+/// The parent's first part of init's setup, done while init waits for its
+/// first `Proceed`: the user namespace's maps (only a process outside the
+/// namespace may write them), then the idmapped mounts, which need the
+/// mapped namespace.
 fn prepare_init(plan: &Plan, pid: Pid, trees: &HostTrees) -> Result<()> {
     if let Some(maps) = &plan.userns {
         DirectIdMapper.write(pid, maps)?;
@@ -332,6 +336,19 @@ fn prepare_init(plan: &Plan, pid: Pid, trees: &HostTrees) -> Result<()> {
             trees.idmap(plan, ns.as_fd())?;
         }
     }
+    Ok(())
+}
+
+/// The second part, when init asks with `SetLimits`: its rlimits and
+/// `oom_score_adj`. In a user namespace, init could lower its limits but
+/// not raise a hard one, nor lower its OOM score: both need
+/// `CAP_SYS_RESOURCE` in the *initial* user namespace. So they are set from
+/// outside, for every container (one code path). Init asks once its setup
+/// as root is done, so the mounts' fds don't count against the container's
+/// `RLIMIT_NOFILE`, and before it changes its uid, which matters for
+/// `RLIMIT_NPROC`: the kernel checks it against the new user's process
+/// count at that moment. (runc sets them at the same point, `procReady`.)
+fn set_limits(plan: &Plan, pid: Pid) -> Result<()> {
     for r in &plan.process.rlimits {
         process::prlimit(pid, r.resource, r.soft, r.hard)
             .with_context(|| format!("set container init's {:?} (prlimit)", r.resource))?;
@@ -369,11 +386,12 @@ pub(crate) fn block_signals() -> Result<SignalFd> {
     SignalFd::with_flags(&blocked, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK).context("signalfd")
 }
 
-/// Waits for init's `Ready`. Returns `Some(msg)` if init reported an
-/// error instead. A SIGTERM/SIGINT/SIGHUP/SIGQUIT to `rustlet-runc` meanwhile
-/// aborts the create (the guard then removes everything), so a create stuck
-/// on, say, a hung network mount can always be interrupted.
-fn wait_ready(sock: &SyncSocket, sfd: &SignalFd) -> Result<Option<SyncMsg>> {
+/// Waits for init to send `want` (`SetLimits`, then `Ready`). Returns
+/// `Some(msg)` if init reported an error instead. A
+/// SIGTERM/SIGINT/SIGHUP/SIGQUIT to `rustlet-runc` meanwhile aborts the
+/// create (the guard then removes everything), so a create stuck on, say, a
+/// hung network mount can always be interrupted.
+fn wait_for(sock: &SyncSocket, sfd: &SignalFd, want: &SyncMsg) -> Result<Option<SyncMsg>> {
     loop {
         let mut fds = [PollFd::new(sock.as_fd(), PollFlags::POLLIN), PollFd::new(sfd.as_fd(), PollFlags::POLLIN)];
         match poll(&mut fds, PollTimeout::NONE) {
@@ -390,7 +408,7 @@ fn wait_ready(sock: &SyncSocket, sfd: &SignalFd) -> Result<Option<SyncMsg>> {
         }
         if fds[0].revents().is_some_and(|r| !r.is_empty()) {
             return match sock.recv()? {
-                Some(SyncMsg::Ready) => Ok(None),
+                Some(msg) if msg == *want => Ok(None),
                 Some(msg) => Ok(Some(msg)),
                 None => Err(Error::Init {
                     message: "container init exited during setup without saying why".into(),
