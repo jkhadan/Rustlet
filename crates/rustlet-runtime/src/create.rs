@@ -11,9 +11,11 @@
 //!  cgroup: create under the delegated root, write limits, open dirfd
 //!  mkfifo exec.fifo (0622), open O_PATH
 //!  console: connect --console-socket, or a socketpair (foreground run)
+//!  open_tree: rootfs, bind sources            (rootfs::HostTrees)
 //!  setns() joins, block signals
 //!  clone3(CLONE_NEW* | CLONE_PIDFD | CLONE_INTO_CGROUP) ─► init::container_init
-//!                                               … setup …
+//!  uid_map/gid_map, idmaps, rlimits, oom          waits
+//!  send Proceed ────────────────────────────────► … setup …
 //!  recv ◄──────────────────────────────── Ready (or Error)
 //!  write state.json, pid file                   open(exec.fifo, O_WRONLY) blocks
 //!  create: exit 0      run: release() ────────► write "0", execve
@@ -43,8 +45,10 @@ use crate::cgroups::{Cgroup, SystemdDelegated};
 use crate::error::{Context, Error, Result};
 use crate::init::{self, InitContext};
 use crate::plan::Plan;
+use crate::rootfs::HostTrees;
 use crate::state::{Lock, Private, State, StateDir, Status, now_rfc3339};
 use crate::sync::{self, SyncMsg, SyncSocket};
+use crate::userns::{DirectIdMapper, IdMapper};
 use crate::{console, namespaces};
 
 /// Signals the parent intercepts (and so blocks before `clone3`) while a
@@ -194,7 +198,11 @@ pub(crate) fn spawn(opts: &CreateOptions, foreground: bool) -> Result<Spawned> {
         }
     };
 
+    // The host side of every mount, opened while we are still only in the
+    // host's namespaces (see `HostTrees` for why not in init).
+    let trees = HostTrees::open(&plan)?;
     let parent_mnt_ns = namespaces::current_mnt_ns()?;
+    let host_init_mnt_ns = namespaces::host_init_mnt_ns()?;
     namespaces::join_all(&plan.namespaces)?;
     let (parent_sock, child_sock) = sync::pair()?;
 
@@ -221,6 +229,8 @@ pub(crate) fn spawn(opts: &CreateOptions, foreground: bool) -> Result<Spawned> {
             let ctx = InitContext {
                 plan: &plan,
                 parent_mnt_ns,
+                host_init_mnt_ns,
+                trees,
                 sync: &child_sock,
                 exec_fifo: &fifo,
                 console: console_child,
@@ -272,6 +282,10 @@ pub(crate) fn spawn(opts: &CreateOptions, foreground: bool) -> Result<Spawned> {
             }
             dir.write(&state)?;
 
+            prepare_init(&plan, pid, &trees)?;
+            // Init holds its own copies of the trees until it attaches them.
+            drop(trees);
+            proceed(&parent_sock)?;
             if let Some(msg) = wait_ready(&parent_sock, &sfd)? {
                 // Init exits after reporting; reap it, then let the guard
                 // remove the cgroup and the state directory.
@@ -297,6 +311,48 @@ pub(crate) fn spawn(opts: &CreateOptions, foreground: bool) -> Result<Spawned> {
                 guard,
             })
         }
+    }
+}
+
+/// The parent's part of init's setup, done while init waits for `Proceed`:
+///
+/// * the user namespace's maps (only a process outside the namespace may
+///   write them), then the idmapped mounts, which need the mapped namespace;
+/// * rlimits and `oom_score_adj`. In a user namespace, init could lower its
+///   limits but not raise a hard one, nor lower its OOM score: both need
+///   `CAP_SYS_RESOURCE` in the *initial* user namespace. So they are set
+///   from outside, for every container (one code path), and before init
+///   changes its uid, which matters for `RLIMIT_NPROC`: the kernel checks it
+///   against the new user's process count at that moment.
+fn prepare_init(plan: &Plan, pid: Pid, trees: &HostTrees) -> Result<()> {
+    if let Some(maps) = &plan.userns {
+        DirectIdMapper.write(pid, maps)?;
+        if plan.mounts.iter().any(|m| m.idmap.is_some()) {
+            let ns = process::open_ns(format!("/proc/{pid}/ns/user")).context("open init's user namespace")?;
+            trees.idmap(plan, ns.as_fd())?;
+        }
+    }
+    for r in &plan.process.rlimits {
+        process::prlimit(pid, r.resource, r.soft, r.hard)
+            .with_context(|| format!("set container init's {:?} (prlimit)", r.resource))?;
+    }
+    if let Some(adj) = plan.process.oom_score_adj {
+        // Init is our unreaped child, so its PID can't have been reused.
+        let path = format!("/proc/{pid}/oom_score_adj");
+        std::fs::write(&path, adj.to_string()).with_context(|| format!("write {path}"))?;
+    }
+    Ok(())
+}
+
+/// Lets init go on. If it is already gone, what it reported before dying
+/// says more than our `EPIPE`.
+fn proceed(sock: &SyncSocket) -> Result<()> {
+    match sock.send(&SyncMsg::Proceed) {
+        Ok(()) => Ok(()),
+        Err(e) => match sock.recv() {
+            Ok(Some(msg)) => Err(msg.into_error()),
+            _ => Err(e),
+        },
     }
 }
 

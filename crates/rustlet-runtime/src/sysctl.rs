@@ -23,6 +23,13 @@
 //! fails with `ENOENT`) or shown read-only (`rmem_max`, mode 0444 on Linux
 //! 7.0: `EACCES`), so the write fails instead of reaching the host.
 //!
+//! With a user namespace, "its own" gets stricter: the kernel lets container
+//! root write a namespaced sysctl only if its user namespace *owns* that
+//! namespace, which only the new ones are (a joined network namespace
+//! belongs to whoever created it). And `kernel.domainname` can't be set at
+//! all: UTS sysctls check for *host* root, which container root isn't (the
+//! spec's `domainname` field still works; it is a syscall).
+//!
 //! [`plan`] checks all this in `rustlet-runc`, before the container exists.
 //! [`apply`] then writes the values from container init (which is in the
 //! container's namespaces, so the kernel picks the container's copy),
@@ -180,15 +187,28 @@ fn namespace_of(key: &str, parts: &[&str]) -> Result<Kind> {
 /// Refuses `key` unless the container gets a `kind` namespace of its own.
 ///
 /// "Its own" means: a new one, or one joined by path that is not the one
-/// `rustlet-runc` itself runs in. (Like runc, "the host" here is the
+/// `rustlet-runc` itself runs in; with a user namespace, only a new one (see
+/// the module docs). (Like runc, "the host" here is the
 /// *current* namespace, not the initial one: nested inside another container
 /// that is the right notion, since it is the namespace we would be changing.)
 /// A type not listed in `linux.namespaces` at all is shared with us.
 fn check_own_namespace(key: &str, kind: Kind, ns: &NamespacePlan) -> Result<()> {
+    if ns.new_user() && kind == Kind::Uts {
+        return Err(Error::invalid(format!(
+            "sysctl {key} can't be set in a container with a user namespace: the kernel only lets host root write \
+             UTS sysctls (set the spec's `domainname` field instead)"
+        )));
+    }
     if ns.clone_flags.contains(kind.flag()) {
         return Ok(());
     }
     let name = kind.spec_name();
+    if ns.new_user() {
+        return Err(Error::invalid(format!(
+            "sysctl {key} needs a new {name} namespace: with a user namespace, container root may only change \
+             sysctls of namespaces created with it (add {{\"type\": \"{name}\"}} to linux.namespaces, without a path)"
+        )));
+    }
     let Some(join) = ns.joins.iter().find(|j| j.kind == kind.flag()) else {
         return Err(Error::invalid(format!(
             "sysctl {key} needs the container to have its own {name} namespace, but it shares the host's \
@@ -292,6 +312,22 @@ mod tests {
         // A join path that doesn't exist is an error, not "not the host".
         let gone = ns(CloneFlags::empty(), vec![Join { kind: CloneFlags::NEWNET, path: "/nonexistent/ns".into() }]);
         assert!(one("net.ipv4.ip_forward", "1", &gone).is_err());
+    }
+
+    #[test]
+    fn with_a_user_namespace_only_new_namespaces_count() {
+        let user = ns(CloneFlags::NEWUSER | CloneFlags::NEWIPC | CloneFlags::NEWUTS, vec![]);
+        one("kernel.shmmax", "1024", &user).unwrap();
+        // A joined network namespace belongs to someone else's user namespace.
+        let joined = NamespacePlan {
+            joins: vec![Join { kind: CloneFlags::NEWNET, path: "/proc/self/ns/ipc".into() }],
+            ..user.clone()
+        };
+        let msg = one("net.ipv4.ip_forward", "1", &joined).unwrap_err().to_string();
+        assert!(msg.contains("needs a new network namespace"), "{msg}");
+        // UTS sysctls check for host root.
+        let msg = one("kernel.domainname", "example", &user).unwrap_err().to_string();
+        assert!(msg.contains("`domainname` field"), "{msg}");
     }
 
     #[test]

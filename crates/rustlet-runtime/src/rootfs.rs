@@ -1,24 +1,32 @@
 //! Building the container's filesystem view and switching into it.
 //!
 //! Runs inside container init, in its brand-new mount namespace, which
-//! starts as a *copy* of the host's mount table. The steps, in order:
+//! starts as a *copy* of the host's mount table. Before that, still in
+//! `rustlet-runc`, the host-side trees are opened ([`HostTrees`]). The steps,
+//! in order:
 //!
+//! 0. **Open the host's trees** (parent, before `clone3`): the rootfs and
+//!    every bind-mount source, as detached copies (`open_tree(CLONE)`), see
+//!    [`HostTrees`] for why the parent does this.
 //! 1. **Cut propagation** ([`make_private`]). The copied mounts keep their
 //!    propagation type, and on a systemd host `/` is `shared`: a mount
 //!    (or unmount!) under a shared mount is replayed in every peer, including
 //!    the host's namespace. `mount("/", MS_REC|MS_PRIVATE)` turns every mount
 //!    into a private one, and we re-read mountinfo to *prove* no shared mount
 //!    is left before going further.
-//! 2. **Bind the rootfs onto itself** ([`bind_rootfs`]). `pivot_root`
-//!    requires the new root to be a mount point; a plain directory isn't
-//!    one. `open_tree(OPEN_TREE_CLONE)` + `move_mount` makes it one, and the
-//!    fd we keep refers to the root of that new mount.
+//! 2. **Attach the rootfs on top of `/`** ([`attach_rootfs`]). `pivot_root`
+//!    needs the new root to be a mount point, and this makes it one without
+//!    ever looking up the rootfs's path in here. It doesn't change what init
+//!    sees as `/` yet: a process's root is a (mount, directory) pair that
+//!    stays the *lower* mount, so host paths such as `/dev/null` still
+//!    resolve on the host until step 5.
 //! 3. **Mount everything in `config.json`** ([`mount_entry`]), fd-based:
-//!    build the mount detached (`fsopen`/`fsmount` or `open_tree`), resolve
-//!    the target with `openat2(RESOLVE_IN_ROOT)`, attach with `move_mount`
-//!    onto that fd. See `inroot` for why.
-//! 4. **Populate `/dev`** ([`populate_dev`]): device nodes and the standard
-//!    symlinks, only ever inside a tmpfs.
+//!    build the mount detached (`fsopen`/`fsmount`, or the parent's tree),
+//!    resolve the target with `openat2(RESOLVE_IN_ROOT)`, attach with
+//!    `move_mount` onto that fd. See `inroot` for why.
+//! 4. **Populate `/dev`** ([`populate_dev`]): device nodes (or, in a user
+//!    namespace, bind mounts of the host's) and the standard symlinks, only
+//!    ever inside a tmpfs.
 //! 5. **Switch root** ([`pivot`]): `pivot_root(".", ".")`, then detach the
 //!    old root, which is now stacked on top of the new one.
 //! 6. **Read-only root** ([`make_root_readonly`]), if asked for.
@@ -30,8 +38,8 @@ use nix::fcntl::OFlag;
 use nix::sys::stat::{Mode, SFlag};
 use rustlet_sys::fs::{fs_magic, fstatx, magic};
 use rustlet_sys::mount::{
-    self, FsContext, MntFlags, MountAttr, MsFlags, OpenTreeFlags, Propagation, SetAttr, mount_setattr, move_mount_fd,
-    open_tree,
+    self, FsContext, MntFlags, MountAttr, MoveMountFlags, MsFlags, OpenTreeFlags, Propagation, SetAttr, mount_setattr,
+    move_mount_fd, open_tree,
 };
 use rustlet_sys::{Errno, mountinfo};
 
@@ -40,15 +48,78 @@ use crate::inroot;
 use crate::mounts::{self, FsOption, MountEntry, MountKind};
 use crate::plan::Plan;
 
-/// Steps 1–5 (and 6 if requested), in order. On return the process's root
-/// and working directory are the container's `/`.
-pub fn setup(plan: &Plan) -> Result<()> {
-    make_private()?;
-    let root = bind_rootfs(&plan.root)?;
-    for m in &plan.mounts {
-        mount_entry(root.as_fd(), m)?;
+/// The host side of a container's mounts, opened by `rustlet-runc` itself
+/// before `clone3`: the rootfs and the source of every bind mount.
+///
+/// Why the parent, and not init:
+///
+/// * **Init may not be able to reach them.** With a user namespace, init is
+///   host uid 1000000, and a bundle in a `0750` home directory is out of its
+///   reach (every path lookup checks search permission on each directory).
+///   The parent is host root.
+/// * **Idmapped mounts need it.** Only a mount that isn't attached anywhere
+///   yet may be idmapped, and only by someone privileged over the
+///   filesystem's own user namespace (the host's): the parent does it while
+///   init waits ([`HostTrees::idmap`]).
+/// * **Each host path is resolved exactly once**, by the privileged side,
+///   before any process of the container exists to race with it.
+///
+/// Every tree is a *detached* copy (`open_tree(OPEN_TREE_CLONE)`): a mount
+/// that is attached nowhere, so nothing can be mounted onto or below it and
+/// the fd is the only way to it. Init inherits the fds through `clone3` and
+/// attaches them; they are close-on-exec, so none reaches the container's
+/// program.
+pub(crate) struct HostTrees {
+    rootfs: OwnedFd,
+    /// One per `plan.mounts` entry: `Some` for bind mounts.
+    binds: Vec<Option<OwnedFd>>,
+}
+
+impl HostTrees {
+    /// Parent side, before `clone3`.
+    pub(crate) fn open(plan: &Plan) -> Result<HostTrees> {
+        let rootfs = open_rootfs(&plan.root)?;
+        let binds = plan
+            .mounts
+            .iter()
+            .map(|m| match &m.kind {
+                MountKind::Bind { source, recursive } => open_bind(m, source, *recursive).map(Some),
+                MountKind::Fs { .. } | MountKind::HostSysfs => Ok(None),
+            })
+            .collect::<Result<_>>()?;
+        Ok(HostTrees { rootfs, binds })
     }
-    populate_dev(root.as_fd())?;
+
+    /// Parent side, once the user namespace's maps are written: idmaps the
+    /// bind mounts that asked for it (`idmap`, `ridmap`) with `userns`, an fd
+    /// for init's user namespace. File owners on those mounts are then
+    /// translated through the container's maps: a file of host root's
+    /// belongs to container root, and what container root creates is stored
+    /// as host root's.
+    pub(crate) fn idmap(&self, plan: &Plan, userns: BorrowedFd<'_>) -> Result<()> {
+        for (m, tree) in plan.mounts.iter().zip(&self.binds) {
+            let (Some(idmap), Some(tree)) = (&m.idmap, tree) else { continue };
+            mount_setattr(
+                tree.as_fd(),
+                idmap.recursive,
+                &SetAttr { set: MountAttr::IDMAP, userns: Some(userns), ..Default::default() },
+            )
+            .with_context(|| format!("mount {}: idmap it with the container's user namespace", m.describe()))?;
+        }
+        Ok(())
+    }
+}
+
+/// Steps 1–5 (and 6 if requested), in order, with the trees the parent
+/// opened. On return the process's root and working directory are the
+/// container's `/`.
+pub(crate) fn setup(plan: &Plan, trees: HostTrees) -> Result<()> {
+    make_private()?;
+    let root = attach_rootfs(trees.rootfs)?;
+    for (m, tree) in plan.mounts.iter().zip(trees.binds) {
+        mount_entry(root.as_fd(), m, tree)?;
+    }
+    populate_dev(root.as_fd(), plan.namespaces.new_user())?;
     // The working directory is created (if missing) while we still hold the
     // rootfs fd; `process` chdir()s into it after the identity switch.
     inroot::mkdir_all(root.as_fd(), &plan.process.cwd, Mode::from_bits_truncate(0o755))
@@ -81,12 +152,11 @@ pub fn make_private() -> Result<()> {
     Ok(())
 }
 
-/// Step 2: turns `root` into a mount point by bind-mounting it onto itself,
-/// recursively (a rootfs may contain mounts of its own), with `nodev`: device
-/// nodes that come with an image never work. Returns an `O_PATH` fd for the
-/// root of the new mount.
-pub fn bind_rootfs(root: &Path) -> Result<OwnedFd> {
-    let ctx = || format!("bind rootfs {}", root.display());
+/// Step 0 (parent): a detached, recursive copy of the rootfs (it may contain
+/// mounts of its own), with `nodev` on every mount of it: device nodes that
+/// come with an image never work.
+fn open_rootfs(root: &Path) -> Result<OwnedFd> {
+    let ctx = || format!("open rootfs {}", root.display());
     let tree = open_tree(None, root, OpenTreeFlags::CLONE | OpenTreeFlags::RECURSIVE).with_context(ctx)?;
     mount_setattr(
         tree.as_fd(),
@@ -94,20 +164,50 @@ pub fn bind_rootfs(root: &Path) -> Result<OwnedFd> {
         &SetAttr { set: MountAttr::NODEV, propagation: Some(Propagation::Private), ..Default::default() },
     )
     .with_context(ctx)?;
-    let target = nix::fcntl::open(
-        root,
-        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )
-    .with_context(ctx)?;
-    move_mount_fd(tree.as_fd(), target.as_fd()).with_context(ctx)?;
-    // After move_mount, `tree` refers to the root of the attached mount;
-    // `target` still refers to the directory *underneath* it.
     Ok(tree)
 }
 
-/// Step 3: creates one mount detached, then attaches it at its destination.
-pub fn mount_entry(root: BorrowedFd<'_>, m: &MountEntry) -> Result<()> {
+/// Step 0 (parent): a detached copy of a bind mount's source, `rbind`
+/// copying the mounts below it too. The clone inherits the source mount's
+/// attributes; `set`/`clear` adjust them. Like mount(8), `ro` on an rbind
+/// applies to the top mount only; submounts keep their own flags (the
+/// recursive `rro` & co. are applied in [`mount_entry`]).
+fn open_bind(m: &MountEntry, source: &Path, recursive: bool) -> Result<OwnedFd> {
+    let ctx = || format!("mount {}", m.describe());
+    let mut flags = OpenTreeFlags::CLONE;
+    if recursive {
+        flags |= OpenTreeFlags::RECURSIVE;
+    }
+    let tree = open_tree(None, source, flags).with_context(ctx)?;
+    mount_setattr(
+        tree.as_fd(),
+        false,
+        &SetAttr { set: m.set, clear: m.clear, propagation: Some(Propagation::Private), userns: None },
+    )
+    .with_context(ctx)?;
+    Ok(tree)
+}
+
+/// Step 2: mounts the rootfs tree (from [`HostTrees`]) on top of `/`, and
+/// returns the tree's fd, which now refers to the root of the attached
+/// mount.
+///
+/// `/` because it is the one place init can always name: it never has to
+/// look up the rootfs's host path, which (see [`HostTrees`]) it might not be
+/// allowed to. Being mounted *on* `/`, the tree is a child of the old root,
+/// exactly what `pivot_root` needs (step 5). Until then, init's root stays
+/// the old root underneath (a process's root doesn't move when something is
+/// mounted over it), so its absolute paths still lead to the host's files.
+pub fn attach_rootfs(tree: OwnedFd) -> Result<OwnedFd> {
+    mount::move_mount(Some(tree.as_fd()), Path::new(""), None, Path::new("/"), MoveMountFlags::F_EMPTY_PATH)
+        .context("attach the rootfs on top of /")?;
+    Ok(tree)
+}
+
+/// Step 3: attaches one mount at its destination: a new filesystem, the
+/// parent's tree for a bind mount (`tree`), or init's copy of the host's
+/// `/sys`.
+pub(crate) fn mount_entry(root: BorrowedFd<'_>, m: &MountEntry, tree: Option<OwnedFd>) -> Result<()> {
     let ctx = || format!("mount {}", m.describe());
     let (mnt, is_dir) = match &m.kind {
         MountKind::Fs { fstype, source, options } => {
@@ -125,29 +225,22 @@ pub fn mount_entry(root: BorrowedFd<'_>, m: &MountEntry) -> Result<()> {
             // For a new filesystem the attributes are simply part of fsmount.
             (fs.mount(m.set).with_context(ctx)?, true)
         }
-        MountKind::Bind { source, recursive } => {
-            let is_dir = std::fs::metadata(source).with_context(ctx)?.is_dir();
-            let mut flags = OpenTreeFlags::CLONE;
-            if *recursive {
-                flags |= OpenTreeFlags::RECURSIVE;
-            }
-            let tree = open_tree(None, source, flags).with_context(ctx)?;
-            // The clone inherits the source mount's attributes; `set`/`clear`
-            // adjust them. Like mount(8), `ro` on an rbind applies to the top
-            // mount only; submounts keep their own flags.
-            mount_setattr(
-                tree.as_fd(),
-                false,
-                &SetAttr { set: m.set, clear: m.clear, propagation: Some(Propagation::Private), userns: None },
-            )
-            .with_context(ctx)?;
+        MountKind::Bind { .. } => {
+            let tree = tree.ok_or_else(|| Error::Init {
+                message: format!("{}: rustlet-runc didn't open the source", ctx()),
+                errno: None,
+            })?;
+            let is_dir = fstatx(tree.as_fd()).with_context(ctx)?.is_dir();
             (tree, is_dir)
         }
+        MountKind::HostSysfs => (host_sysfs(m).with_context(ctx)?, true),
     };
-    if let MountKind::Fs { fstype, .. } = &m.kind
-        && matches!(fstype.as_str(), "proc" | "sysfs")
-    {
-        refuse_symlinked_destination(root, m, fstype)?;
+    match &m.kind {
+        MountKind::Fs { fstype, .. } if matches!(fstype.as_str(), "proc" | "sysfs") => {
+            refuse_symlinked_destination(root, m, fstype)?;
+        }
+        MountKind::HostSysfs => refuse_symlinked_destination(root, m, "sysfs")?,
+        _ => {}
     }
     if !m.rec_set.is_empty() || !m.rec_clear.is_empty() {
         mount_setattr(
@@ -161,6 +254,26 @@ pub fn mount_entry(root: BorrowedFd<'_>, m: &MountEntry) -> Result<()> {
         inroot::ensure_mount_target(root, &m.destination, is_dir).with_context(|| format!("{}: mount point", ctx()))?;
     check_resolved_target(m, target.as_fd())?;
     move_mount_fd(mnt.as_fd(), target.as_fd()).with_context(ctx)
+}
+
+/// [`MountKind::HostSysfs`]: a recursive copy of `/sys` from init's copy of
+/// the host's mount table (before `pivot_root`, `/sys` is still the
+/// host's), with the entry's attributes on every mount of the copy, so that
+/// `ro` also covers what is mounted below `/sys`. Made here rather than by the
+/// parent because the kernel keeps what it copies into a less privileged
+/// mount namespace *locked*: those submounts can't be taken off to look
+/// underneath, or have their flags cleared.
+fn host_sysfs(m: &MountEntry) -> rustlet_sys::Result<OwnedFd> {
+    let tree = open_tree(None, Path::new("/sys"), OpenTreeFlags::CLONE | OpenTreeFlags::RECURSIVE)?;
+    if fs_magic(tree.as_fd())? != magic::SYSFS_MAGIC {
+        return Err(Errno::EXDEV);
+    }
+    mount_setattr(
+        tree.as_fd(),
+        true,
+        &SetAttr { set: m.set, clear: m.clear, propagation: Some(Propagation::Private), userns: None },
+    )?;
+    Ok(tree)
 }
 
 /// procfs and sysfs go exactly where the spec says, onto a real directory:
@@ -231,7 +344,13 @@ const DEV_SYMLINKS: [(&str, &str); 5] = [
 /// Refuses unless `/dev` is a tmpfs: the nodes must never be written into
 /// the image's own `dev/` directory (which is shared and, being on a `nodev`
 /// mount, couldn't use them anyway).
-pub fn populate_dev(root: BorrowedFd<'_>) -> Result<()> {
+///
+/// In a user namespace (`userns`), `mknod` of a device is always `EPERM`
+/// (it needs `CAP_MKNOD` in the initial user namespace), and a node on a
+/// filesystem mounted from inside one could never be opened anyway (the
+/// kernel marks such superblocks "no devices"). So each node is a bind mount
+/// of the host's own instead ([`bind_host_device`]).
+pub fn populate_dev(root: BorrowedFd<'_>, userns: bool) -> Result<()> {
     let dev = inroot::open_dir(root, Path::new("/dev")).context("open /dev in rootfs")?;
     if fs_magic(dev.as_fd()).context("fstatfs /dev")? != magic::TMPFS_MAGIC {
         return Err(Error::invalid(
@@ -239,6 +358,10 @@ pub fn populate_dev(root: BorrowedFd<'_>) -> Result<()> {
         ));
     }
     for (name, major, minor) in DEFAULT_DEVICES {
+        if userns {
+            bind_host_device(dev.as_fd(), name, (major, minor))?;
+            continue;
+        }
         // umask is 0 during init, so 0o666 is exactly what gets created.
         match nix::sys::stat::mknodat(
             &dev,
@@ -260,6 +383,40 @@ pub fn populate_dev(root: BorrowedFd<'_>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A bind of the host's `/dev/<name>` onto a new, empty file in the
+/// container's `/dev`.
+///
+/// The host's node comes from init's copy of the host's mount table (step 4
+/// runs before `pivot_root`, so `/dev` is still the host's devtmpfs, which
+/// belongs to the initial user namespace: its nodes can be opened). The copy
+/// is checked to be the character device it should be before it is attached,
+/// and it inherits the host mount's `nosuid`/`noexec`, locked.
+fn bind_host_device(dev: BorrowedFd<'_>, name: &str, (major, minor): (u64, u64)) -> Result<()> {
+    let ctx = || format!("bind the host's /dev/{name}");
+    let host = Path::new("/dev").join(name);
+    let tree = open_tree(None, &host, OpenTreeFlags::CLONE | OpenTreeFlags::SYMLINK_NOFOLLOW).with_context(ctx)?;
+    let st = fstatx(tree.as_fd()).with_context(ctx)?;
+    if !st.is_char_device() || (u64::from(st.rdev.0), u64::from(st.rdev.1)) != (major, minor) {
+        return Err(Error::Init {
+            message: format!(
+                "the host's /dev/{name} is not character device {major}:{minor} (file type {:#o}, device {}:{})",
+                st.file_type(),
+                st.rdev.0,
+                st.rdev.1
+            ),
+            errno: None,
+        });
+    }
+    let create = OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let target = match nix::fcntl::openat(dev, name, create, Mode::from_bits_truncate(0o666)) {
+        Ok(fd) => fd,
+        // Already there (e.g. the spec bind-mounted one): keep it.
+        Err(Errno::EEXIST) => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("create /dev/{name}")),
+    };
+    move_mount_fd(tree.as_fd(), target.as_fd()).with_context(ctx)
 }
 
 /// Step 5: makes `root` the process's `/` and throws the host's view away.

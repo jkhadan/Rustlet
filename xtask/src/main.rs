@@ -3,7 +3,7 @@
 //!
 //! | task          | what it does                                                   |
 //! |---------------|----------------------------------------------------------------|
-//! | `rootfs`      | download Alpine's minirootfs, build the demo/test bundle       |
+//! | `rootfs`      | download Alpine's minirootfs, build the demo/test bundle; `--remap` adds the user-namespace one (via sudo) |
 //! | `itest`       | build as you, then run the privileged tests as root in a limited systemd scope |
 //! | `dev-storage` | put `/var/lib/rustlet` on its own loop-mounted ext4 image      |
 //! | `check-host`  | report the host facts the design depends on                    |
@@ -43,6 +43,21 @@ enum Task {
         /// Re-extract the rootfs and overwrite config.json.
         #[arg(long)]
         force: bool,
+        /// Also generate bundles/alpine-remap for user-namespace tests: a
+        /// rootfs owned by host ids 1000000+ (asks for sudo to chown it).
+        #[arg(long)]
+        remap: bool,
+    },
+    /// The root half of `rootfs --remap`, which runs it through sudo.
+    #[command(hide = true)]
+    RemapExtract {
+        /// The Alpine tarball (its sha256 is checked again).
+        tarball: PathBuf,
+        /// The bundle directory; must be .rustlet-dev/bundles/alpine-remap.
+        bundle: PathBuf,
+        /// Replace an existing rootfs.
+        #[arg(long)]
+        force: bool,
     },
     /// Run the privileged integration tests (tests/ crate) as root.
     Itest {
@@ -72,6 +87,10 @@ enum Task {
         /// CPU limit in CPUs, e.g. 0.5.
         #[arg(long)]
         cpus: Option<f64>,
+        /// Run in a user namespace (container root = host uid 1000000); needs
+        /// `cargo xtask rootfs --remap`.
+        #[arg(long)]
+        userns: bool,
     },
     /// Compile a seccomp profile (Docker's default, or a bundle's) and show the BPF program.
     Seccomp {
@@ -97,11 +116,12 @@ enum Task {
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().task {
-        Task::Rootfs { force } => rootfs::run(force),
+        Task::Rootfs { force, remap } => rootfs::run(force, remap),
+        Task::RemapExtract { tarball, bundle, force } => rootfs::remap_extract(&tarball, &bundle, force),
         Task::Itest { args } => itest::run(&args),
         Task::DevStorage { size, dry_run } => devstorage::run(&size, dry_run),
         Task::CheckHost => checkhost::run(),
-        Task::Demo { memory, pids, cpus } => demo::run(memory.as_deref(), pids, cpus),
+        Task::Demo { memory, pids, cpus, userns } => demo::run(memory.as_deref(), pids, cpus, userns),
         Task::Seccomp { bundle, caps, disasm, json } => seccomp::run(bundle.as_deref(), caps.as_deref(), disasm, json),
         Task::ImageRun => bail!("`image-run` arrives in Phase 3 (images)"),
         Task::GenTs => bail!("`gen-ts` arrives in Phase 6 (desktop app)"),

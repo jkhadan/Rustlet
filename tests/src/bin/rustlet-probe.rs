@@ -1,8 +1,10 @@
 //! `rustlet-probe`: makes the syscalls that busybox can't, for the seccomp
-//! tests in `tests/tests/hardening.rs`.
+//! tests in `tests/tests/hardening.rs` and the user-namespace tests.
 //!
 //! Each argument names one probe. For each one it prints a line
-//! `<probe> ok` or `<probe> <ERRNO>`, e.g. `clone3 ENOSYS`.
+//! `<probe> ok` or `<probe> <ERRNO>`, e.g. `clone3 ENOSYS`; the
+//! `session-keyring` probe prints the keyring's serial number and
+//! description instead of `ok` (`<serial> keyring;<uid>;<gid>;<perm>;<name>`).
 //!
 //! This is a glibc binary and the test rootfs is Alpine (musl), so the tests
 //! bind-mount it together with the host's library directory and start it
@@ -58,6 +60,14 @@ fn probe(name: &str) -> Option<Result<(), Errno>> {
 
 fn main() -> std::process::ExitCode {
     for name in std::env::args().skip(1) {
+        if name == "session-keyring" {
+            use rustlet_sys::keyring::{SESSION_KEYRING, describe, keyring_id};
+            match keyring_id(SESSION_KEYRING).and_then(|id| Ok((id, describe(id)?))) {
+                Ok((id, d)) => println!("{name} {id} {d}"),
+                Err(e) => println!("{name} {e:?}"),
+            }
+            continue;
+        }
         match probe(&name) {
             Some(Ok(())) => println!("{name} ok"),
             Some(Err(e)) => println!("{name} {e:?}"),

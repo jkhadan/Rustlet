@@ -12,6 +12,9 @@
 //! `exec.fifo` for writing, which only returns once `rustlet-runc start` (or
 //! `run`) opens the other end. Phase 2b added the hardening: a session
 //! keyring, sysctls, masked and read-only paths, capabilities and seccomp.
+//! Phase 2c added user namespaces: init first waits for the parent to map
+//! it (and to set its rlimits, which it might not be allowed to raise
+//! itself), then becomes root of its namespace.
 
 use std::convert::Infallible;
 use std::io::Write;
@@ -25,15 +28,20 @@ use rustlet_sys::process::{self, CloneFlags};
 use crate::error::{Context, Error, Result};
 use crate::plan::Plan;
 use crate::proc_handle::ProcHandle;
+use crate::rootfs::HostTrees;
 use crate::sync::{SyncMsg, SyncSocket};
-use crate::{console, namespaces, paths, process as proc_setup, rootfs, sysctl};
+use crate::{console, namespaces, paths, process as proc_setup, rootfs, sysctl, userns};
 
 /// Everything init gets from its parent besides the plan. The fds are the
 /// child's copies (inherited through the address-space copy of `clone3`).
 pub(crate) struct InitContext<'a> {
     pub plan: &'a Plan,
-    /// The mount namespace `rustlet-runc` started in (for the safety check).
+    /// The mount namespace `rustlet-runc` started in, and host init's (for
+    /// the safety check).
     pub parent_mnt_ns: (u64, u64),
+    pub host_init_mnt_ns: (u64, u64),
+    /// The rootfs and bind-mount sources, opened by the parent.
+    pub trees: HostTrees,
     pub sync: &'a SyncSocket,
     /// `O_PATH` fd of `<state dir>/exec.fifo`. After `pivot_root` the path
     /// is unreachable, the fd is not.
@@ -56,8 +64,19 @@ pub(crate) fn container_init(ctx: InitContext<'_>) -> Error {
     }
 }
 
-fn try_init(mut ctx: InitContext<'_>) -> Result<Infallible> {
-    let plan = ctx.plan;
+fn try_init(ctx: InitContext<'_>) -> Result<Infallible> {
+    let InitContext {
+        plan,
+        parent_mnt_ns,
+        host_init_mnt_ns,
+        trees,
+        sync,
+        exec_fifo,
+        mut console,
+        foreground,
+        preserve_fds,
+        no_new_keyring,
+    } = ctx;
     // ── signals ───────────────────────────────────────────────────────────
     // The parent blocked the signals it forwards *before* clone3 (so none
     // can slip through between clone3 and its signalfd). A blocked mask
@@ -73,29 +92,35 @@ fn try_init(mut ctx: InitContext<'_>) -> Result<Infallible> {
     nix::sys::stat::umask(Mode::empty());
 
     // ── namespaces ────────────────────────────────────────────────────────
+    // The parent maps our user namespace, idmaps mounts and sets our rlimits
+    // and oom_score_adj; nothing here may run before that.
+    sync.wait_proceed()?;
+    if plan.namespaces.new_user() {
+        userns::become_root()?;
+    }
     if plan.namespaces.new_cgroup {
         // We were born in the container's cgroup (CLONE_INTO_CGROUP), so the
         // new cgroup namespace is rooted there: /proc/self/cgroup = "0::/".
         process::unshare(CloneFlags::NEWCGROUP).context("unshare(CLONE_NEWCGROUP)")?;
     }
     // Hard stop before the first mount: never touch the host's mount table.
-    namespaces::assert_new_mount_ns(ctx.parent_mnt_ns)?;
+    namespaces::assert_new_mount_ns(parent_mnt_ns, host_init_mnt_ns)?;
     // A procfs instance of our own, attached nowhere: sysctls and
     // oom_score_adj are written through it, so no mount in the container
     // can redirect those writes.
     let proc = ProcHandle::new()?;
-    if !ctx.no_new_keyring {
+    if !no_new_keyring {
         proc_setup::join_session_keyring(&plan.id)?;
     }
 
     // ── filesystem ────────────────────────────────────────────────────────
-    rootfs::setup(plan)?;
+    rootfs::setup(plan, trees)?;
 
     // ── terminal ──────────────────────────────────────────────────────────
     // After pivot_root (the PTY must come from the container's own devpts),
     // before the identity switch (bind-mounting /dev/console needs root).
     if plan.process.terminal {
-        let sock = ctx.console.take().ok_or_else(|| Error::invalid("terminal requested without a console socket"))?;
+        let sock = console.take().ok_or_else(|| Error::invalid("terminal requested without a console socket"))?;
         console::setup_container_tty(sock, plan.process.console_size)?;
     }
 
@@ -114,7 +139,7 @@ fn try_init(mut ctx: InitContext<'_>) -> Result<Infallible> {
         bring_up_loopback()?;
     }
     paths::apply(&plan.paths)?;
-    proc_setup::set_limits(&plan.process, &proc)?;
+    // (rlimits and oom_score_adj were set by the parent, before Proceed.)
     drop(proc);
 
     // ── identity ──────────────────────────────────────────────────────────
@@ -129,11 +154,11 @@ fn try_init(mut ctx: InitContext<'_>) -> Result<Infallible> {
     // the same: `--preserve-fds 5` with only fd 3 open is not an error.)
     // Before the identity switch, which may load the seccomp filter: a
     // profile that doesn't allow close_range must not break the container.
-    rustlet_sys::fs::close_range_cloexec(3 + ctx.preserve_fds).context("close_range(CLOEXEC)")?;
+    rustlet_sys::fs::close_range_cloexec(3 + preserve_fds).context("close_range(CLOEXEC)")?;
     proc_setup::switch_identity(&plan.process, plan.seccomp.as_ref())?;
     proc_setup::enter_cwd(&plan.process)?;
     let prepared = proc_setup::prepare_exec(&plan.process)?;
-    if ctx.foreground {
+    if foreground {
         // Foreground `run`: if rustlet-runc dies, so does the container.
         // (Set after the identity switch: the kernel clears it when
         // credentials change.) Detached containers outlive `create` on purpose.
@@ -141,8 +166,8 @@ fn try_init(mut ctx: InitContext<'_>) -> Result<Infallible> {
     }
 
     // ── the gate ──────────────────────────────────────────────────────────
-    ctx.sync.send(&SyncMsg::Ready)?;
-    wait_for_start(ctx.exec_fifo)?;
+    sync.send(&SyncMsg::Ready)?;
+    wait_for_start(exec_fifo)?;
 
     Err(proc_setup::exec(&plan.process, &prepared, plan.seccomp.as_ref()))
 }

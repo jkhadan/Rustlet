@@ -13,7 +13,7 @@
 //! * not listed: the container **shares** the runtime's namespace, e.g.
 //!   `--pid=host`.
 //!
-//! Two types get special treatment:
+//! Three types get special treatment:
 //!
 //! * **mount** must always be new. Joining one, or sharing the host's, would
 //!   let `pivot_root` and the container's mounts land in someone else's
@@ -27,6 +27,11 @@
 //!   placing the child; on this 7.0 kernel a combined `clone3` gets it right
 //!   too, see `docs/learn/04-cgroups-v2.md`. Unsharing after placement is
 //!   correct on every kernel either way.)
+//! * **user** can only be new (see `userns`). `clone3` creates it *first*,
+//!   so every other new namespace is owned by it, which is what gives
+//!   container root its capabilities over them. Joining one by path is
+//!   refused: the parent would have to `setns` into it before `clone3`, and
+//!   would lose its host privileges for everything it still has to do.
 
 use std::os::fd::AsFd;
 use std::path::PathBuf;
@@ -60,6 +65,11 @@ impl NamespacePlan {
     pub fn new_uts(&self) -> bool {
         self.clone_flags.contains(CloneFlags::NEWUTS)
     }
+
+    /// Whether the container gets a user namespace of its own.
+    pub fn new_user(&self) -> bool {
+        self.clone_flags.contains(CloneFlags::NEWUSER)
+    }
 }
 
 fn flag(t: LinuxNamespaceType) -> CloneFlags {
@@ -87,10 +97,10 @@ pub fn plan(namespaces: &[LinuxNamespace]) -> Result<NamespacePlan> {
         }
         seen |= f;
         match (t, ns.path()) {
-            (LinuxNamespaceType::User, _) => {
+            (LinuxNamespaceType::User, Some(_)) => {
                 return Err(Error::Unsupported(vec![Unsupported {
-                    field: "linux.namespaces: user".into(),
-                    when: "Phase 2c",
+                    field: "linux.namespaces: joining a user namespace by path".into(),
+                    when: "not planned",
                 }]));
             }
             (LinuxNamespaceType::Mount, Some(_)) => {
@@ -131,14 +141,20 @@ pub fn current_mnt_ns() -> Result<(u64, u64)> {
     procfs::ns_id(None, "mnt").context("read /proc/self/ns/mnt")
 }
 
+/// Identity of host init's mount namespace (`/proc/1/ns/mnt`), read by the
+/// parent: container init, in a user namespace, may not look at PID 1's
+/// namespaces.
+pub fn host_init_mnt_ns() -> Result<(u64, u64)> {
+    procfs::ns_id(Some(nix::unistd::Pid::from_raw(1)), "mnt").context("read /proc/1/ns/mnt")
+}
+
 /// Child side, **before any mount**: proves that this process is in a new
 /// mount namespace, different both from the one `rustlet-runc` started in
-/// and from host init's (`/proc/1/ns/mnt`, still the host's procfs at this
-/// point). This check runs in release builds too; it is the last line of
-/// defence for the host's mount table.
-pub fn assert_new_mount_ns(parent: (u64, u64)) -> Result<()> {
+/// and from host init's (both read by the parent). This check runs in
+/// release builds too; it is the last line of defence for the host's mount
+/// table.
+pub fn assert_new_mount_ns(parent: (u64, u64), host_init: (u64, u64)) -> Result<()> {
     let me = current_mnt_ns()?;
-    let host_init = procfs::ns_id(Some(nix::unistd::Pid::from_raw(1)), "mnt").context("read /proc/1/ns/mnt")?;
     if me == parent || me == host_init {
         return Err(Error::Init {
             message: format!(
@@ -192,8 +208,12 @@ mod tests {
     }
 
     #[test]
-    fn user_namespaces_wait_for_phase_2c() {
-        let e = plan(&[ns(LinuxNamespaceType::Mount, None), ns(LinuxNamespaceType::User, None)]).unwrap_err();
-        assert!(matches!(e, Error::Unsupported(_)));
+    fn user_namespaces_are_new_or_refused() {
+        let p = plan(&[ns(LinuxNamespaceType::Mount, None), ns(LinuxNamespaceType::User, None)]).unwrap();
+        assert!(p.new_user());
+        assert_eq!(p.clone_flags, CloneFlags::NEWNS | CloneFlags::NEWUSER);
+        let e = plan(&[ns(LinuxNamespaceType::Mount, None), ns(LinuxNamespaceType::User, Some("/proc/1/ns/user"))])
+            .unwrap_err();
+        assert!(matches!(e, Error::Unsupported(_)), "{e}");
     }
 }

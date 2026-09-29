@@ -26,6 +26,9 @@ pub(crate) fn run(extra: &[String]) -> anyhow::Result<()> {
     if !dev_dir().join("bundles/alpine/rootfs/bin/busybox").exists() {
         bail!("the Alpine test rootfs is missing: run `cargo xtask rootfs` first");
     }
+    if !dev_dir().join("bundles/alpine-remap/rootfs/bin/busybox").exists() {
+        bail!("the user-namespace test rootfs is missing: run `cargo xtask rootfs --remap` first");
+    }
     run_cmd(cargo().args(["build", "--quiet", "-p", "rustlet-runc"]))?;
     let binaries = test_binaries()?;
 

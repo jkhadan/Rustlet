@@ -13,9 +13,10 @@
 //!  setns(init pidfd, PID)                 (only affects children)
 //!  clone3(CLONE_INTO_CGROUP | CLONE_PIDFD) ─────────► born in the container's
 //!                                                     PID namespace and cgroup
-//!                                                     rlimits, oom_score_adj, keyring
-//!                                                     setns(init pidfd, MNT|UTS|IPC|NET|CGROUP|TIME)
-//!                                                     PTY (if -t), identity, caps, seccomp
+//!                                                     rlimits, oom_score_adj
+//!                                                     setns(init pidfd, USER|MNT|UTS|IPC|NET|CGROUP|TIME)
+//!                                                     user namespace: become its root
+//!                                                     keyring, PTY (if -t), identity, caps, seccomp
 //!  recv ◄──────────────────────────── EOF on execve (or Error)
 //!  pid file, unlock; -d: exit 0
 //!  otherwise: relay, forward signals, wait → exit status
@@ -33,6 +34,12 @@
 //! clocks too, so that one is the child's job.) The child, born inside,
 //! joins everything else itself, with a single `setns` on init's pidfd
 //! (Linux 5.8+ accepts several namespace types at once for a pidfd).
+//!
+//! A user namespace is the child's to join too, in the same `setns` (the
+//! kernel enters it first). The child then becomes root of the namespace,
+//! as init did, before anything that creates or looks up something owned
+//! by a uid: the session keyring (keyring names are per user namespace, and
+//! the container's belongs to container root) and the PTY.
 //!
 //! Joining the PID namespace in the parent also means no double fork is
 //! needed (runc's `nsexec` forks twice for this): our child is a direct
@@ -66,13 +73,13 @@ use rustlet_sys::process::{self, Clone3, CloneFlags, Forked, WaitResult, WaitTar
 
 use crate::console::{self, Relay};
 use crate::create::{self, block_signals};
-use crate::error::{Context, Error, Result, Unsupported};
+use crate::error::{Context, Error, Result};
 use crate::plan::{self, ProcessPlan};
 use crate::proc_handle::ProcHandle;
 use crate::seccomp::{self, Filter};
 use crate::state::{StateDir, Status};
 use crate::sync::{self, SyncMsg, SyncSocket};
-use crate::{process as proc_setup, run};
+use crate::{namespaces, process as proc_setup, run, userns};
 
 /// Options for [`exec`].
 #[derive(Debug, Clone)]
@@ -160,6 +167,13 @@ pub fn exec(opts: &ExecOptions) -> Result<i32> {
     let spec = dir.load_config()?;
     let process = exec_process(&spec, &opts.process, opts.tty)?;
     let plan = plan::process_plan(&process)?;
+    if let Some(linux) = spec.linux() {
+        // With a user namespace, the process's ids must exist in it.
+        let ns = namespaces::plan(linux.namespaces().as_deref().unwrap_or_default())?;
+        if let Some(maps) = userns::plan(linux, &ns)? {
+            maps.check_process(&plan)?;
+        }
+    }
     let seccomp = spec.linux().as_ref().and_then(|l| l.seccomp().as_ref()).map(seccomp::compile).transpose()?;
     if plan.terminal && opts.detach && opts.console_socket.is_none() {
         return Err(Error::container("exec -t -d needs --console-socket (somewhere to send the terminal)"));
@@ -412,7 +426,8 @@ fn add_caps(caps: &mut LinuxCapabilities, names: &[String]) -> Result<()> {
 }
 
 /// The namespace kinds a container can have, in `/proc/<pid>/ns/` terms.
-const KINDS: [(&str, CloneFlags); 7] = [
+const KINDS: [(&str, CloneFlags); 8] = [
+    ("user", CloneFlags::NEWUSER),
     ("mnt", CloneFlags::NEWNS),
     ("uts", CloneFlags::NEWUTS),
     ("ipc", CloneFlags::NEWIPC),
@@ -433,12 +448,6 @@ fn namespaces_to_join(init: Pid) -> Result<(CloneFlags, CloneFlags)> {
         let ours = rustlet_sys::procfs::ns_id(None, kind).with_context(|| format!("read our {kind} ns"))?;
         Ok(theirs != ours)
     };
-    if differs("user")? {
-        return Err(Error::Unsupported(vec![Unsupported {
-            field: "exec into a user namespace".into(),
-            when: "Phase 2c",
-        }]));
-    }
     let (mut parent, mut child) = (CloneFlags::empty(), CloneFlags::empty());
     for (kind, flag) in KINDS {
         if differs(kind)? {
@@ -493,15 +502,18 @@ impl Child<'_> {
         let proc = ProcHandle::new()?;
         proc_setup::set_limits(p, &proc)?;
         drop(proc);
-        if !self.no_new_keyring {
-            // Finds the container's `_ses.<id>` keyring by name and joins it.
-            proc_setup::join_session_keyring(self.id)?;
-        }
 
         process::setns(self.init.as_fd(), self.namespaces)
             .with_context(|| format!("setns({:?}) into the container", self.namespaces))?;
         // setns(CLONE_NEWNS) put us at the container's `/`; the pidfd has
         // done its job.
+        if self.namespaces.contains(CloneFlags::NEWUSER) {
+            userns::become_root()?;
+        }
+        if !self.no_new_keyring {
+            // Finds the container's `_ses.<id>` keyring by name and joins it.
+            proc_setup::join_session_keyring(self.id)?;
+        }
         if p.terminal {
             let sock =
                 self.console.take().ok_or_else(|| Error::invalid("terminal requested without a console socket"))?;

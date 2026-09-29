@@ -14,6 +14,10 @@
 //! first, because of cgroup v2's "no internal processes" rule: the scope can
 //! only get a container child cgroup with controllers enabled once no process
 //! sits in the scope itself. The container then gets `<scope>/demo`.
+//!
+//! `--userns` runs it in a user namespace (`0 1000000 65536`, as
+//! `--userns=remap` will), on the rootfs from `cargo xtask rootfs --remap`:
+//! try `cat /proc/self/uid_map` inside, and `ps -o user,pid,cmd` on the host.
 
 use std::path::Path;
 use std::process::Command;
@@ -37,10 +41,14 @@ fn parse_bytes(s: &str) -> anyhow::Result<i64> {
     Ok(num.parse::<i64>().with_context(|| format!("bad size {s:?}"))? * mult)
 }
 
-pub(crate) fn run(memory: Option<&str>, pids: Option<i64>, cpus: Option<f64>) -> anyhow::Result<()> {
-    let rootfs = dev_dir().join("bundles/alpine/rootfs");
+pub(crate) fn run(memory: Option<&str>, pids: Option<i64>, cpus: Option<f64>, userns: bool) -> anyhow::Result<()> {
+    let (rootfs, hint) = if userns {
+        (dev_dir().join("bundles/alpine-remap/rootfs"), "cargo xtask rootfs --remap")
+    } else {
+        (dev_dir().join("bundles/alpine/rootfs"), "cargo xtask rootfs")
+    };
     if !rootfs.join("bin/busybox").exists() {
-        bail!("the Alpine rootfs is missing: run `cargo xtask rootfs` first");
+        bail!("the Alpine rootfs is missing: run `{hint}` first");
     }
     run_cmd(cargo().args(["build", "--quiet", "-p", "rustlet-runc"]))?;
 
@@ -50,6 +58,9 @@ pub(crate) fn run(memory: Option<&str>, pids: Option<i64>, cpus: Option<f64>) ->
     let mut root = s.root().clone().unwrap();
     root.set_path(rootfs.canonicalize()?);
     s.set_root(Some(root));
+    if userns {
+        spec::with_user_namespace(&mut s, spec::REMAP_HOST_ID, spec::REMAP_SIZE);
+    }
     let mut res = LinuxResourcesBuilder::default();
     if let Some(m) = memory {
         let bytes = parse_bytes(m)?;

@@ -341,6 +341,20 @@ fn waitid_with(target: WaitTarget<'_>, options: libc::c_int) -> Result<WaitResul
     }
 }
 
+/// `prlimit(2)`: sets a resource limit of *another* process. The runtime sets
+/// container init's limits from outside, because inside a user namespace init
+/// may not raise a hard limit itself (that takes `CAP_SYS_RESOURCE` in the
+/// initial user namespace).
+pub fn prlimit(pid: Pid, resource: nix::sys::resource::Resource, soft: u64, hard: u64) -> Result<()> {
+    let new = libc::rlimit64 { rlim_cur: soft, rlim_max: hard };
+    // SAFETY: `new` is a valid `rlimit64` that lives across the call, and the
+    // old-limit pointer is NULL (the kernel then doesn't write anything).
+    let ret = unsafe {
+        libc::prlimit64(pid.as_raw(), resource as libc::__rlimit_resource_t, &raw const new, std::ptr::null_mut())
+    };
+    crate::check_int(ret).map(drop)
+}
+
 /// Opens a namespace file such as `/proc/<pid>/ns/net` (`O_RDONLY|O_CLOEXEC`).
 pub fn open_ns(path: impl AsRef<std::path::Path>) -> Result<OwnedFd> {
     let f = std::fs::File::open(path.as_ref()).map_err(|e| Errno::from_raw(e.raw_os_error().unwrap_or(libc::EIO)))?;

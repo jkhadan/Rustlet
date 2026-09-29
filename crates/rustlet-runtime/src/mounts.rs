@@ -27,6 +27,7 @@ use rustlet_sys::mount::MountAttr;
 
 use crate::bundle::Bundle;
 use crate::error::{Context, Error, Result, Unsupported};
+use crate::userns::IdMap;
 
 /// A filesystem option passed to `fsconfig`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,8 +50,17 @@ pub enum MountKind {
         options: Vec<FsOption>,
     },
     /// A bind mount of a host path: `open_tree(source, OPEN_TREE_CLONE)`,
-    /// plus `AT_RECURSIVE` for `rbind`.
+    /// plus `AT_RECURSIVE` for `rbind`. `rustlet-runc` opens the source
+    /// itself, before the container exists (see `rootfs::HostTrees`).
     Bind { source: PathBuf, recursive: bool },
+    /// Instead of sysfs, a recursive bind of the host's `/sys` made by init
+    /// itself, from its copy of the host's mount table: what a container with
+    /// a user namespace but no network namespace of its own gets, since only
+    /// the network namespace's owner may mount sysfs (see `userns`). Made in
+    /// init, so the kernel keeps the host's submounts under it locked (they
+    /// can't be unmounted to see what's underneath). `set`/`clear` apply to
+    /// every mount of the copy.
+    HostSysfs,
 }
 
 /// One validated mount, in the order `config.json` lists it.
@@ -67,6 +77,22 @@ pub struct MountEntry {
     /// after `set`/`clear`.
     pub rec_set: MountAttr,
     pub rec_clear: MountAttr,
+    /// `idmap`/`ridmap`: an idmapped bind mount (see [`Idmap`]).
+    pub idmap: Option<Idmap>,
+}
+
+/// An idmapped mount: file owners are translated through the container's
+/// user namespace on the way in and out, so files that belong to host root
+/// belong to container root, without anything being chowned on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Idmap {
+    /// `ridmap`: every mount of an `rbind`, not only the top one.
+    pub recursive: bool,
+    /// The mount's own `uidMappings`/`gidMappings`, if it has any. Only the
+    /// container's own are supported (`userns::check_mounts`); empty means
+    /// "the container's".
+    pub uids: Vec<IdMap>,
+    pub gids: Vec<IdMap>,
 }
 
 impl MountEntry {
@@ -80,6 +106,7 @@ impl MountEntry {
                 source.display(),
                 self.destination.display()
             ),
+            MountKind::HostSysfs => format!("rbind of the host's /sys on {}", self.destination.display()),
         }
     }
 }
@@ -108,6 +135,10 @@ enum Opt {
     /// A recursive attribute (`rro`, `rnosuid`, …): `(set, clear)`.
     Rec(MountAttr, MountAttr),
     Bind {
+        recursive: bool,
+    },
+    /// `idmap` / `ridmap`.
+    Idmap {
         recursive: bool,
     },
     /// Accepted and implied: propagation is always private here.
@@ -169,12 +200,8 @@ fn classify(word: &str) -> Result<Opt> {
             )));
         }
         "remount" => return Err(Error::invalid("mount option `remount` makes no sense in config.json")),
-        "idmap" | "ridmap" => {
-            return Err(Error::Unsupported(vec![Unsupported {
-                field: format!("mount option `{word}` (idmapped mounts)"),
-                when: "Phase 2c",
-            }]));
-        }
+        "idmap" => Opt::Idmap { recursive: false },
+        "ridmap" => Opt::Idmap { recursive: true },
         "tmpcopyup" => {
             return Err(Error::Unsupported(vec![Unsupported {
                 field: "mount option `tmpcopyup`".into(),
@@ -212,17 +239,12 @@ pub fn parse(m: &Mount, bundle: &Bundle) -> Result<MountEntry> {
     if destination == Path::new("/") {
         return Err(Error::invalid("a mount on `/` would hide the rootfs; use root.path instead"));
     }
-    if m.uid_mappings().is_some() || m.gid_mappings().is_some() {
-        return Err(Error::Unsupported(vec![Unsupported {
-            field: format!("{}: uidMappings/gidMappings", what()),
-            when: "Phase 2c",
-        }]));
-    }
 
     let mut set = MountAttr::empty();
     let mut clear = MountAttr::empty();
     let (mut rec_set, mut rec_clear) = (MountAttr::empty(), MountAttr::empty());
     let mut bind = None;
+    let mut idmap: Option<bool> = None;
     let mut fs_opts = Vec::new();
     for word in m.options().iter().flatten() {
         match classify(word)? {
@@ -247,6 +269,7 @@ pub fn parse(m: &Mount, bundle: &Bundle) -> Result<MountEntry> {
                 rec_clear = (rec_clear - a) | c;
             }
             Opt::Bind { recursive } => bind = Some(recursive || bind == Some(true)),
+            Opt::Idmap { recursive } => idmap = Some(recursive || idmap == Some(true)),
             Opt::Private | Opt::Ignore => {}
             Opt::Fs(o) => fs_opts.push(o),
         }
@@ -275,9 +298,33 @@ pub fn parse(m: &Mount, bundle: &Bundle) -> Result<MountEntry> {
         MountKind::Fs { fstype: fstype.to_owned(), source, options: fs_opts }
     };
 
-    let entry = MountEntry { destination, kind, set, clear, rec_set, rec_clear };
+    let idmap = parse_idmap(m, idmap, &kind).map_err(|why| Error::invalid(format!("{}: {why}", what())))?;
+    let entry = MountEntry { destination, kind, set, clear, rec_set, rec_clear, idmap };
     check_pseudo_fs_targets(&entry)?;
     Ok(entry)
+}
+
+/// The `idmap`/`ridmap` options and the mount's own `uidMappings` and
+/// `gidMappings`, which OCI only allows together. Whether the container has
+/// a user namespace to idmap with is the plan's business
+/// (`userns::check_mounts`).
+fn parse_idmap(m: &Mount, option: Option<bool>, kind: &MountKind) -> std::result::Result<Option<Idmap>, String> {
+    let (uids, gids) = (m.uid_mappings().as_deref(), m.gid_mappings().as_deref());
+    let Some(recursive) = option else {
+        if uids.is_some() || gids.is_some() {
+            return Err("uidMappings/gidMappings on a mount need the `idmap` or `ridmap` option".into());
+        }
+        return Ok(None);
+    };
+    if !matches!(kind, MountKind::Bind { .. }) {
+        return Err("`idmap`/`ridmap` are only supported on bind mounts".into());
+    }
+    if uids.is_some() != gids.is_some() {
+        return Err("a mount's uidMappings and gidMappings go together: give both or neither".into());
+    }
+    let convert =
+        |maps: Option<&[oci_spec::runtime::LinuxIdMapping]>| crate::userns::from_spec(maps.unwrap_or_default());
+    Ok(Some(Idmap { recursive, uids: convert(uids), gids: convert(gids) }))
 }
 
 /// The files under `/proc` that a bind mount may replace: the ones lxcfs
@@ -320,7 +367,7 @@ fn check_pseudo_fs_targets(e: &MountEntry) -> Result<()> {
     let d = e.destination.as_path();
     let fstype = match &e.kind {
         MountKind::Fs { fstype, .. } => Some(fstype.as_str()),
-        MountKind::Bind { .. } => None,
+        MountKind::Bind { .. } | MountKind::HostSysfs => None,
     };
     let refuse = |why: String| Err(Error::invalid(format!("mount {} is not allowed: {why}", e.describe())));
     if d == Path::new("/proc") {
@@ -483,9 +530,25 @@ mod tests {
     }
 
     #[test]
-    fn idmap_is_reported_as_unsupported() {
-        let err = parse(&mount("/data", "bind", "/tmp", &["bind", "idmap"]), &bundle()).unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)));
+    fn idmap_options_and_mappings() {
+        let b = bundle();
+        let e = parse(&mount("/data", "bind", "/tmp", &["rbind", "ridmap"]), &b).unwrap();
+        assert_eq!(e.idmap, Some(Idmap { recursive: true, uids: vec![], gids: vec![] }));
+        assert_eq!(parse(&mount("/data", "bind", "/tmp", &["bind"]), &b).unwrap().idmap, None);
+        // Only bind mounts can be idmapped.
+        let msg = parse(&mount("/data", "tmpfs", "tmpfs", &["idmap"]), &b).unwrap_err().to_string();
+        assert!(msg.contains("only supported on bind mounts"), "{msg}");
+        // Mappings need the option, and come in pairs.
+        let map = oci_spec::runtime::LinuxIdMappingBuilder::default().host_id(1u32).size(1u32).build().unwrap();
+        let mut m = mount("/data", "bind", "/tmp", &["bind"]);
+        m.set_uid_mappings(Some(vec![map]));
+        m.set_gid_mappings(Some(vec![map]));
+        assert!(parse(&m, &b).unwrap_err().to_string().contains("need the `idmap`"));
+        m.set_options(Some(vec!["bind".into(), "idmap".into()]));
+        let e = parse(&m, &b).unwrap();
+        assert_eq!(e.idmap.unwrap().uids, vec![IdMap { container: 0, host: 1, size: 1 }]);
+        m.set_gid_mappings(None);
+        assert!(parse(&m, &b).unwrap_err().to_string().contains("go together"));
     }
 
     #[test]

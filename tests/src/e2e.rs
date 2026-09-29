@@ -34,8 +34,8 @@ use rustlet_runtime::oci_spec::runtime::{
 };
 
 use crate::{
-    TestBundle, add_mount, alpine_rootfs, assert_host_mounts_unchanged, host_mounts, itest_cgroup, itest_scope, runc,
-    runtime_root,
+    TestBundle, add_mount, alpine_rootfs, assert_host_mounts_unchanged, host_mounts, itest_cgroup, itest_scope,
+    remap_rootfs, runc, runtime_root,
 };
 
 /// Upper bound for any one `rustlet-runc` invocation.
@@ -215,8 +215,13 @@ impl HostSnapshot {
     }
 }
 
+/// Top-level entries of both shared rootfs trees (plain and remapped), as
+/// full paths, sorted.
 fn rootfs_entries() -> Vec<OsString> {
-    let mut v: Vec<_> = std::fs::read_dir(alpine_rootfs()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    let mut v = Vec::new();
+    for root in [alpine_rootfs(), remap_rootfs()] {
+        v.extend(std::fs::read_dir(&root).unwrap().map(|e| root.join(e.unwrap().file_name()).into_os_string()));
+    }
     v.sort();
     v
 }

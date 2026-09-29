@@ -103,6 +103,31 @@ pub fn default_spec() -> Spec {
     spec
 }
 
+/// The first host id of the subordinate range `--userns=remap` uses
+/// (docs/architecture.md §2.2.1): container ids `0..REMAP_SIZE` are host ids
+/// `REMAP_HOST_ID..REMAP_HOST_ID + REMAP_SIZE`, for uids and gids alike. It
+/// is far above both the regular users and the ranges `useradd` hands out in
+/// `/etc/subuid` (100000 onwards, 65536 each).
+pub const REMAP_HOST_ID: u32 = 1_000_000;
+/// The size of that range: every 16-bit id an image can use.
+pub const REMAP_SIZE: u32 = 65_536;
+
+/// Gives `spec` a new user namespace in which container ids `0..size` are
+/// host ids `host..host + size`, for uids and gids alike.
+pub fn with_user_namespace(spec: &mut Spec, host: u32, size: u32) {
+    use oci_spec::runtime::{LinuxIdMappingBuilder, LinuxNamespaceBuilder, LinuxNamespaceType};
+    let linux = spec.linux_mut().get_or_insert_with(Default::default);
+    let mut namespaces = linux.namespaces().clone().unwrap_or_default();
+    if !namespaces.iter().any(|n| n.typ() == LinuxNamespaceType::User) {
+        namespaces
+            .push(LinuxNamespaceBuilder::default().typ(LinuxNamespaceType::User).build().expect("static namespace"));
+    }
+    linux.set_namespaces(Some(namespaces));
+    let map = LinuxIdMappingBuilder::default().container_id(0u32).host_id(host).size(size).build().expect("static map");
+    linux.set_uid_mappings(Some(vec![map]));
+    linux.set_gid_mappings(Some(vec![map]));
+}
+
 /// Serializes a spec the way humans like to read it.
 pub fn to_pretty_json(spec: &Spec) -> String {
     serde_json::to_string_pretty(spec).expect("a Spec always serializes") + "\n"

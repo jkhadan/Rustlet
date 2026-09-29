@@ -4,6 +4,8 @@
 //! points at the shared Alpine rootfs from `cargo xtask rootfs` (always
 //! read-only, so tests can't change it or each other), runs the real
 //! `rustlet-runc` binary on it, and checks what the container printed.
+//! User-namespace tests use [`userns_spec`] instead, on the copy from
+//! `cargo xtask rootfs --remap` whose files are owned by the mapped host ids.
 //!
 //! Every run also asserts the host's mount table is unchanged afterwards:
 //! nothing a container mounts may ever show up on the host.
@@ -16,7 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use rustlet_runtime::oci_spec::runtime::{Mount, MountBuilder, Spec};
-use rustlet_runtime::spec::{default_spec, to_pretty_json};
+use rustlet_runtime::spec::{REMAP_HOST_ID, REMAP_SIZE, default_spec, to_pretty_json, with_user_namespace};
 
 /// Reason string for `#[ignore]` on every privileged test.
 pub const PRIVILEGED: &str = "needs root: run with `cargo xtask itest`";
@@ -25,6 +27,15 @@ pub const PRIVILEGED: &str = "needs root: run with `cargo xtask itest`";
 pub fn alpine_rootfs() -> PathBuf {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.rustlet-dev/bundles/alpine/rootfs");
     assert!(p.join("bin/busybox").exists(), "missing {}: run `cargo xtask rootfs`", p.display());
+    p.canonicalize().unwrap()
+}
+
+/// The Alpine rootfs made by `cargo xtask rootfs --remap`: the same files,
+/// owned by host ids `REMAP_HOST_ID` + their ids in the tarball, so that
+/// container root in a [`userns_spec`] container owns what it should.
+pub fn remap_rootfs() -> PathBuf {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.rustlet-dev/bundles/alpine-remap/rootfs");
+    assert!(p.join("bin/busybox").exists(), "missing {}: run `cargo xtask rootfs --remap`", p.display());
     p.canonicalize().unwrap()
 }
 
@@ -112,6 +123,22 @@ pub fn spec(args: &[&str]) -> Spec {
 /// Shorthand: `spec(["sh", "-c", script])`.
 pub fn sh(script: &str) -> Spec {
     spec(&["sh", "-c", script])
+}
+
+/// [`spec`], but in a new user namespace (container ids `0..REMAP_SIZE` are
+/// host ids `REMAP_HOST_ID..`), on the matching read-only [`remap_rootfs`].
+pub fn userns_spec(args: &[&str]) -> Spec {
+    let mut spec = spec(args);
+    let mut root = spec.root().clone().unwrap();
+    root.set_path(remap_rootfs());
+    spec.set_root(Some(root));
+    with_user_namespace(&mut spec, REMAP_HOST_ID, REMAP_SIZE);
+    spec
+}
+
+/// Shorthand: `userns_spec(["sh", "-c", script])`.
+pub fn userns_sh(script: &str) -> Spec {
+    userns_spec(&["sh", "-c", script])
 }
 
 /// Appends a mount to a spec.
@@ -205,14 +232,16 @@ impl Drop for Running {
 /// Runs `spec` to completion and checks the host mount table afterwards.
 pub fn run(spec: &Spec) -> Output {
     let bundle = TestBundle::new(spec);
+    // `root.path` may be relative to the bundle; `join` keeps absolute ones.
+    let rootfs = bundle.dir.path().join(spec.root().as_ref().unwrap().path());
     let before = host_mounts();
-    let rootfs_before = rootfs_entries();
+    let rootfs_before = rootfs_entries(&rootfs);
     let out = bundle.command().output().unwrap();
     let after = host_mounts();
     assert_host_mounts_unchanged(&before, &after);
     // The rootfs is shared by every test; a mount point created in it (as
     // root, before the read-only remount) would leak into later runs.
-    assert_eq!(rootfs_before, rootfs_entries(), "a test created entries in the shared rootfs");
+    assert_eq!(rootfs_before, rootfs_entries(&rootfs), "a test created entries in the shared rootfs");
     Output {
         status: out.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -220,9 +249,9 @@ pub fn run(spec: &Spec) -> Output {
     }
 }
 
-/// Top-level names in the shared Alpine rootfs, sorted.
-fn rootfs_entries() -> Vec<std::ffi::OsString> {
-    let mut v: Vec<_> = std::fs::read_dir(alpine_rootfs()).unwrap().map(|e| e.unwrap().file_name()).collect();
+/// Top-level names in a (shared) rootfs, sorted.
+fn rootfs_entries(rootfs: &Path) -> Vec<std::ffi::OsString> {
+    let mut v: Vec<_> = std::fs::read_dir(rootfs).unwrap().map(|e| e.unwrap().file_name()).collect();
     v.sort();
     v
 }

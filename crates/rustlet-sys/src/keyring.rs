@@ -12,6 +12,7 @@ use crate::{Errno, Result, check, cstr};
 /// A key or keyring serial number.
 pub type KeySerial = i32;
 
+const KEYCTL_GET_KEYRING_ID: libc::c_int = 0;
 const KEYCTL_JOIN_SESSION_KEYRING: libc::c_int = 1;
 const KEYCTL_SETPERM: libc::c_int = 5;
 const KEYCTL_DESCRIBE: libc::c_int = 6;
@@ -29,6 +30,18 @@ pub fn join_session_keyring(name: &str) -> Result<KeySerial> {
     // SAFETY: KEYCTL_JOIN_SESSION_KEYRING reads one NUL-terminated string,
     // which `n` provides for the duration of the call.
     let ret = unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_JOIN_SESSION_KEYRING, n.as_ptr()) };
+    check(ret).map(|v| v as KeySerial)
+}
+
+/// `KEY_SPEC_SESSION_KEYRING`: "the caller's session keyring", for calls
+/// that take a key serial.
+pub const SESSION_KEYRING: KeySerial = -3;
+
+/// `KEYCTL_GET_KEYRING_ID` (without creating anything): the real serial
+/// number behind a special id such as [`SESSION_KEYRING`].
+pub fn keyring_id(key: KeySerial) -> Result<KeySerial> {
+    // SAFETY: integer arguments only.
+    let ret = unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_GET_KEYRING_ID, key, 0) };
     check(ret).map(|v| v as KeySerial)
 }
 

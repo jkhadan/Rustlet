@@ -25,6 +25,7 @@ use crate::namespaces::{self, NamespacePlan};
 use crate::paths::{self, PathRules};
 use crate::seccomp::{self, Filter};
 use crate::sysctl::{self, Sysctl};
+use crate::userns::{self, UsernsPlan};
 
 /// A validated container configuration.
 #[derive(Debug, Clone)]
@@ -48,6 +49,9 @@ pub struct Plan {
     pub sysctls: Vec<Sysctl>,
     /// `linux.seccomp`, compiled to BPF. `None`: no filter (unconfined).
     pub seccomp: Option<Filter>,
+    /// The new user namespace's maps (`linux.uidMappings`/`gidMappings`).
+    /// `None`: the container stays in the runtime's user namespace.
+    pub userns: Option<UsernsPlan>,
 }
 
 /// Where the container's cgroup goes and what gets written into it.
@@ -119,7 +123,10 @@ impl Plan {
         let root_cfg = spec.root().as_ref().ok_or_else(|| Error::invalid("missing `root`"))?;
         let root = resolve_root(&bundle.resolve(root_cfg.path()))?;
 
-        let mounts = spec.mounts().iter().flatten().map(|m| mounts::parse(m, bundle)).collect::<Result<Vec<_>>>()?;
+        let mut mounts =
+            spec.mounts().iter().flatten().map(|m| mounts::parse(m, bundle)).collect::<Result<Vec<_>>>()?;
+        let userns = userns::plan(linux, &namespaces)?;
+        userns::check_mounts(&mut mounts, userns.as_ref(), &namespaces)?;
         // Init uses /proc after pivot_root (the exec.fifo reopen, oom_score_adj).
         // Without our own procfs there, those paths would resolve inside the
         // image's `proc/` directory, which the image controls.
@@ -146,6 +153,10 @@ impl Plan {
             linux.readonly_paths().as_deref().unwrap_or_default(),
         )?;
         let seccomp = linux.seccomp().as_ref().map(seccomp::compile).transpose()?;
+        let process = process_plan(process)?;
+        if let Some(u) = &userns {
+            u.check_process(&process)?;
+        }
         Ok(Plan {
             id: id.to_owned(),
             root,
@@ -154,11 +165,12 @@ impl Plan {
             mounts,
             hostname,
             domainname,
-            process: process_plan(process)?,
+            process,
             cgroup: cgroup_plan(linux)?,
             paths,
             sysctls,
             seccomp,
+            userns,
         })
     }
 }
@@ -305,7 +317,6 @@ fn reject_unsupported(spec: &Spec) -> Result<()> {
     need(spec.solaris().is_some() || spec.windows().is_some() || spec.vm().is_some(), "non-Linux sections", "never");
 
     if let Some(l) = spec.linux() {
-        need(some_vec(l.uid_mappings()) || some_vec(l.gid_mappings()), "linux.uidMappings/gidMappings", "Phase 2c");
         if let Some(r) = l.resources() {
             // Without the eBPF device filter, device rules would be silently
             // unenforced. (Limits are handled by `cgroups::settings_for`.)
@@ -393,12 +404,84 @@ mod tests {
     fn unsupported_features_name_their_phase() {
         let mut spec = default_spec();
         let linux = spec.linux_mut().as_mut().unwrap();
-        linux.set_uid_mappings(Some(vec![Default::default()]));
         linux.set_devices(Some(vec![Default::default()]));
+        linux.set_intel_rdt(Some(Default::default()));
         let (_d, b) = bundle_with(spec);
         let msg = Plan::new("x", &b).unwrap_err().to_string();
-        assert!(msg.contains("linux.uidMappings/gidMappings (Phase 2c)"), "{msg}");
         assert!(msg.contains("linux.devices (Phase 2c)"), "{msg}");
+        assert!(msg.contains("linux.intelRdt (not planned)"), "{msg}");
+    }
+
+    fn remapped() -> Spec {
+        let mut spec = default_spec();
+        crate::spec::with_user_namespace(&mut spec, crate::spec::REMAP_HOST_ID, crate::spec::REMAP_SIZE);
+        spec
+    }
+
+    #[test]
+    fn user_namespace_plan() {
+        let (_d, b) = bundle_with(remapped());
+        let plan = Plan::new("x", &b).unwrap();
+        let u = plan.userns.as_ref().unwrap();
+        assert_eq!(u.uid_to_host(0), Some(1_000_000));
+        assert!(plan.namespaces.new_user());
+        // With a new network namespace, sysfs stays sysfs.
+        assert!(
+            plan.mounts.iter().any(|m| matches!(&m.kind, mounts::MountKind::Fs { fstype, .. } if fstype == "sysfs"))
+        );
+
+        // Without one, it becomes a bind of the host's /sys.
+        let mut spec = remapped();
+        let linux = spec.linux_mut().as_mut().unwrap();
+        let ns = linux.namespaces().clone().unwrap();
+        linux.set_namespaces(Some(
+            ns.into_iter().filter(|n| n.typ() != oci_spec::runtime::LinuxNamespaceType::Network).collect(),
+        ));
+        let (_d, b) = bundle_with(spec);
+        let plan = Plan::new("x", &b).unwrap();
+        let sys = plan.mounts.iter().find(|m| m.destination == Path::new("/sys")).unwrap();
+        assert_eq!(sys.kind, mounts::MountKind::HostSysfs);
+    }
+
+    #[test]
+    fn user_namespace_refusals() {
+        let refused = |spec: Spec, why: &str| {
+            let (_d, b) = bundle_with(spec);
+            let msg = Plan::new("x", &b).unwrap_err().to_string();
+            assert!(msg.contains(why), "expected {why:?} in: {msg}");
+        };
+        // Maps without a user namespace, and the other way round.
+        let mut spec = remapped();
+        let linux = spec.linux_mut().as_mut().unwrap();
+        let ns = linux.namespaces().clone().unwrap();
+        linux.set_namespaces(Some(
+            ns.into_iter().filter(|n| n.typ() != oci_spec::runtime::LinuxNamespaceType::User).collect(),
+        ));
+        refused(spec, "no new `user` namespace");
+        let mut spec = remapped();
+        spec.linux_mut().as_mut().unwrap().set_gid_mappings(None);
+        refused(spec, "needs both");
+        // The process's ids must be mapped.
+        let mut spec = remapped();
+        let mut p = spec.process().clone().unwrap();
+        let mut user = p.user().clone();
+        user.set_additional_gids(Some(vec![70000]));
+        p.set_user(user);
+        spec.set_process(Some(p));
+        refused(spec, "additionalGids 70000 is not mapped");
+        // So must devpts' gid=5.
+        let mut spec = remapped();
+        let map = oci_spec::runtime::LinuxIdMappingBuilder::default().host_id(2_000_000u32).size(1u32).build().unwrap();
+        spec.linux_mut().as_mut().unwrap().set_gid_mappings(Some(vec![map]));
+        refused(spec, "`gid=5`");
+        // A shared PID namespace can't get a procfs from the user namespace.
+        let mut spec = remapped();
+        let linux = spec.linux_mut().as_mut().unwrap();
+        let ns = linux.namespaces().clone().unwrap();
+        linux.set_namespaces(Some(
+            ns.into_iter().filter(|n| n.typ() != oci_spec::runtime::LinuxNamespaceType::Pid).collect(),
+        ));
+        refused(spec, "new `pid` namespace");
     }
 
     #[test]

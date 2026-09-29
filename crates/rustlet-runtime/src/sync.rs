@@ -7,6 +7,9 @@
 //! The conversation, from container init's side:
 //!
 //! ```text
+//!   ◄── Proceed               the parent has finished its part: the user
+//!                             namespace's maps, idmapped mounts, rlimits
+//!                             and oom_score_adj (see `create`)
 //!   setup (mounts, pivot_root, tty, identity, $PATH lookup) …
 //!   ──► Ready                 "created": now blocking on exec.fifo
 //!   … `start` opens exec.fifo, init writes one byte, then execve …
@@ -28,10 +31,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Context, Error, Result};
 
-/// Messages from container init to `rustlet-runc`.
+/// Messages between `rustlet-runc` and container init.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum SyncMsg {
+    /// Parent → init, the only message in that direction: go ahead with the
+    /// setup.
+    Proceed,
     /// Init is fully set up and about to block on `exec.fifo`.
     Ready,
     /// Init failed before (or at) `execve`. `exec` says whether it was the
@@ -62,7 +68,9 @@ impl SyncMsg {
                 Error::Exec { message, errno: Errno::from_raw(errno.unwrap_or(libc::EIO)) }
             }
             SyncMsg::Error { message, errno, .. } => Error::Init { message, errno },
-            SyncMsg::Ready => Error::Init { message: "unexpected Ready from container init".into(), errno: None },
+            SyncMsg::Ready | SyncMsg::Proceed => {
+                Error::Init { message: format!("unexpected {self:?} from container init"), errno: None }
+            }
         }
     }
 }
@@ -85,6 +93,15 @@ pub(crate) fn pair() -> Result<(SyncSocket, SyncSocket)> {
 }
 
 impl SyncSocket {
+    /// Init side: waits for the parent's [`SyncMsg::Proceed`].
+    pub(crate) fn wait_proceed(&self) -> Result<()> {
+        match self.recv()? {
+            Some(SyncMsg::Proceed) => Ok(()),
+            None => Err(Error::Init { message: "rustlet-runc went away during create".into(), errno: None }),
+            Some(other) => Err(Error::Init { message: format!("unexpected {other:?} from rustlet-runc"), errno: None }),
+        }
+    }
+
     /// Sends one message. `MSG_NOSIGNAL`: if the parent is gone we want
     /// `EPIPE`, not a SIGPIPE that kills init with a confusing status.
     pub(crate) fn send(&self, msg: &SyncMsg) -> Result<()> {

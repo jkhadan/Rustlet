@@ -29,13 +29,17 @@
 //!
 //! Phase 2a split this into `create` + `start` (the exec.fifo gate) and
 //! added cgroups and terminals; Phase 2b the hardening (capabilities,
-//! seccomp, masked paths, sysctls, the sealed self re-exec) and `exec`.
+//! seccomp, masked paths, sysctls, the sealed self re-exec) and `exec`;
+//! Phase 2c user namespaces (`userns`), for which the parent now opens the
+//! rootfs and bind sources itself (`rootfs::HostTrees`) and sets init's
+//! rlimits, before letting init proceed.
 //!
 //! ## What this build does *not* do yet
 //!
 //! Features that `config.json` can ask for but this build can't enforce are
 //! rejected with the phase that adds them (see `plan::reject_unsupported`):
-//! user namespaces and devices arrive in Phase 2c.
+//! device rules, `CAP_MKNOD` and `--privileged` wait for the eBPF device
+//! filter, the second half of Phase 2c.
 
 #![forbid(unsafe_code)]
 
@@ -63,6 +67,7 @@ pub mod spec;
 pub mod state;
 mod sync;
 pub mod sysctl;
+pub mod userns;
 
 pub use bundle::Bundle;
 pub use create::{CreateOptions, create};
