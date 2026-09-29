@@ -9,6 +9,7 @@
 //! | `check-host`  | report the host facts the design depends on                    |
 //! | `demo`        | interactive Alpine shell with cgroup limits (`--memory 64M --pids 64`) |
 //! | `seccomp`     | compile a seccomp profile to BPF: summary, `--disasm`, `--json` |
+//! | `devices`     | build a device filter (defaults, or a bundle's) and show its eBPF program |
 //! | `image-run`   | Phase 3                                                        |
 //! | `gen-ts`      | Phase 6                                                        |
 //!
@@ -18,6 +19,7 @@
 
 mod checkhost;
 mod demo;
+mod devices;
 mod devstorage;
 mod itest;
 mod rootfs;
@@ -108,6 +110,15 @@ enum Task {
         #[arg(long, conflicts_with = "disasm")]
         json: bool,
     },
+    /// Build a device filter (the defaults, or a bundle's) and show its eBPF program.
+    Devices {
+        /// Use this bundle's `linux.resources.devices` and `linux.devices`.
+        #[arg(long)]
+        bundle: Option<PathBuf>,
+        /// Also print the disassembled program.
+        #[arg(long)]
+        disasm: bool,
+    },
     /// Pull an image and run it with rustlet-runc (Phase 3).
     ImageRun,
     /// Generate TypeScript types for the desktop app (Phase 6).
@@ -123,6 +134,7 @@ fn main() -> anyhow::Result<()> {
         Task::CheckHost => checkhost::run(),
         Task::Demo { memory, pids, cpus, userns } => demo::run(memory.as_deref(), pids, cpus, userns),
         Task::Seccomp { bundle, caps, disasm, json } => seccomp::run(bundle.as_deref(), caps.as_deref(), disasm, json),
+        Task::Devices { bundle, disasm } => devices::run(bundle.as_deref(), disasm),
         Task::ImageRun => bail!("`image-run` arrives in Phase 3 (images)"),
         Task::GenTs => bail!("`gen-ts` arrives in Phase 6 (desktop app)"),
     }

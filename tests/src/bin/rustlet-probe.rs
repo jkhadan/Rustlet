@@ -1,10 +1,17 @@
 //! `rustlet-probe`: makes the syscalls that busybox can't, for the seccomp
-//! tests in `tests/tests/hardening.rs` and the user-namespace tests.
+//! tests in `tests/tests/hardening.rs`, the user-namespace tests and the
+//! device-filter tests.
 //!
 //! Each argument names one probe. For each one it prints a line
 //! `<probe> ok` or `<probe> <ERRNO>`, e.g. `clone3 ENOSYS`; the
 //! `session-keyring` probe prints the keyring's serial number and
 //! description instead of `ok` (`<serial> keyring;<uid>;<gid>;<perm>;<name>`).
+//!
+//! Two probes take arguments, for the device filter:
+//! * `access:PATH:f|r|w|rw`: `access(2)` with `F_OK`, `R_OK`, `W_OK` or both.
+//!   On a device node that runs the device-cgroup check without opening
+//!   anything (`F_OK` asks for no access bits at all).
+//! * `mknod:PATH:b|c:MAJOR:MINOR`: `mknod(2)` of a node, mode 0600.
 //!
 //! This is a glibc binary and the test rootfs is Alpine (musl), so the tests
 //! bind-mount it together with the host's library directory and start it
@@ -14,6 +21,8 @@
 use nix::errno::Errno;
 use nix::sys::personality::{self, Persona};
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
+use nix::sys::stat::{Mode, SFlag, makedev, mknod};
+use nix::unistd::{AccessFlags, access};
 use rustlet_sys::process::{Clone3, CloneFlags, Forked, WaitTarget, exit_now, fork, unshare, waitid};
 
 /// A child that exits at once; waits for it.
@@ -54,8 +63,33 @@ fn probe(name: &str) -> Option<Result<(), Errno>> {
         "personality-no-randomize" => personality::set(Persona::ADDR_NO_RANDOMIZE).map(drop),
         "unix" => open_socket(AddressFamily::Unix, SockType::Stream),
         "inet" => open_socket(AddressFamily::Inet, SockType::Stream),
-        _ => return None,
+        _ => return device_probe(name),
     })
+}
+
+/// `access:PATH:MODE` and `mknod:PATH:TYPE:MAJOR:MINOR`.
+fn device_probe(name: &str) -> Option<Result<(), Errno>> {
+    if let Some(rest) = name.strip_prefix("access:") {
+        let (path, mode) = rest.rsplit_once(':')?;
+        let mode = match mode {
+            "f" => AccessFlags::F_OK,
+            "r" => AccessFlags::R_OK,
+            "w" => AccessFlags::W_OK,
+            "rw" => AccessFlags::R_OK | AccessFlags::W_OK,
+            _ => return None,
+        };
+        return Some(access(path, mode));
+    }
+    let rest = name.strip_prefix("mknod:")?;
+    let mut parts = rest.rsplitn(4, ':');
+    let (minor, major, kind, path) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    let kind = match kind {
+        "b" => SFlag::S_IFBLK,
+        "c" => SFlag::S_IFCHR,
+        _ => return None,
+    };
+    let dev = makedev(major.parse().ok()?, minor.parse().ok()?);
+    Some(mknod(path, kind, Mode::from_bits_truncate(0o600), dev))
 }
 
 fn main() -> std::process::ExitCode {

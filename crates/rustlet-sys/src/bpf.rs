@@ -51,6 +51,7 @@ pub mod op {
     pub const BPF_OR: u8 = 0x40;
     pub const BPF_AND: u8 = 0x50;
     pub const BPF_RSH: u8 = 0x70;
+    pub const BPF_XOR: u8 = 0xa0;
     pub const BPF_MOV: u8 = 0xb0;
     // jmp ops
     pub const BPF_JA: u8 = 0x00;

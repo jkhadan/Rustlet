@@ -1,5 +1,6 @@
 //! cgroups v2: placing a container in its own cgroup, limiting it, freezing
-//! it, killing it, and reading its statistics.
+//! it, killing it, and reading its statistics. Which devices it may use is
+//! an eBPF program attached to the cgroup ([`devices`]).
 //!
 //! A cgroup is a directory in the `cgroup2` filesystem at `/sys/fs/cgroup`.
 //! Everything is done with plain file operations: `mkdir` creates a cgroup,
@@ -66,6 +67,7 @@
 //! `SIGKILL` PID by PID. Both are asynchronous; the kernel reports progress
 //! in `cgroup.events` (`frozen`, `populated`), which we poll.
 
+pub mod devices;
 pub mod resources;
 pub mod stats;
 
