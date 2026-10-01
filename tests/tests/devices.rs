@@ -11,6 +11,8 @@ use std::os::fd::AsFd;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use nix::errno::Errno;
+use nix::sys::stat::{Mode, SFlag, makedev, mknod};
 use rustlet_itests::e2e::*;
 use rustlet_itests::*;
 use rustlet_runtime::cgroups::devices::{Access, DevType, DeviceFilter, MAX_RULES, Origin, Request, Rule, decide};
@@ -274,4 +276,145 @@ fn dv_attached_with_allow_multi() {
     assert_eq!((ids, flags), (vec![id], bpf::F_ALLOW_MULTI));
     let (effective, _) = bpf::prog_query_with(dir.as_fd(), bpf::ATTACH_CGROUP_DEVICE, bpf::F_QUERY_EFFECTIVE).unwrap();
     assert!(effective.contains(&id), "{effective:?}");
+}
+
+// ── attachment and container lifecycle ──────────────────────────────────────
+
+/// Run the syscall probe in Alpine through the host glibc loader. The
+/// writable /mnt bind also holds device nodes for access(2) probes.
+fn device_probe_spec(script: &str) -> (rustlet_runtime::oci_spec::runtime::Spec, tempfile::TempDir) {
+    let lib = "/usr/lib/x86_64-linux-gnu";
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_rustlet-probe"), dir.path().join("probe")).unwrap();
+    let mut s = sh(&format!("PROBE='/opt/ld-linux-x86-64.so.2 --library-path /opt /mnt/probe'; {script}"));
+    add_mount(&mut s, "/mnt", "bind", dir.path().to_str().unwrap(), &["bind", "rw", "nosuid"]);
+    add_mount(&mut s, "/opt", "bind", lib, &["bind", "ro", "nosuid", "nodev"]);
+    (s, dir)
+}
+
+fn wait_for_program_release(id: u32) {
+    wait_until("device program released", PROMPT, || match bpf::prog_fd_by_id(id) {
+        Err(Errno::ENOENT) => true,
+        Ok(fd) => {
+            drop(fd);
+            false
+        }
+        Err(e) => panic!("BPF_PROG_GET_FD_BY_ID {id}: {e}"),
+    });
+}
+
+fn saved_program(c: &Container) -> u32 {
+    let state: rustlet_runtime::state::State =
+        serde_json::from_slice(&std::fs::read(runtime_root().join(c.id()).join("state.json")).unwrap()).unwrap();
+    state.rustlet.device_filter.expect("no saved device filter")
+}
+
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dv_default_devices_work() {
+    let script = r#"set -e
+for d in null zero full random urandom tty ptmx; do
+    test -r /dev/$d; test -w /dev/$d
+done
+for d in null zero random urandom; do
+    dd if=/dev/$d of=/dev/null bs=1 count=1 2>/dev/null
+    printf x > /dev/$d
+done
+dd if=/dev/full of=/dev/null bs=1 count=1 2>/dev/null
+if printf x > /dev/full 2>/dev/null; then exit 1; fi
+echo defaults-ok"#;
+    for terminal in [false, true] {
+        let mut s = sh(script);
+        set_cgroup(&mut s, "dv-defaults");
+        if terminal {
+            set_terminal(&mut s, None);
+        }
+        let mut c = Container::new(&s);
+        let out = c.run_foreground(&[], Some(b""), TIMEOUT);
+        assert!(out.ok().contains("defaults-ok"), "{out:#?}");
+        c.assert_gone();
+    }
+    let mut s = spec(&["sleep", "3600"]);
+    set_cgroup(&mut s, "dv-default-exec");
+    let c = Container::started(&s);
+    let out = exec_input(
+        c.exec_command(&["-t"], &["sh", "-c", &format!("{script}; echo tty-ok >/dev/tty; tty")]),
+        Some(b""),
+        TIMEOUT,
+    );
+    assert!(out.ok().contains("defaults-ok") && out.stdout.contains("tty-ok"), "{out:#?}");
+    assert!(out.stdout.contains("/dev/pts/"), "{out:#?}");
+}
+
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dv_one_program_attached_and_freed_on_delete() {
+    let mut s = spec(&["sleep", "3600"]);
+    let path = set_cgroup(&mut s, "dv-lifetime");
+    let c = Container::created(&s);
+    let id = saved_program(&c);
+    {
+        let dir = std::fs::File::open(cgroup_dir(&path)).unwrap();
+        let (ids, flags) = bpf::prog_query_with(dir.as_fd(), bpf::ATTACH_CGROUP_DEVICE, 0).unwrap();
+        assert_eq!((ids, flags), (vec![id], bpf::F_ALLOW_MULTI));
+        drop(bpf::prog_fd_by_id(id).unwrap());
+    }
+    c.delete(true).ok();
+    c.assert_gone();
+    wait_for_program_release(id);
+}
+
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dv_failed_create_frees_the_program() {
+    // Both parent-side and init-side failures happen after attachment.
+    // The debug event gives the id even though CreateGuard removes state.
+    for parent_failure in [false, true] {
+        let mut s = spec(&[if parent_failure { "true" } else { "no-such-dv-program" }]);
+        if parent_failure {
+            add_mount(&mut s, "/mnt", "bind", "/no-such-dv-source", &["bind"]);
+        }
+        set_cgroup(&mut s, "dv-failed-create");
+        let mut c = Container::new(&s);
+        let out = c.create(&["--debug", "--log-format", "json"]);
+        out.failed_with(if parent_failure { 1 } else { 127 });
+        let id = out
+            .stderr
+            .lines()
+            .find_map(|line| {
+                let event: serde_json::Value = serde_json::from_str(line).ok()?;
+                event["fields"]["program_id"].as_u64().map(|id| id as u32)
+            })
+            .unwrap_or_else(|| panic!("no attachment event: {out:#?}"));
+        c.assert_gone();
+        wait_for_program_release(id);
+    }
+}
+
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dv_exec_process_is_filtered() {
+    let (mut s, nodes) = device_probe_spec("exec sleep 3600");
+    mknod(&nodes.path().join("fuse"), SFlag::S_IFCHR, Mode::from_bits_truncate(0o666), makedev(10, 229)).unwrap();
+    set_cgroup(&mut s, "dv-exec-filtered");
+    let c = Container::started(&s);
+    // access(2), not an open of the host device. A bound device cannot
+    // bypass the cgroup check, including in an exec process.
+    let out = c.exec_in(
+        &[],
+        &[
+            "/opt/ld-linux-x86-64.so.2",
+            "--library-path",
+            "/opt",
+            "/mnt/probe",
+            "access:/mnt/fuse:r",
+            "access:/mnt/fuse:w",
+            "access:/mnt/fuse:rw",
+            "access:/dev/null:rw",
+        ],
+    );
+    assert_eq!(
+        out.ok(),
+        "access:/mnt/fuse:r EPERM\naccess:/mnt/fuse:w EPERM\naccess:/mnt/fuse:rw EPERM\naccess:/dev/null:rw ok\n"
+    );
 }

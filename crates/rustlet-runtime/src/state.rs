@@ -110,6 +110,11 @@ pub struct Private {
     /// Inode of that cgroup's directory once created: its identity, checked
     /// before every freeze/kill/remove.
     pub cgroup_ino: Option<u64>,
+    /// The id of the device filter attached to that cgroup (`bpftool prog
+    /// show id N`). `None`: no filter, because there is no cgroup, or the
+    /// container was created before Phase 2c part 2. `exec` allows
+    /// `CAP_MKNOD` only with a filter (or a user namespace).
+    pub device_filter: Option<u32>,
     /// Created with `--no-new-keyring`: `exec` then keeps its caller's
     /// session keyring too.
     pub no_new_keyring: bool,

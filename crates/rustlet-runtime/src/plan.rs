@@ -18,6 +18,7 @@ use oci_spec::runtime::{PosixRlimitType, Process, Spec};
 
 use crate::bundle::Bundle;
 use crate::caps::CapsPlan;
+use crate::cgroups::devices::DeviceFilter;
 use crate::cgroups::{self, CgroupPath, Setting};
 use crate::error::{Context, Error, Result, Unsupported};
 use crate::mounts::{self, MountEntry};
@@ -39,9 +40,10 @@ pub struct Plan {
     pub hostname: Option<String>,
     pub domainname: Option<String>,
     pub process: ProcessPlan,
-    /// The container's cgroup (`linux.cgroupsPath`) and the file writes that
-    /// implement `linux.resources`. `None`: the container stays in the
-    /// caller's cgroup (only allowed without resource limits).
+    /// The container's cgroup (`linux.cgroupsPath`), the file writes that
+    /// implement `linux.resources`, and its device filter. `None`: the
+    /// container stays in the caller's cgroup (only allowed without resource
+    /// limits), and has no device filter.
     pub cgroup: Option<CgroupPlan>,
     /// `linux.maskedPaths` and `linux.readonlyPaths`.
     pub paths: PathRules,
@@ -59,6 +61,9 @@ pub struct Plan {
 pub struct CgroupPlan {
     pub path: CgroupPath,
     pub settings: Vec<Setting>,
+    /// Attached to the cgroup before init exists, for every container that
+    /// has one: without device rules in the spec, it allows the defaults.
+    pub devices: DeviceFilter,
 }
 
 /// The process to run, and how.
@@ -204,7 +209,7 @@ fn cgroup_plan(linux: &oci_spec::runtime::Linux) -> Result<Option<CgroupPlan>> {
     match linux.cgroups_path() {
         Some(p) => {
             let path = CgroupPath::parse(&p.to_string_lossy())?;
-            Ok(Some(CgroupPlan { path, settings }))
+            Ok(Some(CgroupPlan { path, settings, devices: DeviceFilter::build(&[], &[])? }))
         }
         None if settings.is_empty() => Ok(None),
         None => Err(Error::invalid(

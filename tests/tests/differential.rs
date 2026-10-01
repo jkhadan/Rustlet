@@ -107,7 +107,7 @@ fn normalise(section: &str, runtime: &str, line: &str) -> String {
         // Ubuntu ships an unconfined `runc` profile attached to
         // /usr/sbin/runc, while rustlet-runc inherits the test's label.
         // Both are unconfined, which is what the comparison keeps.
-        ("identity", _) if line.ends_with(" (unconfined)") => "(unconfined)".to_owned(),
+        ("identity", _) if line == "unconfined" || line.ends_with(" (unconfined)") => "(unconfined)".to_owned(),
         // An exec'd process's PID depends on how many processes came
         // before it; only "is it init" is comparable.
         ("identity", _) if line.starts_with("pid ") && line != "pid 1" => "pid (not 1)".to_owned(),

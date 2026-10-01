@@ -180,6 +180,14 @@ pub(crate) fn spawn(opts: &CreateOptions, foreground: bool) -> Result<Spawned> {
         None => None,
     };
     let cgroup_fd = cgroup.as_ref().map(Cgroup::dir_fd).transpose()?;
+    // The device filter, attached before init exists too: the cgroup keeps
+    // it after we exit, and removing the cgroup removes it.
+    if let (Some(c), Some(fd)) = (&plan.cgroup, &cgroup_fd) {
+        let program_id = c.devices.attach(fd.as_fd())?;
+        tracing::debug!(program_id, "attached cgroup device filter");
+        state.rustlet.device_filter = Some(program_id);
+        dir.write(&state)?;
+    }
 
     // exec.fifo: 0622 because init opens it *after* switching to the
     // container user; umask would strip the write bits, so set them after.
