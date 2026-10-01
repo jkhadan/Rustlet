@@ -1734,10 +1734,13 @@ dependencies = [
 name = "rustlet-itests"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "nix",
+ "rustlet-image",
  "rustlet-runtime",
  "rustlet-sys",
  "serde_json",
+ "tar",
  "tempfile",
 ]
 

@@ -36,6 +36,7 @@ pub mod content;
 pub mod digest;
 pub mod error;
 pub mod image;
+pub mod import;
 pub mod manifest;
 pub mod media;
 pub mod pull;

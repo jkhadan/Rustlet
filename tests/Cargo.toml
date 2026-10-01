@@ -19,7 +19,11 @@ doc = false
 
 [dependencies]
 rustlet-runtime.workspace = true
+rustlet-image.workspace = true
 rustlet-sys.workspace = true
+# Building image layers in the image tests.
+tar.workspace = true
+flate2.workspace = true
 # `personality`: for the probe's seccomp argument-filter checks.
 nix = { workspace = true, features = ["personality"] }
 tempfile.workspace = true

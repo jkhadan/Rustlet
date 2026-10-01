@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod e2e;
+pub mod images;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
