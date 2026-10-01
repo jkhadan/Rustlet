@@ -1,0 +1,106 @@
+//! The paths of the API (see the table in the crate docs), so that client
+//! and server spell them the same way. Query parameters are the `*Query`
+//! structs, URL-encoded (`serde_urlencoded`; `true`/`false` for booleans).
+
+/// `/v1` + `rest`.
+fn v1(rest: &str) -> String {
+    format!("/{}{rest}", crate::API_VERSION)
+}
+
+pub fn ping() -> String {
+    v1("/_ping")
+}
+pub fn version() -> String {
+    v1("/version")
+}
+pub fn info() -> String {
+    v1("/info")
+}
+pub fn events() -> String {
+    v1("/events")
+}
+
+/// `GET` (list) and `POST` (create).
+pub fn containers() -> String {
+    v1("/containers")
+}
+/// `GET` (inspect) and `DELETE`.
+pub fn container(id: &str) -> String {
+    v1(&format!("/containers/{id}"))
+}
+/// `/v1/containers/{id}/{action}`, `action` one of [`action`]'s.
+pub fn container_action(id: &str, action: &str) -> String {
+    v1(&format!("/containers/{id}/{action}"))
+}
+
+/// The last path segment of the per-container routes.
+pub mod action {
+    pub const START: &str = "start";
+    pub const STOP: &str = "stop";
+    pub const KILL: &str = "kill";
+    pub const RESTART: &str = "restart";
+    pub const PAUSE: &str = "pause";
+    pub const UNPAUSE: &str = "unpause";
+    pub const WAIT: &str = "wait";
+    pub const LOGS: &str = "logs";
+    pub const STATS: &str = "stats";
+    pub const ATTACH: &str = "attach";
+    pub const EXEC: &str = "exec";
+    pub const ALL: [&str; 11] = [START, STOP, KILL, RESTART, PAUSE, UNPAUSE, WAIT, LOGS, STATS, ATTACH, EXEC];
+}
+
+/// `GET` (inspect).
+pub fn exec(id: &str) -> String {
+    v1(&format!("/exec/{id}"))
+}
+/// `GET` + WebSocket upgrade (attached), or `POST` (detached).
+pub fn exec_start(id: &str) -> String {
+    v1(&format!("/exec/{id}/start"))
+}
+
+/// `GET` (list) and `DELETE` (`?name=`).
+pub fn images() -> String {
+    v1("/images")
+}
+pub fn image_pull() -> String {
+    v1("/images/pull")
+}
+pub fn image_inspect() -> String {
+    v1("/images/inspect")
+}
+
+/// The same routes in axum's syntax, for the server.
+pub mod pattern {
+    pub const PING: &str = "/v1/_ping";
+    pub const VERSION: &str = "/v1/version";
+    pub const INFO: &str = "/v1/info";
+    pub const EVENTS: &str = "/v1/events";
+    pub const CONTAINERS: &str = "/v1/containers";
+    pub const CONTAINER: &str = "/v1/containers/{id}";
+    /// `/v1/containers/{id}/<action>`.
+    pub fn container_action(action: &str) -> String {
+        format!("/v1/containers/{{id}}/{action}")
+    }
+    pub const EXEC: &str = "/v1/exec/{id}";
+    pub const EXEC_START: &str = "/v1/exec/{id}/start";
+    pub const IMAGES: &str = "/v1/images";
+    pub const IMAGE_PULL: &str = "/v1/images/pull";
+    pub const IMAGE_INSPECT: &str = "/v1/images/inspect";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_match_the_patterns() {
+        assert_eq!(containers(), pattern::CONTAINERS);
+        assert_eq!(container("web"), pattern::CONTAINER.replace("{id}", "web"));
+        for a in action::ALL {
+            assert_eq!(container_action("web", a), pattern::container_action(a).replace("{id}", "web"));
+        }
+        assert_eq!(exec_start("e1"), pattern::EXEC_START.replace("{id}", "e1"));
+        assert_eq!(image_pull(), pattern::IMAGE_PULL);
+        assert_eq!(ping(), pattern::PING);
+    }
+}

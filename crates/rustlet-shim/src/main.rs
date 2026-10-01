@@ -1,4 +1,4 @@
-//! rustlet-shim (skeleton; filled in by later phases).
+//! `rustlet-shim` (filled in next).
 #![forbid(unsafe_code)]
 
 fn main() {}

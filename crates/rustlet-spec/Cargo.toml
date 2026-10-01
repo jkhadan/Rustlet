@@ -1,5 +1,6 @@
 [package]
 name = "rustlet-spec"
+description = "The Rustlets daemon API as types: request and response bodies, streamed records, routes, WebSocket framing."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,3 +11,5 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true

@@ -65,6 +65,7 @@ rustlet-net = { path = "crates/rustlet-net" }
 rustlet-build = { path = "crates/rustlet-build" }
 rustlet-compose = { path = "crates/rustlet-compose" }
 rustlet-client = { path = "crates/rustlet-client" }
+rustlet-shim = { path = "crates/rustlet-shim" }
 
 # syscalls
 libc = "0.2"
@@ -83,7 +84,9 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 http = "1"
-tokio-tungstenite = "0.30"
+serde_urlencoded = "0.7"
+# The version axum's `ws` feature uses, so there is only one.
+tokio-tungstenite = "0.29"
 futures = "0.3"
 bytes = "1"
 

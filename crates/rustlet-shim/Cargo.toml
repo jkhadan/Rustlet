@@ -1,5 +1,6 @@
 [package]
 name = "rustlet-shim"
+description = "One per container: owns its stdio and logs, reaps it as a subreaper, serves attach/exec, reports its exit. Library: the daemon-shim protocol."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,4 +10,26 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "rustlet-shim"
+path = "src/main.rs"
+
 [dependencies]
+rustlet-spec.workspace = true
+rustlet-runtime.workspace = true
+rustlet-sys.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+nix.workspace = true
+libc.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

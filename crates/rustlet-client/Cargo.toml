@@ -1,5 +1,6 @@
 [package]
 name = "rustlet-client"
+description = "Typed async client for the rustletd API: HTTP/1.1 over its Unix socket, NDJSON streams, WebSocket attach and exec."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,3 +11,20 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+rustlet-spec.workspace = true
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+http.workspace = true
+bytes.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_urlencoded.workspace = true
+tokio-tungstenite.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tempfile.workspace = true
