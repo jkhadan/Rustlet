@@ -196,6 +196,120 @@ pub fn fork() -> Result<Forked> {
     }
 }
 
+/// A child process parked in a new user namespace, kept alive so that the
+/// namespace can be given mappings and then opened as an fd.
+///
+/// An idmapped mount needs a *user namespace* to take its mapping from, and
+/// the kernel offers no way to make one other than to put a process in it.
+/// Image layers are idmapped (Phase 3) before the container that will use
+/// them exists, so this process stands in: [`spawn`](Self::spawn) creates it,
+/// the caller writes `/proc/<pid>/uid_map` and `gid_map` (the runtime's
+/// `IdMapper`), [`open_ns`](Self::open_ns) returns the namespace, and
+/// dropping the holder lets the child exit and reaps it. The namespace lives
+/// on for as long as an fd or a mount refers to it.
+///
+/// ## Why this `clone3` is sound in a multithreaded caller
+///
+/// [`Clone3::spawn`] refuses to run in a multithreaded process because its
+/// child goes on to run arbitrary code (see the module docs). This child
+/// doesn't. Between `clone3` returning 0 and `_exit` it makes raw system
+/// calls only (`close_range`, `read`), on values computed before the clone:
+/// no allocation, no lock, no Rust runtime state. Those calls are
+/// async-signal-safe, the condition POSIX sets for the child of a fork in a
+/// multithreaded process, so it doesn't matter which locks other threads held.
+/// The daemon (Phase 4) is multithreaded, which is why this exists.
+#[derive(Debug)]
+pub struct UsernsHolder {
+    pid: Pid,
+    pidfd: OwnedFd,
+    /// The write end of the pipe the child blocks on; closing it is the
+    /// child's signal to exit.
+    release: Option<OwnedFd>,
+}
+
+impl UsernsHolder {
+    /// `clone3(CLONE_NEWUSER | CLONE_PIDFD)` with a child that closes every
+    /// fd it inherited except the read end of a pipe, then waits for EOF on
+    /// it. EOF also comes if the parent dies, so the child can't outlive it.
+    pub fn spawn() -> Result<UsernsHolder> {
+        let (wait, release) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
+        let keep = wait.as_raw_fd();
+        let mut pidfd: libc::c_int = -1;
+        let mut args = CloneArgs {
+            flags: (CloneFlags::NEWUSER | CloneFlags::PIDFD).bits(),
+            pidfd: &raw mut pidfd as u64,
+            exit_signal: Signal::SIGCHLD as u64,
+            ..Default::default()
+        };
+        // SAFETY: `args` is a correctly laid out `struct clone_args` that
+        // lives across the call, and its one pointer (`pidfd`) points to a
+        // live local. Without CLONE_VM/CLONE_THREAD/stack the child gets a
+        // private copy of our address space, and it runs nothing but
+        // `holder_child` (see the type's docs for why that is sound even if
+        // other threads exist).
+        let ret = unsafe { libc::syscall(libc::SYS_clone3, &raw mut args, size_of::<CloneArgs>()) };
+        if ret == 0 {
+            holder_child(keep);
+        }
+        let pid = check(ret)?;
+        drop(wait);
+        Ok(UsernsHolder {
+            pid: Pid::from_raw(pid as libc::pid_t),
+            pidfd: owned_fd(pidfd.into()),
+            release: Some(release),
+        })
+    }
+
+    /// The child's PID, for writing its `uid_map` and `gid_map`.
+    pub fn pid(&self) -> Pid {
+        self.pid
+    }
+
+    /// Opens the child's user namespace (`/proc/<pid>/ns/user`). Call it once
+    /// the maps are written: an fd for a namespace without maps is useless
+    /// for idmapping (the kernel refuses it).
+    ///
+    /// The PID can't have been reused: the child is ours and unreaped until
+    /// the holder is dropped (so don't use this in a process that reaps with
+    /// `waitid(P_ALL)`). If the child died, its namespace links are gone and
+    /// this fails instead.
+    pub fn open_ns(&self) -> Result<OwnedFd> {
+        open_ns(format!("/proc/{}/ns/user", self.pid))
+    }
+}
+
+impl Drop for UsernsHolder {
+    fn drop(&mut self) {
+        // EOF on the pipe: the child exits. Then reap it, so no zombie stays.
+        drop(self.release.take());
+        let _ = waitid(WaitTarget::PidFd(std::os::fd::AsFd::as_fd(&self.pidfd)), false);
+    }
+}
+
+/// The parked child of [`UsernsHolder::spawn`]. Raw system calls only.
+fn holder_child(keep: libc::c_int) -> ! {
+    let keep = keep as libc::c_uint;
+    if keep > 3 {
+        // SAFETY: async-signal-safe syscall. It closes descriptors whose
+        // `OwnedFd`s live in this copy of the parent's memory, but the child
+        // never returns into code that would use or drop them: it ends in
+        // `_exit` below.
+        unsafe { libc::syscall(libc::SYS_close_range, 3 as libc::c_uint, keep - 1, 0 as libc::c_uint) };
+    }
+    // SAFETY: as above, for every descriptor above `keep`.
+    unsafe { libc::syscall(libc::SYS_close_range, keep + 1, libc::c_uint::MAX, 0 as libc::c_uint) };
+    let mut byte = 0u8;
+    loop {
+        // SAFETY: `byte` is a valid one-byte buffer on this stack.
+        let n = unsafe { libc::read(keep as libc::c_int, (&raw mut byte).cast(), 1) };
+        if n < 0 && Errno::last() == Errno::EINTR {
+            continue;
+        }
+        break;
+    }
+    exit_now(0)
+}
+
 /// Number of threads in the calling process, from `/proc/self/status`.
 pub fn thread_count() -> Result<usize> {
     let status = std::fs::read_to_string("/proc/self/status").map_err(|_| Errno::EIO)?;
@@ -428,5 +542,27 @@ mod tests {
     #[test]
     fn thread_count_is_positive() {
         assert!(thread_count().unwrap() >= 1);
+    }
+
+    #[test]
+    fn userns_holder_parks_a_child_in_a_new_user_namespace() {
+        // libtest runs this on a worker thread, so the process is
+        // multithreaded: exactly the case `UsernsHolder` exists for.
+        let holder = match UsernsHolder::spawn() {
+            Ok(h) => h,
+            // Hosts that forbid unprivileged user namespaces.
+            Err(Errno::EPERM | Errno::ENOSPC | Errno::EACCES) if !nix::unistd::geteuid().is_root() => return,
+            Err(e) => panic!("spawn: {e}"),
+        };
+        let pid = holder.pid();
+        let ns = holder.open_ns().unwrap();
+        let theirs = crate::fs::fstatx(std::os::fd::AsFd::as_fd(&ns)).unwrap().ino;
+        let ours = crate::fs::statx(None, "/proc/self/ns/user", 0).unwrap().ino;
+        assert_ne!(theirs, ours, "the child should be in a new user namespace");
+        drop(holder);
+        // Dropped: the child got EOF, exited and was reaped.
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists(), "child {pid} still exists");
+        // The namespace outlives its last process while an fd refers to it.
+        assert_eq!(crate::fs::fstatx(std::os::fd::AsFd::as_fd(&ns)).unwrap().ino, theirs);
     }
 }

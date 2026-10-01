@@ -30,6 +30,24 @@ pub fn lset(path: &Path, name: &str, value: &[u8]) -> Result<()> {
     crate::check_int(ret).map(drop)
 }
 
+/// Sets an attribute on the entry `name` of the directory `dir` *without
+/// following it*, the one way to reach a symlink itself by fd: `fsetxattr`
+/// needs an fd opened for I/O, and a symlink can only be opened `O_PATH`.
+///
+/// It calls `lsetxattr("/proc/self/fd/<dir>/<name>")`: the magic link for
+/// `dir` is a non-final component, so it is followed to exactly the
+/// directory we hold; `name` is final, so `l*` doesn't follow it. `name` must
+/// be a single component. Only `trusted.*` and `security.*` attributes exist
+/// on symlinks (`user.*` gets `EPERM`).
+pub fn lset_at(dir: BorrowedFd<'_>, name: &std::ffi::OsStr, attr: &str, value: &[u8]) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    if name.is_empty() || name == "." || name == ".." || name.as_bytes().contains(&b'/') {
+        return Err(Errno::EINVAL);
+    }
+    let path = Path::new(&format!("/proc/self/fd/{}", dir.as_raw_fd())).join(name);
+    lset(&path, attr, value)
+}
+
 /// `fgetxattr` into a freshly sized buffer. `ENODATA` if absent.
 pub fn fget(fd: BorrowedFd<'_>, name: &str) -> Result<Vec<u8>> {
     let n = cstr(name)?;

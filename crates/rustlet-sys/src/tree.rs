@@ -96,6 +96,36 @@ pub fn safe_remove_tree(path: &Path) -> std::result::Result<(), RemoveError> {
     nix::unistd::unlinkat(&parent_fd, name, UnlinkatFlags::RemoveDir).map_err(sys)
 }
 
+/// Recursively deletes the entry `name` in the directory `dir`: a file,
+/// symlink, or whole directory tree, never following a symlink and never
+/// leaving `dir`'s mount.
+///
+/// Unlike [`safe_remove_tree`] this takes no path and doesn't consult
+/// mountinfo, so it is for trees only the caller writes to, such as an image
+/// layer being unpacked, where a later archive entry replaces a directory
+/// with a file. The mount-ID comparison still stops it at any mount.
+pub fn remove_tree_at(dir: BorrowedFd<'_>, name: &OsStr) -> std::result::Result<(), RemoveError> {
+    let shown = Path::new(name);
+    let sys = |e: Errno| RemoveError::Sys(e, shown.to_owned());
+    if name.is_empty() || name == "." || name == ".." || name.as_bytes().contains(&b'/') {
+        return Err(RemoveError::BadPath);
+    }
+    let st = statx(Some(dir), name, libc::AT_SYMLINK_NOFOLLOW).map_err(sys)?;
+    if !st.is_dir() {
+        return nix::unistd::unlinkat(dir, name, UnlinkatFlags::NoRemoveDir).map_err(sys);
+    }
+    let mnt = crate::fs::fstatx(dir).map_err(sys)?.mnt_id;
+    if st.mnt_id != mnt {
+        return Err(RemoveError::CrossesMount(shown.to_owned()));
+    }
+    let sub = open_dir_beneath(dir, name).map_err(|e| match e {
+        Errno::EXDEV => RemoveError::CrossesMount(shown.to_owned()),
+        e => sys(e),
+    })?;
+    remove_contents(sub, mnt, shown, 0)?;
+    nix::unistd::unlinkat(dir, name, UnlinkatFlags::RemoveDir).map_err(sys)
+}
+
 fn open_dir_beneath(dir: BorrowedFd<'_>, name: &OsStr) -> Result<OwnedFd> {
     openat2(
         Some(dir),
@@ -193,6 +223,27 @@ mod tests {
     fn rejects_relative_and_root() {
         assert!(matches!(safe_remove_tree(Path::new("relative")), Err(RemoveError::BadPath)));
         assert!(matches!(safe_remove_tree(Path::new("/")), Err(RemoveError::BadPath)));
+    }
+
+    #[test]
+    fn remove_tree_at_deletes_entries_of_any_type_without_following_links() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("precious"), "keep me").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tree/a/b")).unwrap();
+        std::fs::write(dir.path().join("tree/a/b/f"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("tree/a/escape")).unwrap();
+        std::fs::write(dir.path().join("file"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        let fd = nix::fcntl::open(dir.path(), OFlag::O_RDONLY | OFlag::O_DIRECTORY, Mode::empty()).unwrap();
+        for name in ["tree", "file", "link"] {
+            remove_tree_at(fd.as_fd(), OsStr::new(name)).unwrap();
+            assert!(dir.path().join(name).symlink_metadata().is_err(), "{name} still exists");
+        }
+        assert_eq!(std::fs::read_to_string(outside.path().join("precious")).unwrap(), "keep me");
+        for bad in ["", ".", "..", "a/b"] {
+            assert!(matches!(remove_tree_at(fd.as_fd(), OsStr::new(bad)), Err(RemoveError::BadPath)), "{bad:?}");
+        }
     }
 
     #[test]
