@@ -25,7 +25,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use rustlet_itests::e2e::*;
 use rustlet_itests::*;
-use rustlet_runtime::oci_spec::runtime::Spec;
+use rustlet_runtime::oci_spec::runtime::{
+    LinuxDeviceBuilder, LinuxDeviceCgroupBuilder, LinuxDeviceType, LinuxResourcesBuilder, Spec,
+};
 use rustlet_runtime::spec::to_pretty_json;
 
 const RUNC: &str = "/usr/sbin/runc";
@@ -158,6 +160,25 @@ fn accepted(section: &str, runtime: &str, line: &str) -> bool {
         // Rustlets deliberately doesn't: /proc/kcore is masked anyway, and
         // the link only advertises it.
         ("dev", "runc") => line.starts_with("/dev/core "),
+        // runc permits arbitrary char/block mknod and tun by default;
+        // Rustlets grants m only for defaults and specified nodes.
+        ("access", "runc") => matches!(
+            line,
+            "mknod:/dev/other-char:c:10:230 ok"
+                | "mknod:/dev/other-block:b:8:1 ok"
+                | "access:/dev/net/tun:rw ok"
+                | "access:/dev/fuse:rw ok"
+        ),
+        // The fuse request includes a denied write bit. Rustlets applies
+        // denies per bit, including O_RDWR; runc's v1 emulator only
+        // matches a deny whose access contains the entire request.
+        ("access", "rustlet") => matches!(
+            line,
+            "mknod:/dev/other-char:c:10:230 EPERM"
+                | "mknod:/dev/other-block:b:8:1 EPERM"
+                | "access:/dev/net/tun:rw EPERM"
+                | "access:/dev/fuse:rw EPERM"
+        ),
         _ => false,
     }
 }
@@ -279,6 +300,86 @@ fn have_runc() -> bool {
         eprintln!("skipped: no runc at {RUNC}");
     }
     found
+}
+
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn df_devices_match_runc() {
+    if !have_runc() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_rustlet-probe"), dir.path().join("probe")).unwrap();
+    let script = "echo '== nodes'; stat -c '%n %F %a %u:%g %t:%T' /dev/fuse /dev/net/tun; \
+        echo '== access'; /opt/ld-linux-x86-64.so.2 --library-path /opt /mnt/probe \
+        access:/dev/null:rw access:/dev/fuse:r access:/dev/fuse:w access:/dev/fuse:rw \
+        access:/dev/net/tun:rw mknod:/dev/other-char:c:10:230 mknod:/dev/other-block:b:8:1";
+    let mut s = sh(script);
+    add_mount(&mut s, "/mnt", "bind", dir.path().to_str().unwrap(), &["bind", "ro", "nosuid", "nodev"]);
+    add_mount(&mut s, "/opt", "bind", "/usr/lib/x86_64-linux-gnu", &["bind", "ro", "nosuid", "nodev"]);
+    let caps: Vec<&str> = DEFAULT_CAPS.iter().copied().chain(["CAP_MKNOD"]).collect();
+    set_capabilities(&mut s, CapSets::root(&caps));
+    edit_linux(&mut s, |l| {
+        l.set_seccomp(None);
+        l.set_devices(Some(vec![
+            LinuxDeviceBuilder::default()
+                .path("/dev/fuse")
+                .typ(LinuxDeviceType::C)
+                .major(10)
+                .minor(229)
+                .file_mode(0o640u32)
+                .uid(12u32)
+                .gid(34u32)
+                .build()
+                .unwrap(),
+            LinuxDeviceBuilder::default()
+                .path("/dev/net/tun")
+                .typ(LinuxDeviceType::C)
+                .major(10)
+                .minor(200)
+                .build()
+                .unwrap(),
+        ]));
+        l.set_resources(Some(
+            LinuxResourcesBuilder::default()
+                .devices(vec![
+                    LinuxDeviceCgroupBuilder::default()
+                        .allow(true)
+                        .typ(LinuxDeviceType::C)
+                        .major(10)
+                        .minor(229)
+                        .access("rw")
+                        .build()
+                        .unwrap(),
+                    LinuxDeviceCgroupBuilder::default()
+                        .allow(false)
+                        .typ(LinuxDeviceType::C)
+                        .major(10)
+                        .minor(229)
+                        .access("w")
+                        .build()
+                        .unwrap(),
+                ])
+                .build()
+                .unwrap(),
+        ));
+    });
+    let theirs = run_under_runc(&s, None);
+    theirs.ok();
+    set_cgroup(&mut s, "df-devices");
+    let ours = run(&s);
+    let report = compare(&theirs.stdout, ours.ok());
+    assert!(report.is_empty(), "device behavior differs unexpectedly:\n{report}");
+    // Assert the deliberate differences also occur, so accepting them
+    // cannot hide a regression that grants forbidden access.
+    for denied in [
+        "access:/dev/fuse:rw EPERM",
+        "access:/dev/net/tun:rw EPERM",
+        "mknod:/dev/other-block:b:8:1 EPERM",
+        "mknod:/dev/other-char:c:10:230 EPERM",
+    ] {
+        assert!(ours.stdout.contains(denied), "{ours:#?}");
+    }
 }
 
 /// The same default bundle under runc and rustlet-runc looks the same from

@@ -48,6 +48,7 @@ pub mod caps;
 pub mod cgroups;
 pub mod console;
 pub mod create;
+pub mod dev;
 pub mod error;
 pub mod exec;
 mod init;

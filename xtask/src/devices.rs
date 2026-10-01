@@ -17,9 +17,11 @@ pub(crate) fn run(bundle: Option<&Path>, show_disasm: bool) -> anyhow::Result<()
     let (what, filter) = match bundle {
         Some(dir) => {
             let bundle = rustlet_runtime::Bundle::load(dir)?;
-            let rules =
-                bundle.spec.linux().as_ref().and_then(|l| l.resources().as_ref()).and_then(|r| r.devices().clone());
-            let filter = DeviceFilter::build(rules.as_deref().unwrap_or_default(), &[])?;
+            let plan = rustlet_runtime::plan::Plan::new("devices", &bundle)?;
+            let filter = plan
+                .cgroup
+                .ok_or_else(|| anyhow::anyhow!("set linux.cgroupsPath to inspect the attached device filter"))?
+                .devices;
             (format!("the device filter of {}", bundle.dir.display()), filter)
         }
         None => ("the default device filter".to_owned(), DeviceFilter::build(&[], &[])?),

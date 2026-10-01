@@ -12,11 +12,64 @@ use std::path::Path;
 use rustlet_itests::e2e::*;
 use rustlet_itests::*;
 use rustlet_runtime::oci_spec::runtime::{
-    LinuxIdMappingBuilder, LinuxNamespaceType, PosixRlimitBuilder, PosixRlimitType, Spec,
+    LinuxDeviceBuilder, LinuxDeviceType, LinuxIdMappingBuilder, LinuxNamespaceType, PosixRlimitBuilder,
+    PosixRlimitType, Spec,
 };
 use rustlet_runtime::spec::{REMAP_HOST_ID, REMAP_SIZE};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn us_spec_device_is_a_bind_of_the_hosts() {
+    let mut s = userns_sh("stat -c '%a %t:%T %u:%g' /dev/fuse; grep ' /dev/fuse ' /proc/self/mountinfo");
+    set_cgroup(&mut s, "us-spec-device");
+    let node = LinuxDeviceBuilder::default()
+        .path("/dev/fuse")
+        .typ(LinuxDeviceType::U)
+        .major(10)
+        .minor(229)
+        .file_mode(0o600u32)
+        .uid(123u32)
+        .gid(456u32)
+        .build()
+        .unwrap();
+    edit_linux(&mut s, |l| {
+        l.set_devices(Some(vec![node]));
+    });
+    let out = run(&s);
+    let host = std::fs::metadata("/dev/fuse").unwrap();
+    assert!(out.ok().starts_with(&format!("{:o} a:e5 65534:65534\n", host.mode() & 0o7777)), "{out:#?}");
+    assert!(out.stdout.contains(" /dev/fuse "), "{out:#?}");
+    // Host rdev/type must agree; don't bind a different host node.
+    let mut node = s.linux().as_ref().unwrap().devices().as_ref().unwrap()[0].clone();
+    node.set_minor(228);
+    edit_linux(&mut s, |l| {
+        l.set_devices(Some(vec![node]));
+    });
+    assert_refused(&s, "is not Char device 10:228");
+}
+
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn us_spec_fifo_is_created_with_its_metadata() {
+    let mut s = userns_sh("stat -c '%F %a %u:%g' /dev/events");
+    set_cgroup(&mut s, "us-spec-fifo");
+    let node = LinuxDeviceBuilder::default()
+        .path("/dev/events")
+        .typ(LinuxDeviceType::P)
+        .major(0)
+        .minor(0)
+        .file_mode(0o640u32)
+        .uid(12u32)
+        .gid(34u32)
+        .build()
+        .unwrap();
+    edit_linux(&mut s, |l| {
+        l.set_devices(Some(vec![node]));
+    });
+    assert_eq!(run(&s).ok(), "fifo 640 12:34\n");
+}
 
 /// `Uid:`/`Gid:`/`Groups:` of a host process, as the host sees them.
 fn host_ids(pid: i32) -> (String, String, String) {

@@ -24,7 +24,7 @@
 //!    build the mount detached (`fsopen`/`fsmount`, or the parent's tree),
 //!    resolve the target with `openat2(RESOLVE_IN_ROOT)`, attach with
 //!    `move_mount` onto that fd. See `inroot` for why.
-//! 4. **Populate `/dev`** ([`populate_dev`]): device nodes (or, in a user
+//! 4. **Populate `/dev`** ([`crate::dev::populate`]): device nodes (or, in a user
 //!    namespace, bind mounts of the host's) and the standard symlinks, only
 //!    ever inside a tmpfs.
 //! 5. **Switch root** ([`pivot`]): `pivot_root(".", ".")`, then detach the
@@ -35,7 +35,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
 use nix::fcntl::OFlag;
-use nix::sys::stat::{Mode, SFlag};
+use nix::sys::stat::Mode;
 use rustlet_sys::fs::{fs_magic, fstatx, magic};
 use rustlet_sys::mount::{
     self, FsContext, MntFlags, MountAttr, MoveMountFlags, MsFlags, OpenTreeFlags, Propagation, SetAttr, mount_setattr,
@@ -119,7 +119,7 @@ pub(crate) fn setup(plan: &Plan, trees: HostTrees) -> Result<()> {
     for (m, tree) in plan.mounts.iter().zip(trees.binds) {
         mount_entry(root.as_fd(), m, tree)?;
     }
-    populate_dev(root.as_fd(), plan.namespaces.new_user())?;
+    crate::dev::populate(root.as_fd(), &plan.dev)?;
     // The working directory is created (if missing) while we still hold the
     // rootfs fd; `process` chdir()s into it after the identity switch.
     inroot::mkdir_all(root.as_fd(), &plan.process.cwd, Mode::from_bits_truncate(0o755))
@@ -320,103 +320,6 @@ fn check_resolved_target(m: &MountEntry, target: BorrowedFd<'_>) -> Result<()> {
          mounts may not cover the kernel's files",
         m.describe()
     )))
-}
-
-/// The device nodes every container gets (OCI "default devices").
-/// `(name, major, minor)`; all are world read/write character devices.
-const DEFAULT_DEVICES: [(&str, u64, u64); 6] =
-    [("null", 1, 3), ("zero", 1, 5), ("full", 1, 7), ("random", 1, 8), ("urandom", 1, 9), ("tty", 5, 0)];
-
-/// `/dev` symlinks: `(name, target)`. runc also adds `core -> /proc/kcore`;
-/// we don't: kcore is kernel memory, and the default `maskedPaths` hide it anyway.
-const DEV_SYMLINKS: [(&str, &str); 5] = [
-    // The devpts instance mounted at /dev/pts has its own ptmx; programs
-    // open /dev/ptmx, so point it there instead of at the host's.
-    ("ptmx", "pts/ptmx"),
-    ("fd", "/proc/self/fd"),
-    ("stdin", "/proc/self/fd/0"),
-    ("stdout", "/proc/self/fd/1"),
-    ("stderr", "/proc/self/fd/2"),
-];
-
-/// Step 4: device nodes and symlinks in the container's `/dev`.
-///
-/// Refuses unless `/dev` is a tmpfs: the nodes must never be written into
-/// the image's own `dev/` directory (which is shared and, being on a `nodev`
-/// mount, couldn't use them anyway).
-///
-/// In a user namespace (`userns`), `mknod` of a device is always `EPERM`
-/// (it needs `CAP_MKNOD` in the initial user namespace), and a node on a
-/// filesystem mounted from inside one could never be opened anyway (the
-/// kernel marks such superblocks "no devices"). So each node is a bind mount
-/// of the host's own instead ([`bind_host_device`]).
-pub fn populate_dev(root: BorrowedFd<'_>, userns: bool) -> Result<()> {
-    let dev = inroot::open_dir(root, Path::new("/dev")).context("open /dev in rootfs")?;
-    if fs_magic(dev.as_fd()).context("fstatfs /dev")? != magic::TMPFS_MAGIC {
-        return Err(Error::invalid(
-            "the spec must mount a tmpfs on /dev (device nodes are never created in the image)",
-        ));
-    }
-    for (name, major, minor) in DEFAULT_DEVICES {
-        if userns {
-            bind_host_device(dev.as_fd(), name, (major, minor))?;
-            continue;
-        }
-        // umask is 0 during init, so 0o666 is exactly what gets created.
-        match nix::sys::stat::mknodat(
-            &dev,
-            name,
-            SFlag::S_IFCHR,
-            Mode::from_bits_truncate(0o666),
-            nix::sys::stat::makedev(major, minor),
-        ) {
-            Ok(()) => {}
-            // Already there (e.g. the spec bind-mounted one): keep it.
-            Err(Errno::EEXIST) => {}
-            Err(e) => return Err(e).with_context(|| format!("mknod /dev/{name}")),
-        }
-    }
-    for (name, target) in DEV_SYMLINKS {
-        match nix::unistd::symlinkat(target, &dev, name) {
-            Ok(()) | Err(Errno::EEXIST) => {}
-            Err(e) => return Err(e).with_context(|| format!("symlink /dev/{name}")),
-        }
-    }
-    Ok(())
-}
-
-/// A bind of the host's `/dev/<name>` onto a new, empty file in the
-/// container's `/dev`.
-///
-/// The host's node comes from init's copy of the host's mount table (step 4
-/// runs before `pivot_root`, so `/dev` is still the host's devtmpfs, which
-/// belongs to the initial user namespace: its nodes can be opened). The copy
-/// is checked to be the character device it should be before it is attached,
-/// and it inherits the host mount's `nosuid`/`noexec`, locked.
-fn bind_host_device(dev: BorrowedFd<'_>, name: &str, (major, minor): (u64, u64)) -> Result<()> {
-    let ctx = || format!("bind the host's /dev/{name}");
-    let host = Path::new("/dev").join(name);
-    let tree = open_tree(None, &host, OpenTreeFlags::CLONE | OpenTreeFlags::SYMLINK_NOFOLLOW).with_context(ctx)?;
-    let st = fstatx(tree.as_fd()).with_context(ctx)?;
-    if !st.is_char_device() || (u64::from(st.rdev.0), u64::from(st.rdev.1)) != (major, minor) {
-        return Err(Error::Init {
-            message: format!(
-                "the host's /dev/{name} is not character device {major}:{minor} (file type {:#o}, device {}:{})",
-                st.file_type(),
-                st.rdev.0,
-                st.rdev.1
-            ),
-            errno: None,
-        });
-    }
-    let create = OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-    let target = match nix::fcntl::openat(dev, name, create, Mode::from_bits_truncate(0o666)) {
-        Ok(fd) => fd,
-        // Already there (e.g. the spec bind-mounted one): keep it.
-        Err(Errno::EEXIST) => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("create /dev/{name}")),
-    };
-    move_mount_fd(tree.as_fd(), target.as_fd()).with_context(ctx)
 }
 
 /// Step 5: makes `root` the process's `/` and throws the host's view away.

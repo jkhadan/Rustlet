@@ -325,10 +325,9 @@ pub fn decide(rules: &[Rule], req: &Request) -> bool {
 /// `/dev/ptmx` and the pty slaves. `/dev/console` is a bind mount of a pty
 /// slave (136:N), so it needs no rule of its own.
 pub fn default_rules() -> Vec<Rule> {
-    const NODES: [(u32, u32); 6] = [(1, 3), (1, 5), (1, 7), (1, 8), (1, 9), (5, 0)];
-    let mut rules: Vec<Rule> = NODES
+    let mut rules: Vec<Rule> = crate::dev::DEFAULT_DEVICES
         .into_iter()
-        .map(|(major, minor)| Rule::allow(DevType::Char, major, Some(minor), Access::ALL, Origin::Default))
+        .map(|(_, major, minor)| Rule::allow(DevType::Char, major, Some(minor), Access::ALL, Origin::Default))
         .collect();
     rules.push(Rule::allow(DevType::Char, 5, Some(2), Access::ALL, Origin::Default));
     rules.push(Rule::allow(DevType::Char, 136, None, Access::ALL, Origin::Default));

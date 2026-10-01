@@ -20,6 +20,7 @@ use crate::bundle::Bundle;
 use crate::caps::CapsPlan;
 use crate::cgroups::devices::DeviceFilter;
 use crate::cgroups::{self, CgroupPath, Setting};
+use crate::dev::{self, DevPlan, NodeType};
 use crate::error::{Context, Error, Result, Unsupported};
 use crate::mounts::{self, MountEntry};
 use crate::namespaces::{self, NamespacePlan};
@@ -37,6 +38,8 @@ pub struct Plan {
     pub root_readonly: bool,
     pub namespaces: NamespacePlan,
     pub mounts: Vec<MountEntry>,
+    /// Defaults plus the validated linux.devices entries.
+    pub dev: DevPlan,
     pub hostname: Option<String>,
     pub domainname: Option<String>,
     pub process: ProcessPlan,
@@ -162,7 +165,18 @@ impl Plan {
         if let Some(u) = &userns {
             u.check_process(&process)?;
         }
-        let cgroup = cgroup_plan(linux)?;
+        let dev = dev::plan(linux, &namespaces, &mounts)?;
+        if let Some(u) = &userns {
+            for n in dev.nodes.iter().filter(|n| n.typ == NodeType::Fifo) {
+                if u.uid_to_host(n.uid).is_none() || u.gid_to_host(n.gid).is_none() {
+                    return Err(Error::invalid(format!(
+                        "linux.devices[{}]: FIFO uid/gid must be mapped in the user namespace",
+                        n.index
+                    )));
+                }
+            }
+        }
+        let cgroup = cgroup_plan(linux, &dev)?;
         check_mknod(&process.caps, cgroup.is_some(), namespaces.new_user())?;
         Ok(Plan {
             id: id.to_owned(),
@@ -170,6 +184,7 @@ impl Plan {
             root_readonly: root_cfg.readonly().unwrap_or(false),
             namespaces,
             mounts,
+            dev,
             hostname,
             domainname,
             process,
@@ -203,7 +218,7 @@ fn resolve_root(path: &Path) -> Result<PathBuf> {
 /// `linux.cgroupsPath` + `linux.resources`. Limits need a cgroup to live in:
 /// asking for `memory.limit` without saying where the cgroup goes is an
 /// error, not a silently unlimited container.
-fn cgroup_plan(linux: &oci_spec::runtime::Linux) -> Result<Option<CgroupPlan>> {
+fn cgroup_plan(linux: &oci_spec::runtime::Linux, dev: &DevPlan) -> Result<Option<CgroupPlan>> {
     let rules = linux.resources().as_ref().and_then(|r| r.devices().as_deref()).unwrap_or_default();
     let settings = match linux.resources() {
         Some(r) => cgroups::settings_for(r)?,
@@ -212,7 +227,7 @@ fn cgroup_plan(linux: &oci_spec::runtime::Linux) -> Result<Option<CgroupPlan>> {
     match linux.cgroups_path() {
         Some(p) => {
             let path = CgroupPath::parse(&p.to_string_lossy())?;
-            Ok(Some(CgroupPlan { path, settings, devices: DeviceFilter::build(rules, &[])? }))
+            Ok(Some(CgroupPlan { path, settings, devices: DeviceFilter::build(rules, &dev.mknod_rules())? }))
         }
         None if !rules.is_empty() => {
             Err(Error::invalid("linux.resources.devices needs a device filter: set linux.cgroupsPath"))
@@ -325,10 +340,6 @@ fn resource(t: PosixRlimitType) -> Resource {
     }
 }
 
-fn some_vec<T>(v: &Option<Vec<T>>) -> bool {
-    v.as_ref().is_some_and(|v| !v.is_empty())
-}
-
 /// Collects every field this build can't honour yet.
 fn reject_unsupported(spec: &Spec) -> Result<()> {
     let mut missing = Vec::new();
@@ -343,7 +354,6 @@ fn reject_unsupported(spec: &Spec) -> Result<()> {
     need(spec.solaris().is_some() || spec.windows().is_some() || spec.vm().is_some(), "non-Linux sections", "never");
 
     if let Some(l) = spec.linux() {
-        need(some_vec(l.devices()), "linux.devices", "Phase 2c");
         need(
             l.rootfs_propagation().as_deref().is_some_and(|p| !matches!(p, "" | "private" | "rprivate")),
             "linux.rootfsPropagation other than private",

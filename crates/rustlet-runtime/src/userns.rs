@@ -31,7 +31,7 @@
 //!   namespace, and `net.*` and IPC sysctls theirs (see `sysctl`);
 //! * **device nodes** can't be created at all (`mknod` needs `CAP_MKNOD` in
 //!   the initial user namespace), so `/dev` gets bind mounts of the host's
-//!   nodes (see `rootfs::populate_dev`);
+//!   nodes (see `crate::dev::populate`);
 //! * **every id the container uses must be mapped**: uid and gid 0 (init
 //!   becomes root of the namespace), the process's user and groups, the
 //!   `uid=`/`gid=` options of filesystems such as devpts.

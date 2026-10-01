@@ -17,7 +17,8 @@ use rustlet_itests::e2e::*;
 use rustlet_itests::*;
 use rustlet_runtime::cgroups::devices::{Access, DevType, DeviceFilter, MAX_RULES, Origin, Request, Rule, decide};
 use rustlet_runtime::oci_spec::runtime::{
-    LinuxDeviceCgroup, LinuxDeviceCgroupBuilder, LinuxDeviceType, LinuxResourcesBuilder, Spec,
+    LinuxDevice, LinuxDeviceBuilder, LinuxDeviceCgroup, LinuxDeviceCgroupBuilder, LinuxDeviceType,
+    LinuxResourcesBuilder, Spec,
 };
 use rustlet_sys::bpf;
 
@@ -532,4 +533,134 @@ fn dv_mknod_in_a_user_namespace_needs_no_filter() {
     let mut s = userns_sh("if mknod /dev/n c 1 3 2>/dev/null; then exit 1; fi; echo denied");
     give_mknod(&mut s);
     assert_eq!(run(&s).ok(), "denied\n");
+}
+
+// ── OCI nodes ───────────────────────────────────────────────────────────────
+
+fn device_node(path: &str, typ: LinuxDeviceType, major: i64, minor: i64) -> LinuxDevice {
+    LinuxDeviceBuilder::default().path(path).typ(typ).major(major).minor(minor).build().unwrap()
+}
+
+fn set_nodes(s: &mut Spec, nodes: Vec<LinuxDevice>) {
+    edit_linux(s, |l| {
+        l.set_devices(Some(nodes));
+    });
+}
+
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dv_spec_device_needs_a_rule() {
+    let (mut s, _dir) = device_probe_spec("$PROBE access:/dev/fuse:r access:/dev/fuse:w access:/dev/fuse:rw");
+    set_cgroup(&mut s, "dv-spec-fuse");
+    set_nodes(&mut s, vec![device_node("/dev/fuse", LinuxDeviceType::C, 10, 229)]);
+    assert_eq!(run(&s).ok(), "access:/dev/fuse:r EPERM\naccess:/dev/fuse:w EPERM\naccess:/dev/fuse:rw EPERM\n");
+    set_device_rules(&mut s, vec![device_rule(true, LinuxDeviceType::C, Some(10), Some(229), "rw")]);
+    assert_eq!(run(&s).ok(), "access:/dev/fuse:r ok\naccess:/dev/fuse:w ok\naccess:/dev/fuse:rw ok\n");
+}
+
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dv_nested_device_path() {
+    let mut s = sh("stat -c '%F %t:%T %a %u:%g' /dev/net/tun; stat -c '%a' /dev/net");
+    set_cgroup(&mut s, "dv-nested");
+    set_nodes(&mut s, vec![device_node("/dev/net/tun", LinuxDeviceType::U, 10, 200)]);
+    assert_eq!(run(&s).ok(), "character special file a:c8 666 0:0\n755\n");
+}
+
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dv_file_mode_and_owner() {
+    let mut s = sh("stat -c '%F %a %u:%g' /dev/fuse /dev/null /dev/events /dev/disk");
+    set_cgroup(&mut s, "dv-metadata");
+    let mut fuse = device_node("/dev/fuse", LinuxDeviceType::C, 10, 229);
+    fuse.set_file_mode(Some(0o2640));
+    fuse.set_uid(Some(12));
+    fuse.set_gid(Some(34));
+    let mut null = device_node("/dev/null", LinuxDeviceType::U, 1, 3);
+    null.set_file_mode(Some(0o600));
+    null.set_uid(Some(56));
+    null.set_gid(Some(78));
+    set_nodes(
+        &mut s,
+        vec![
+            fuse,
+            null,
+            device_node("/dev/events", LinuxDeviceType::P, 0, 0),
+            device_node("/dev/disk", LinuxDeviceType::B, 8, 0),
+        ],
+    );
+    assert_eq!(
+        run(&s).ok(),
+        "character special file 2640 12:34\ncharacter special file 600 56:78\nfifo 666 0:0\nblock special file 666 0:0\n"
+    );
+}
+
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dv_bad_device_paths_are_refused() {
+    let mut s = spec(&["true"]);
+    set_nodes(&mut s, vec![device_node("/dev/fuse", LinuxDeviceType::C, 10, 229)]);
+    let mut c = Container::new(&s);
+    c.create(&[]).refused("set linux.cgroupsPath");
+    c.assert_gone();
+    set_cgroup(&mut s, "dv-bad-paths");
+    for path in [
+        "dev/x",
+        "/dev",
+        "/dev/",
+        "/dev/../x",
+        "/dev/./x",
+        "/dev//x",
+        "/dev/x/",
+        "/mnt/x",
+        "/dev/console",
+        "/dev/ptmx",
+        "/dev/fd/x",
+        "/dev/pts/x",
+        "/dev/shm/x",
+    ] {
+        set_nodes(&mut s, vec![device_node(path, LinuxDeviceType::C, 10, 229)]);
+        let mut c = Container::new(&s);
+        c.create(&[]).refused("linux.devices[0]");
+        c.assert_gone();
+    }
+    for nodes in [
+        vec![device_node("/dev/null", LinuxDeviceType::C, 1, 5)],
+        vec![device_node("/dev/x", LinuxDeviceType::A, 0, 0)],
+        vec![device_node("/dev/x", LinuxDeviceType::C, -1, 0)],
+        vec![device_node("/dev/x", LinuxDeviceType::C, 4096, 0)],
+        vec![device_node("/dev/x", LinuxDeviceType::C, 1, 0x10_0000)],
+        vec![device_node("/dev/x", LinuxDeviceType::C, 1, 3), device_node("/dev/x", LinuxDeviceType::C, 1, 3)],
+        vec![device_node("/dev/x", LinuxDeviceType::C, 1, 3), device_node("/dev/x/y", LinuxDeviceType::C, 1, 3)],
+    ] {
+        set_nodes(&mut s, nodes);
+        let mut c = Container::new(&s);
+        c.create(&[]).refused("linux.devices[");
+        c.assert_gone();
+    }
+    // A mount below the node also conflicts, including if mounted first.
+    set_nodes(&mut s, vec![device_node("/dev/x", LinuxDeviceType::C, 1, 3)]);
+    add_mount(&mut s, "/dev/x/child", "tmpfs", "tmpfs", &[]);
+    let mut c = Container::new(&s);
+    c.create(&[]).refused("conflicts with a mount");
+    c.assert_gone();
+}
+
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dv_existing_spec_node_is_refused() {
+    // /dev is itself a new tmpfs. A nested spec node cannot replace its
+    // already-created parent directory, even if they share a device id.
+    let mut s = spec(&["true"]);
+    set_cgroup(&mut s, "dv-existing");
+    set_nodes(
+        &mut s,
+        vec![
+            device_node("/dev/parent/child", LinuxDeviceType::C, 1, 3),
+            device_node("/dev/parent", LinuxDeviceType::C, 1, 3),
+        ],
+    );
+    let mut c = Container::new(&s);
+    c.create(&[]).refused("parent of another device");
+    c.assert_gone();
 }
