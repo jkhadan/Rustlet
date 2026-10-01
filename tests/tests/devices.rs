@@ -664,3 +664,78 @@ fn dv_existing_spec_node_is_refused() {
     c.create(&[]).refused("parent of another device");
     c.assert_gone();
 }
+
+// ── privileged-shaped specs and host-device translation ─────────────────────
+
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dv_privileged_spec_runs() {
+    let script = "set -e; grep -E '^(CapEff|CapInh|CapAmb|NoNewPrivs|Seccomp):' /proc/self/status; \
+        stat -c '%F %t:%T' /dev/fuse; dd if=/dev/fuse of=/dev/null bs=1 count=0 2>/dev/null; \
+        awk '$5 == \"/sys\" || $5 == \"/sys/fs/cgroup\" { print $5, $6 }' /proc/self/mountinfo";
+    for userns in [false, true] {
+        let mut s = if userns { userns_sh(script) } else { sh(script) };
+        set_cgroup(&mut s, "dv-privileged");
+        rustlet_runtime::spec::privileged(&mut s).unwrap();
+        let bundle = TestBundle::new(&s);
+        let plan =
+            rustlet_runtime::plan::Plan::new(&bundle.id, &rustlet_runtime::Bundle::load(bundle.dir.path()).unwrap())
+                .unwrap();
+        let filter = plan.cgroup.unwrap().devices;
+        assert!(filter.compiled.is_empty());
+        assert_eq!(filter.initial, Access::ALL);
+        assert_eq!(filter.program.len(), 2);
+        let out = run(&s);
+        let stdout = out.ok();
+        assert_eq!(status_hex(stdout, "CapEff"), rustlet_sys::caps::CapSet::all(rustlet_sys::caps::last_cap()).0);
+        assert_eq!(status_hex(stdout, "CapInh"), 0);
+        assert_eq!(status_hex(stdout, "CapAmb"), 0);
+        assert_eq!(status_field(stdout, "Seccomp"), Some("0"));
+        assert_eq!(status_field(stdout, "NoNewPrivs"), Some("1"));
+        assert!(stdout.contains("character special file a:e5"), "{out:#?}");
+        for mount in ["/sys", "/sys/fs/cgroup"] {
+            let options = stdout.lines().find_map(|l| l.strip_prefix(&format!("{mount} "))).unwrap();
+            assert!(options.split(',').any(|o| o == "rw"), "{mount}: {options}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dv_host_device_helper_translates_node_and_rule() {
+    let (mut s, _dir) = device_probe_spec("$PROBE access:/dev/custom/fuse:rw");
+    set_cgroup(&mut s, "dv-host-device");
+    rustlet_runtime::spec::add_host_device(
+        &mut s,
+        std::path::Path::new("/dev/fuse"),
+        std::path::Path::new("/dev/custom/fuse"),
+        "rw",
+    )
+    .unwrap();
+    assert_eq!(run(&s).ok(), "access:/dev/custom/fuse:rw ok\n");
+    let nodes = rustlet_runtime::spec::host_devices().unwrap();
+    assert!(nodes.windows(2).all(|pair| pair[0].path() < pair[1].path()));
+    assert!(nodes.iter().any(|n| n.path() == std::path::Path::new("/dev/fuse")));
+    assert!(!nodes.iter().any(|n| n.path().starts_with("/dev/pts") || n.path().starts_with("/dev/shm")));
+    let before = s.clone();
+    assert!(
+        rustlet_runtime::spec::add_host_device(
+            &mut s,
+            std::path::Path::new("/dev/fuse"),
+            std::path::Path::new("/dev/x"),
+            ""
+        )
+        .is_err()
+    );
+    assert_eq!(s, before);
+    assert!(
+        rustlet_runtime::spec::add_host_device(
+            &mut s,
+            std::path::Path::new("/etc/hostname"),
+            std::path::Path::new("/dev/x"),
+            "r"
+        )
+        .is_err()
+    );
+    assert_eq!(s, before);
+}

@@ -93,6 +93,12 @@ enum Task {
         /// `cargo xtask rootfs --remap`.
         #[arg(long)]
         userns: bool,
+        /// All capabilities, no seccomp or masked paths, host devices, writable /sys and cgroupfs.
+        #[arg(long)]
+        privileged: bool,
+        /// Host device and access, e.g. /dev/fuse or /dev/fuse:rw (repeatable).
+        #[arg(long, value_name = "PATH[:rwm]")]
+        device: Vec<String>,
     },
     /// Compile a seccomp profile (Docker's default, or a bundle's) and show the BPF program.
     Seccomp {
@@ -132,7 +138,9 @@ fn main() -> anyhow::Result<()> {
         Task::Itest { args } => itest::run(&args),
         Task::DevStorage { size, dry_run } => devstorage::run(&size, dry_run),
         Task::CheckHost => checkhost::run(),
-        Task::Demo { memory, pids, cpus, userns } => demo::run(memory.as_deref(), pids, cpus, userns),
+        Task::Demo { memory, pids, cpus, userns, privileged, device } => {
+            demo::run(memory.as_deref(), pids, cpus, userns, privileged, &device)
+        }
         Task::Seccomp { bundle, caps, disasm, json } => seccomp::run(bundle.as_deref(), caps.as_deref(), disasm, json),
         Task::Devices { bundle, disasm } => devices::run(bundle.as_deref(), disasm),
         Task::ImageRun => bail!("`image-run` arrives in Phase 3 (images)"),

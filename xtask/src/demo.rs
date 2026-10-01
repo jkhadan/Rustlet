@@ -41,7 +41,14 @@ fn parse_bytes(s: &str) -> anyhow::Result<i64> {
     Ok(num.parse::<i64>().with_context(|| format!("bad size {s:?}"))? * mult)
 }
 
-pub(crate) fn run(memory: Option<&str>, pids: Option<i64>, cpus: Option<f64>, userns: bool) -> anyhow::Result<()> {
+pub(crate) fn run(
+    memory: Option<&str>,
+    pids: Option<i64>,
+    cpus: Option<f64>,
+    userns: bool,
+    privileged: bool,
+    devices: &[String],
+) -> anyhow::Result<()> {
     let (rootfs, hint) = if userns {
         (dev_dir().join("bundles/alpine-remap/rootfs"), "cargo xtask rootfs --remap")
     } else {
@@ -78,6 +85,13 @@ pub(crate) fn run(memory: Option<&str>, pids: Option<i64>, cpus: Option<f64>, us
     let linux = s.linux_mut().as_mut().unwrap();
     linux.set_cgroups_path(Some(format!("{scope}/demo").into()));
     linux.set_resources(Some(res.build()?));
+    if privileged {
+        spec::privileged(&mut s)?;
+    }
+    for device in devices {
+        let (path, access) = device.rsplit_once(':').unwrap_or((device, "rwm"));
+        spec::add_host_device(&mut s, Path::new(path), Path::new(path), access)?;
+    }
 
     let bundle = dev_dir().join("bundles/demo");
     std::fs::create_dir_all(&bundle)?;

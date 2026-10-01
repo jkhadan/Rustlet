@@ -62,6 +62,11 @@ pub(super) const EXIT: BpfInsn = BpfInsn::new(BPF_JMP | BPF_EXIT, 0, 0, 0, 0);
 /// The program for `rules` (already optimised), with `w6` starting at
 /// `initial`.
 pub(super) fn compile(initial: Access, rules: &[Rule]) -> Vec<BpfInsn> {
+    if initial == Access::ALL && rules.is_empty() {
+        // A privileged allow-all has no remaining decisions. No context
+        // loads or access-mask comparisons are needed, even for access 0.
+        return vec![alu32_k(BPF_MOV, 0, 1), EXIT];
+    }
     let mut p = vec![
         ldxw(R_TYPE, R_CTX, CTX_ACCESS_TYPE),
         alu32_x(BPF_MOV, R_ACCESS, R_TYPE),

@@ -147,7 +147,7 @@ fn a_privileged_spec_compiles_to_almost_nothing() {
     let f = DeviceFilter::build(&[allow_all], &nodes).unwrap();
     assert_eq!(f.rules.len(), 1 + default_rules().len() + 300);
     assert!(f.compiled.is_empty(), "{:?}", f.compiled);
-    assert_eq!(f.program.len(), 12);
+    assert_eq!(f.program.len(), 2);
     assert!(f.allows(&req(DevType::Block, 8, 0, Access::ALL)));
 }
 
