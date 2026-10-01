@@ -201,28 +201,7 @@ impl ContentStore {
     /// exclude each other as processes do. (`flock` would do as well; the
     /// fcntl form is the one `nix` offers for this workspace's Rust.)
     pub fn lock(&self) -> Result<StoreLock> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&self.lock)
-            .with_context(|| format!("open {}", self.lock.display()))?;
-        let whole_file = libc::flock {
-            l_type: libc::F_WRLCK as libc::c_short,
-            l_whence: libc::SEEK_SET as libc::c_short,
-            l_start: 0,
-            l_len: 0,
-            l_pid: 0,
-        };
-        loop {
-            match nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_OFD_SETLKW(&whole_file)) {
-                Ok(_) => return Ok(StoreLock(file)),
-                Err(rustlet_sys::Errno::EINTR) => continue,
-                Err(e) => return Err(e).with_context(|| format!("lock {}", self.lock.display())),
-            }
-        }
+        ofd_lock(&self.lock).map(StoreLock)
     }
 
     fn read_index(&self) -> Result<ImageIndex> {
@@ -305,6 +284,35 @@ impl ContentStore {
 /// The store's write lock; released on drop.
 #[derive(Debug)]
 pub struct StoreLock(#[allow(dead_code)] File);
+
+/// Opens (creating it if needed) and exclusively locks the whole file at
+/// `path`, waiting for the lock: an open-file-description lock
+/// (`F_OFD_SETLKW`), held until the returned file is closed. See
+/// [`ContentStore::lock`] for why OFD rather than a POSIX record lock.
+pub(crate) fn ofd_lock(path: &Path) -> Result<File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let whole_file = libc::flock {
+        l_type: libc::F_WRLCK as libc::c_short,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+    };
+    loop {
+        match nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_OFD_SETLKW(&whole_file)) {
+            Ok(_) => return Ok(file),
+            Err(rustlet_sys::Errno::EINTR) => continue,
+            Err(e) => return Err(e).with_context(|| format!("lock {}", path.display())),
+        }
+    }
+}
 
 fn ref_name(d: &Descriptor) -> Option<&str> {
     d.annotations().as_ref()?.get(REF_NAME).map(String::as_str)

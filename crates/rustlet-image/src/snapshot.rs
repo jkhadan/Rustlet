@@ -6,7 +6,8 @@
 //! │  ├─ fs/                    the layer's files: an overlay lower directory
 //! │  └─ snapshot.json          chain ID, diff ID, parent, blob, size, …
 //! ├─ 9b1e4c0d27fa…/            the next layer up (its parent is the one above)
-//! └─ .tmp-…/                   an unpack in progress
+//! ├─ .tmp-…/                   an unpack in progress
+//! └─ .locks/<chain ID>         taken while that layer is checked and unpacked
 //! ```
 //!
 //! A snapshot holds *one* layer's files: whiteouts and opaque markers in it
@@ -17,6 +18,13 @@
 //! Unpacking happens in `.tmp-<random>/` and is renamed into place only when
 //! the layer's blob digest and diff ID both check out, so a snapshot
 //! directory that exists is complete and correct.
+//!
+//! Unpacks of one chain ID take turns, across threads and processes (the
+//! daemon unpacks in child processes): each holds an exclusive lock on
+//! `.locks/<chain ID hex>` from its check for the snapshot until the
+//! snapshot is in place. Without it, an unpack that found a crash-damaged
+//! directory could move aside the good snapshot a concurrent unpack of the
+//! same layer had just put there.
 
 use std::os::fd::AsFd;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -145,8 +153,16 @@ impl Snapshotter {
     ) -> Result<Vec<Snapshot>> {
         let mut out = Vec::with_capacity(image.layers.len());
         for layer in &image.layers {
+            // Without the lock first: a snapshot that exists stays.
+            if let Ok(Some(s)) = self.get(&layer.chain_id) {
+                events(SnapshotEvent::Exists { layer });
+                out.push(s);
+                continue;
+            }
+            let _turn = self.lock_layer(&layer.chain_id)?;
             match self.get(&layer.chain_id) {
                 Ok(Some(s)) => {
+                    // Another unpack of the layer finished while we waited.
                     events(SnapshotEvent::Exists { layer });
                     out.push(s);
                     continue;
@@ -165,6 +181,17 @@ impl Snapshotter {
             out.push(snapshot);
         }
         Ok(out)
+    }
+
+    /// Waits for, and takes, the turn to check and unpack `chain_id`.
+    fn lock_layer(&self, chain_id: &Digest) -> Result<std::fs::File> {
+        let locks = self.dir.join(".locks");
+        match std::fs::DirBuilder::new().mode(0o700).create(&locks) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).with_context(|| format!("create {}", locks.display())),
+        }
+        crate::content::ofd_lock(&locks.join(chain_id.hex()))
     }
 
     /// Unpacks one layer into `.tmp-…/fs`, verifies it, and renames the
@@ -202,7 +229,8 @@ impl Snapshotter {
 
     /// Renames the finished `tmp` to `dest`, durably. If `dest` exists:
     /// another unpack of the layer finished first (a usable snapshot: ours
-    /// is dropped), or a crash left a directory without a usable
+    /// is dropped; only possible for an unpacker that doesn't take the
+    /// layer's lock), or a crash left a directory without a usable
     /// `snapshot.json` (moved aside and deleted, then ours takes its place).
     fn publish(&self, tmp: &Path, dest: &Path, chain_id: &Digest) -> Result<()> {
         static N: AtomicU64 = AtomicU64::new(0);
@@ -344,10 +372,40 @@ mod tests {
             let got = snapshots.ensure(store.content(), &image, &mut |_| {}).unwrap();
             assert_eq!(std::fs::read_to_string(got[0].fs().join("etc/hello")).unwrap(), "hi");
             assert!(!got[0].fs().join("stale").exists(), "the leftover was replaced, not merged");
-            let names: Vec<_> = std::fs::read_dir(snapshots.dir()).unwrap().map(|e| e.unwrap().file_name()).collect();
+            let names: Vec<_> = std::fs::read_dir(snapshots.dir())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .filter(|n| n != ".locks")
+                .collect();
             assert_eq!(names, [std::ffi::OsString::from(chain.hex())], "nothing left aside");
             std::fs::remove_dir_all(&dest).unwrap();
         }
+    }
+
+    #[test]
+    fn concurrent_unpacks_of_a_layer_take_turns() {
+        let (_dir, store, image) = store_with_image();
+        let unpacked = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    store
+                        .snapshots()
+                        .ensure(store.content(), &image, &mut |e| {
+                            if matches!(e, SnapshotEvent::Unpacked { .. }) {
+                                unpacked.fetch_add(1, Ordering::Relaxed);
+                            }
+                        })
+                        .unwrap()
+                });
+            }
+        });
+        // Exactly one did the work; the others waited and found it.
+        assert_eq!(unpacked.into_inner(), 1);
+        let mut names: Vec<_> =
+            std::fs::read_dir(store.snapshots().dir()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        names.sort();
+        assert_eq!(names, [std::ffi::OsString::from(".locks"), image.layers[0].chain_id.hex().into()]);
     }
 
     #[test]

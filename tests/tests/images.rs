@@ -39,6 +39,12 @@ fn names(dir: &Path) -> Vec<String> {
     v
 }
 
+/// What `snapshots/` holds apart from its `.locks` directory (the unpack
+/// locks, which stay).
+fn snapshot_entries(s: &TestStore) -> Vec<String> {
+    names(s.store.snapshots().dir()).into_iter().filter(|n| n != ".locks").collect()
+}
+
 /// Runs `options` on a mounted image and checks the host mount table.
 fn run_image(image: &Image, mounted: &Mounted, options: RunOptions) -> Output {
     let spec = runspec::build(image, &mounted.root(), &options).unwrap();
@@ -124,7 +130,7 @@ fn im_unpack_stays_inside_the_layer_as_root() {
     assert!(!Path::new("/tmp/rustlet-itest-dotdot").exists());
     assert!(!Path::new("/tmp/rustlet-itest-dangling").exists());
     // Failed unpacks leave nothing behind, not even their `.tmp-*`.
-    let left: Vec<_> = names(s.store.snapshots().dir()).into_iter().filter(|n| n.starts_with('.')).collect();
+    let left: Vec<_> = snapshot_entries(&s).into_iter().filter(|n| n.starts_with('.')).collect();
     assert!(left.is_empty(), "{left:?}");
 }
 
@@ -246,7 +252,7 @@ fn im_digest_mismatches_leave_no_snapshot() {
     let e = s.store.snapshots().ensure(content, &image, &mut |_| {}).unwrap_err();
     assert!(matches!(e, Error::DigestMismatch { .. } | Error::Io { .. }), "{e}");
 
-    assert!(names(s.store.snapshots().dir()).is_empty(), "{:?}", names(s.store.snapshots().dir()));
+    assert!(snapshot_entries(&s).is_empty(), "{:?}", snapshot_entries(&s));
 }
 
 #[test]
@@ -301,7 +307,7 @@ fn im_concurrent_unpacks_of_the_same_image_agree() {
     for r in &results {
         assert_eq!(r, &results[0]);
     }
-    assert_eq!(names(s.store.snapshots().dir()).len(), 3, "{:?}", names(s.store.snapshots().dir()));
+    assert_eq!(snapshot_entries(&s).len(), 3, "{:?}", snapshot_entries(&s));
 }
 
 #[test]

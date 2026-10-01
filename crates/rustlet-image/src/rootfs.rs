@@ -81,7 +81,12 @@ pub fn remap() -> UsernsPlan {
     UsernsPlan { uids: vec![map], gids: vec![map] }
 }
 
-/// A mounted container rootfs in `containers/<id>/`.
+/// A container's directory, `containers/<id>/`, and the overlay mounted on
+/// its `rootfs/` (while it is).
+///
+/// The directory outlives the mount: the daemon mounts the overlay when the
+/// container starts and unmounts it when it stops, and `upper/` (the
+/// container's changes) stays until the container is removed.
 #[derive(Debug)]
 pub struct ContainerRootfs {
     dir: PathBuf,
@@ -89,21 +94,11 @@ pub struct ContainerRootfs {
 }
 
 impl ContainerRootfs {
-    /// Creates `dir/{upper,work,rootfs}` and mounts the overlay of `layers`
-    /// (bottom first) with `upper` on top at `dir/rootfs`. With `idmap`, the
-    /// layers are idmapped with the container's mappings first, so files the
-    /// image owns as root appear as the container's root. `dir` must not
-    /// exist yet; on failure nothing of it is left.
+    /// [`create`](Self::create) and [`mount_layers`](Self::mount_layers) in
+    /// one: `dir` must not exist yet; on failure nothing of it is left.
     pub fn mount(dir: &Path, layers: &[Snapshot], idmap: Option<&UsernsPlan>) -> Result<ContainerRootfs> {
-        if layers.is_empty() {
-            return Err(Error::invalid("the image has no layers, so no filesystem to run"));
-        }
-        if layers.len() > MAX_LAYERS {
-            return Err(Error::unsupported(format!("{} layers; overlay stacks at most {MAX_LAYERS}", layers.len())));
-        }
-        let dir = canonical_new(dir)?;
-        std::fs::DirBuilder::new().mode(0o700).create(&dir).with_context(|| format!("create {}", dir.display()))?;
-        let mut rootfs = ContainerRootfs { dir, mounted: false };
+        check_layers(layers)?;
+        let mut rootfs = ContainerRootfs::create(dir)?;
         match rootfs.mount_layers(layers, idmap) {
             Ok(()) => Ok(rootfs),
             Err(e) => {
@@ -115,15 +110,63 @@ impl ContainerRootfs {
         }
     }
 
-    fn mount_layers(&mut self, layers: &[Snapshot], idmap: Option<&UsernsPlan>) -> Result<()> {
-        let upper = self.dir.join("upper");
+    /// Creates `dir` (which must not exist yet) with an empty `upper/`,
+    /// `work/` and `rootfs/`. Nothing is mounted.
+    pub fn create(dir: &Path) -> Result<ContainerRootfs> {
+        let dir = canonical_new(dir)?;
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).with_context(|| format!("create {}", dir.display()))?;
+        let rootfs = ContainerRootfs { dir, mounted: false };
+        for (path, mode) in [(rootfs.upper(), 0o755), (rootfs.dir.join("work"), 0o700), (rootfs.rootfs(), 0o755)] {
+            let made = std::fs::DirBuilder::new()
+                .mode(mode)
+                .create(&path)
+                .and_then(|()| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)));
+            if let Err(e) = made {
+                let _ = rustlet_sys::tree::safe_remove_tree(&rootfs.dir);
+                return Err(e).with_context(|| format!("create {}", path.display()));
+            }
+        }
+        Ok(rootfs)
+    }
+
+    /// An existing container directory, made by [`create`](Self::create),
+    /// mounted or not (a daemon that restarted finds it either way).
+    pub fn open(dir: &Path) -> Result<ContainerRootfs> {
+        let dir = dir.canonicalize().with_context(|| format!("open {}", dir.display()))?;
+        for sub in ["upper", "work", "rootfs"] {
+            let p = dir.join(sub);
+            if !std::fs::symlink_metadata(&p).with_context(|| format!("open {}", p.display()))?.is_dir() {
+                return Err(Error::invalid(format!("{} is not a directory", p.display())));
+            }
+        }
+        let mut rootfs = ContainerRootfs { dir, mounted: false };
+        rootfs.mounted = rootfs.is_mounted()?;
+        Ok(rootfs)
+    }
+
+    /// Is something mounted on `rootfs/`? (Its mount differs from the
+    /// directory's.)
+    pub fn is_mounted(&self) -> Result<bool> {
+        let id = |p: &Path| {
+            rustlet_sys::fs::statx(None, p, libc::AT_SYMLINK_NOFOLLOW)
+                .map(|s| s.mnt_id)
+                .with_context(|| format!("statx {}", p.display()))
+        };
+        Ok(id(&self.rootfs())? != id(&self.dir)?)
+    }
+
+    /// Mounts the overlay of `layers` (bottom first) with `upper/` on top at
+    /// `rootfs/`. With `idmap`, the layers are idmapped with the container's
+    /// mappings first, so files the image owns as root appear as the
+    /// container's root, and `upper/` is given to the mapped root.
+    pub fn mount_layers(&mut self, layers: &[Snapshot], idmap: Option<&UsernsPlan>) -> Result<()> {
+        check_layers(layers)?;
+        if self.mounted || self.is_mounted()? {
+            return Err(Error::invalid(format!("{} is mounted already", self.rootfs().display())));
+        }
+        let upper = self.upper();
         let work = self.dir.join("work");
         let target = self.rootfs();
-        for (path, mode) in [(&upper, 0o755), (&work, 0o700), (&target, 0o755)] {
-            std::fs::DirBuilder::new().mode(mode).create(path).with_context(|| format!("create {}", path.display()))?;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-                .with_context(|| format!("chmod {}", path.display()))?;
-        }
         let staged = match idmap {
             None => None,
             Some(maps) => {
@@ -157,6 +200,11 @@ impl ContainerRootfs {
         let ns = holder.open_ns().context("open the idmap's user namespace")?;
         drop(holder);
         let dir = self.dir.join("lower");
+        if dir.symlink_metadata().is_ok() {
+            // Left by a crash between staging and detaching.
+            rustlet_sys::tree::unmount_under(&dir).with_context(|| format!("unmount under {}", dir.display()))?;
+            rustlet_sys::tree::safe_remove_tree(&dir).with_context(|| format!("remove {}", dir.display()))?;
+        }
         std::fs::DirBuilder::new().mode(0o700).create(&dir).with_context(|| format!("create {}", dir.display()))?;
         let mut staged = Staged { dir, paths: Vec::new() };
         for (i, layer) in layers.iter().enumerate() {
@@ -222,6 +270,16 @@ impl ContainerRootfs {
         self.mounted = false;
         rustlet_sys::tree::safe_remove_tree(&self.dir).with_context(|| format!("remove {}", self.dir.display()))
     }
+}
+
+fn check_layers(layers: &[Snapshot]) -> Result<()> {
+    if layers.is_empty() {
+        return Err(Error::invalid("the image has no layers, so no filesystem to run"));
+    }
+    if layers.len() > MAX_LAYERS {
+        return Err(Error::unsupported(format!("{} layers; overlay stacks at most {MAX_LAYERS}", layers.len())));
+    }
+    Ok(())
 }
 
 /// The idmapped layers, attached under `lower/`; detached and removed on drop.

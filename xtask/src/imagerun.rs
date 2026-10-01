@@ -118,11 +118,11 @@ pub(crate) fn run_as_root(args: &ImageRunArgs) -> anyhow::Result<()> {
     let store = Store::open(&args.store).with_context(|| format!("open the image store {}", args.store.display()))?;
     let image = if args.local_alpine { local_alpine(&store, args)? } else { pull(&store, args)? };
     println!(
-        "image      {} = {} ({}, {} layers, {})",
+        "image      {} = {} ({}, {}, {})",
         image.display_name(),
         image.manifest_digest,
         image.config.platform(),
-        image.layers.len(),
+        layers(image.layers.len()),
         size(image.compressed_size())
     );
     image.config.check_runnable()?;
@@ -134,9 +134,9 @@ pub(crate) fn run_as_root(args: &ImageRunArgs) -> anyhow::Result<()> {
     let maps = remap();
     let mut rootfs = ContainerRootfs::mount(&dir, &snapshots, args.userns.then_some(&maps))?;
     println!(
-        "rootfs     {} (overlay of {} layers{})",
+        "rootfs     {} (overlay of {}{})",
         rootfs.rootfs().display(),
-        snapshots.len(),
+        layers(snapshots.len()),
         if args.userns { ", idmapped" } else { "" }
     );
 
@@ -257,7 +257,7 @@ fn print_progress(p: &Progress, json: bool, tty: bool) {
     match p {
         Progress::Resolving { reference } => println!("resolve    {reference}"),
         Progress::Resolved { manifest, repo_digest, platform, layers, size: total, .. } => {
-            println!("manifest   {manifest} for {platform}, {layers} layers, {}", size(*total));
+            println!("manifest   {manifest} for {platform}, {}, {}", self::layers(*layers), size(*total));
             if repo_digest != manifest {
                 println!("index      {repo_digest}");
             }
@@ -280,11 +280,20 @@ fn print_progress(p: &Progress, json: bool, tty: bool) {
     }
 }
 
+/// Layers are named by their blob digest, as in the pull's lines; the
+/// snapshot a layer is unpacked into by its chain ID.
 fn print_snapshot(e: SnapshotEvent<'_>) {
     match e {
-        SnapshotEvent::Exists { layer } => println!("  layer  {} already unpacked", short(&layer.chain_id)),
+        SnapshotEvent::Exists { layer } => {
+            println!("  layer  {} already unpacked (snapshot {})", short(&layer.blob), short(&layer.chain_id))
+        }
         SnapshotEvent::Unpacking { layer } => {
-            print!("  layer  {} unpacking {} … ", short(&layer.blob), size(layer.size));
+            print!(
+                "  layer  {} unpacking {} into snapshot {} … ",
+                short(&layer.blob),
+                size(layer.size),
+                short(&layer.chain_id)
+            );
             let _ = std::io::stdout().flush();
         }
         SnapshotEvent::Unpacked { report, .. } => {
@@ -306,6 +315,11 @@ fn print_snapshot(e: SnapshotEvent<'_>) {
 
 fn short(d: &Digest) -> &str {
     d.short()
+}
+
+/// "1 layer", "3 layers".
+fn layers(n: usize) -> String {
+    if n == 1 { "1 layer".into() } else { format!("{n} layers") }
 }
 
 /// `3.4 MiB`-style sizes.
@@ -347,6 +361,7 @@ mod tests {
     fn sizes_and_ids() {
         assert_eq!(size(512), "512 B");
         assert_eq!(size(3 << 20), "3.0 MiB");
+        assert_eq!((layers(1).as_str(), layers(3).as_str()), ("1 layer", "3 layers"));
         let (a, b) = (container_id(), container_id());
         assert_eq!(a.len(), 64);
         assert_ne!(a, b);
