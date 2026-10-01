@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "Development tasks: `cargo xtask <rootfs|itest|dev-storage|check-host>`."
+description = "Development tasks: `cargo xtask <rootfs|itest|demo|image-run|…>`."
 version.workspace = true
 edition.workspace = true
 publish = false
@@ -10,6 +10,11 @@ workspace = true
 
 [dependencies]
 rustlet-runtime.workspace = true
+rustlet-image.workspace = true
+rustlet-sys.workspace = true
+libc.workspace = true
+nix.workspace = true
+tokio.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 flate2.workspace = true

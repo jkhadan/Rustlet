@@ -10,7 +10,8 @@
 //! | `demo`        | interactive Alpine shell with cgroup limits (`--memory 64M --pids 64`) |
 //! | `seccomp`     | compile a seccomp profile to BPF: summary, `--disasm`, `--json` |
 //! | `devices`     | build a device filter (defaults, or a bundle's) and show its eBPF program |
-//! | `image-run`   | Phase 3                                                        |
+//! | `image-run`   | pull an image and run it: registry → snapshots → overlay → rustlet-runc (`--userns`) |
+//! | `images`      | list the image store, inspect an image, `ls` inside snapshots and container layers |
 //! | `gen-ts`      | Phase 6                                                        |
 //!
 //! Nothing here runs `sudo cargo`: builds always run as your user, and only
@@ -21,6 +22,8 @@ mod checkhost;
 mod demo;
 mod devices;
 mod devstorage;
+mod imagerun;
+mod images;
 mod itest;
 mod rootfs;
 mod seccomp;
@@ -125,8 +128,16 @@ enum Task {
         #[arg(long)]
         disasm: bool,
     },
-    /// Pull an image and run it with rustlet-runc (Phase 3).
-    ImageRun,
+    /// Pull an image (or reuse the store's) and run it with rustlet-runc, in a delegated scope.
+    ImageRun(imagerun::ImageRunArgs),
+    /// The root half of `image-run`, which runs it through sudo.
+    #[command(hide = true)]
+    ImageRunRoot(imagerun::ImageRunArgs),
+    /// Look inside the image store: list names, inspect an image, ls a snapshot or container layer.
+    Images(images::ImagesArgs),
+    /// The root half of `images`.
+    #[command(hide = true)]
+    ImagesRoot(images::ImagesArgs),
     /// Generate TypeScript types for the desktop app (Phase 6).
     GenTs,
 }
@@ -143,7 +154,10 @@ fn main() -> anyhow::Result<()> {
         }
         Task::Seccomp { bundle, caps, disasm, json } => seccomp::run(bundle.as_deref(), caps.as_deref(), disasm, json),
         Task::Devices { bundle, disasm } => devices::run(bundle.as_deref(), disasm),
-        Task::ImageRun => bail!("`image-run` arrives in Phase 3 (images)"),
+        Task::ImageRun(args) => imagerun::run(&args),
+        Task::ImageRunRoot(args) => imagerun::run_as_root(&args),
+        Task::Images(args) => images::run(&args),
+        Task::ImagesRoot(args) => images::run_as_root(&args),
         Task::GenTs => bail!("`gen-ts` arrives in Phase 6 (desktop app)"),
     }
 }

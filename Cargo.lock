@@ -2832,10 +2832,15 @@ dependencies = [
  "clap",
  "flate2",
  "hex",
+ "libc",
+ "nix",
+ "rustlet-image",
  "rustlet-runtime",
+ "rustlet-sys",
  "serde_json",
  "sha2",
  "tar",
+ "tokio",
 ]
 
 [[package]]

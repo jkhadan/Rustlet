@@ -24,7 +24,7 @@ use std::process::Command;
 
 use anyhow::{Context, bail};
 use rustlet_runtime::oci_spec::runtime::{
-    LinuxCpuBuilder, LinuxMemoryBuilder, LinuxPidsBuilder, LinuxResourcesBuilder,
+    LinuxCpuBuilder, LinuxMemoryBuilder, LinuxPidsBuilder, LinuxResources, LinuxResourcesBuilder,
 };
 use rustlet_runtime::spec;
 
@@ -68,6 +68,34 @@ pub(crate) fn run(
     if userns {
         spec::with_user_namespace(&mut s, spec::REMAP_HOST_ID, spec::REMAP_SIZE);
     }
+    let linux = s.linux_mut().as_mut().unwrap();
+    linux.set_cgroups_path(Some(format!("{scope}/demo").into()));
+    linux.set_resources(Some(resources(memory, pids, cpus)?));
+    if privileged {
+        spec::privileged(&mut s)?;
+    }
+    for device in devices {
+        let (path, access) = device.rsplit_once(':').unwrap_or((device, "rwm"));
+        spec::add_host_device(&mut s, Path::new(path), Path::new(path), access)?;
+    }
+
+    let bundle = dev_dir().join("bundles/demo");
+    std::fs::create_dir_all(&bundle)?;
+    std::fs::write(bundle.join("config.json"), spec::to_pretty_json(&s))?;
+
+    let script = scope_script(&scope, Path::new(&format!("/run/rustlet/demo-{}", std::process::id())), &bundle, "demo");
+    println!("container cgroup: /sys/fs/cgroup{scope}/demo   (try: cat /sys/fs/cgroup/memory.max inside)");
+    let status = Command::new("sudo")
+        .args(["/usr/bin/systemd-run", "--scope", "--quiet", "--collect"])
+        .arg(format!("--unit={unit}"))
+        .args(["-p", "Delegate=yes", "--", "/bin/sh", "-c", &script])
+        .status()
+        .context("run sudo systemd-run")?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// `--memory`, `--pids` and `--cpus` as OCI resources.
+pub(crate) fn resources(memory: Option<&str>, pids: Option<i64>, cpus: Option<f64>) -> anyhow::Result<LinuxResources> {
     let mut res = LinuxResourcesBuilder::default();
     if let Some(m) = memory {
         let bytes = parse_bytes(m)?;
@@ -82,37 +110,21 @@ pub(crate) fn run(
         let period = 100_000u64;
         res = res.cpu(LinuxCpuBuilder::default().quota((c * period as f64) as i64).period(period).build()?);
     }
-    let linux = s.linux_mut().as_mut().unwrap();
-    linux.set_cgroups_path(Some(format!("{scope}/demo").into()));
-    linux.set_resources(Some(res.build()?));
-    if privileged {
-        spec::privileged(&mut s)?;
-    }
-    for device in devices {
-        let (path, access) = device.rsplit_once(':').unwrap_or((device, "rwm"));
-        spec::add_host_device(&mut s, Path::new(path), Path::new(path), access)?;
-    }
+    Ok(res.build()?)
+}
 
-    let bundle = dev_dir().join("bundles/demo");
-    std::fs::create_dir_all(&bundle)?;
-    std::fs::write(bundle.join("config.json"), spec::to_pretty_json(&s))?;
-
+/// The shell script `systemd-run --scope` runs: move into a `runtime` leaf
+/// of the scope (the "no internal processes" rule), then become
+/// `rustlet-runc run`.
+pub(crate) fn scope_script(scope: &str, state_root: &Path, bundle: &Path, id: &str) -> String {
     let runc = workspace().join("target/debug/rustlet-runc");
-    let script = format!(
+    format!(
         "set -e; cg=/sys/fs/cgroup{scope}; mkdir \"$cg/runtime\"; echo $$ > \"$cg/runtime/cgroup.procs\"; \
-         exec {} --root /run/rustlet/demo-{} run --bundle {} demo",
+         exec {} --root {} run --bundle {} {id}",
         shell_quote(&runc),
-        std::process::id(),
-        shell_quote(&bundle)
-    );
-    println!("container cgroup: /sys/fs/cgroup{scope}/demo   (try: cat /sys/fs/cgroup/memory.max inside)");
-    let status = Command::new("sudo")
-        .args(["/usr/bin/systemd-run", "--scope", "--quiet", "--collect"])
-        .arg(format!("--unit={unit}"))
-        .args(["-p", "Delegate=yes", "--", "/bin/sh", "-c", &script])
-        .status()
-        .context("run sudo systemd-run")?;
-    std::process::exit(status.code().unwrap_or(1));
+        shell_quote(state_root),
+        shell_quote(bundle)
+    )
 }
 
 fn shell_quote(p: &Path) -> String {
