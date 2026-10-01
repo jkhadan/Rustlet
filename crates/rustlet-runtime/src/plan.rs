@@ -272,6 +272,16 @@ pub(crate) fn process_plan(p: &Process) -> Result<ProcessPlan> {
         return Err(Error::invalid(format!("process.cwd {} must be absolute", p.cwd().display())));
     }
     let user = p.user();
+    // (uid_t)-1 and (gid_t)-1 mean "leave this id unchanged" to setresuid,
+    // setresgid and setgroups' neighbours: a process told to run as one of
+    // them would quietly keep running as root.
+    let unchanged = u32::MAX;
+    if user.uid() == unchanged || user.gid() == unchanged || user.additional_gids().iter().flatten().any(|&g| g == unchanged)
+    {
+        return Err(Error::invalid(format!(
+            "process.user: {unchanged} is (uid_t)-1, which the kernel reads as \"don't change the id\""
+        )));
+    }
     let rlimits = p
         .rlimits()
         .iter()
@@ -523,6 +533,24 @@ mod tests {
             ns.into_iter().filter(|n| n.typ() != oci_spec::runtime::LinuxNamespaceType::Pid).collect(),
         ));
         refused(spec, "new `pid` namespace");
+    }
+
+    #[test]
+    fn minus_one_is_not_an_id() {
+        for (uid, gid, extra) in [(u32::MAX, 0, vec![]), (0, u32::MAX, vec![]), (1000, 1000, vec![5, u32::MAX])] {
+            let mut p = default_spec().process().clone().unwrap();
+            let mut user = p.user().clone();
+            user.set_uid(uid);
+            user.set_gid(gid);
+            user.set_additional_gids(Some(extra));
+            p.set_user(user);
+            assert!(process_plan(&p).unwrap_err().to_string().contains("(uid_t)-1"), "{uid}:{gid}");
+        }
+        let mut p = default_spec().process().clone().unwrap();
+        let mut user = p.user().clone();
+        user.set_uid(u32::MAX - 1);
+        p.set_user(user);
+        process_plan(&p).unwrap();
     }
 
     #[test]
