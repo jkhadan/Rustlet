@@ -580,6 +580,22 @@ rustlet-runc: error: invalid config.json: process.user.uid 65536 is not mapped i
 does anything, as `create` does. The kernel would refuse the `setresuid`
 with a bare `EINVAL`.
 
+**Stdio that can be reopened** (found in Phase 3, with nginx). Without a
+terminal, a foreground container or `exec`'d process used to inherit
+`rustlet-runc`'s own stdin, stdout and stderr. In a user namespace those
+fds work, but they can't be *reopened*: `/dev/stderr` is a symlink to
+`/proc/self/fd/2`, and opening it opens the pipe behind fd 2 afresh, with
+a permission check against the pipe's owner. A pipe made by our caller
+belongs to host root, whom the namespace doesn't map, so `sh -c 'echo x
+>/dev/stderr'` got `EACCES`, and nginx, whose `error.log` is a symlink to
+`/dev/stderr`, refused to start. `run` and `exec` now give such a process
+three pipes of its own, chowned to its mapped user, and relay them to and
+from their own stdio
+([`stdio.rs`](../../crates/rustlet-runtime/src/stdio.rs)), as runc's
+`setupProcessPipes` does. `us_stdio_can_be_reopened`,
+`us_exec_stdio_can_be_reopened` and `us_unread_input_does_not_stall_the_relay`
+cover it.
+
 ## 9. Refused at `create`, and what's different
 
 Each of these fails before anything exists, with a reason, and leaves
