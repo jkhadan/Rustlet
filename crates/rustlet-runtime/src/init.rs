@@ -30,6 +30,7 @@ use crate::error::{Context, Error, Result};
 use crate::plan::Plan;
 use crate::proc_handle::ProcHandle;
 use crate::rootfs::HostTrees;
+use crate::stdio::ContainerStdio;
 use crate::sync::{SyncMsg, SyncSocket};
 use crate::{console, namespaces, paths, process as proc_setup, rootfs, sysctl, userns};
 
@@ -49,6 +50,8 @@ pub(crate) struct InitContext<'a> {
     pub exec_fifo: &'a OwnedFd,
     /// Connected console socket, when `process.terminal` is set.
     pub console: Option<OwnedFd>,
+    /// Stdio pipes to install as fds 0-2 (see `stdio`).
+    pub stdio: Option<ContainerStdio>,
     /// Foreground `run`: tie the container's life to `rustlet-runc`.
     pub foreground: bool,
     /// `--preserve-fds N`: fds 3..3+N go to the program.
@@ -74,10 +77,16 @@ fn try_init(ctx: InitContext<'_>) -> Result<Infallible> {
         sync,
         exec_fifo,
         mut console,
+        stdio,
         foreground,
         preserve_fds,
         no_new_keyring,
     } = ctx;
+    // ── stdio ─────────────────────────────────────────────────────────────
+    // First, so that anything said from here on goes through the pipes.
+    if let Some(stdio) = stdio {
+        stdio.install()?;
+    }
     // ── signals ───────────────────────────────────────────────────────────
     // The parent blocked the signals it forwards *before* clone3 (so none
     // can slip through between clone3 and its signalfd). A blocked mask

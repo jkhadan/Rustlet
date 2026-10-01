@@ -78,6 +78,7 @@ use crate::plan::{self, ProcessPlan};
 use crate::proc_handle::ProcHandle;
 use crate::seccomp::{self, Filter};
 use crate::state::{StateDir, Status};
+use crate::stdio::{self, ContainerStdio};
 use crate::sync::{self, SyncMsg, SyncSocket};
 use crate::{namespaces, process as proc_setup, run, userns};
 
@@ -168,12 +169,14 @@ pub fn exec(opts: &ExecOptions) -> Result<i32> {
     let process = exec_process(&spec, &opts.process, opts.tty)?;
     let plan = plan::process_plan(&process)?;
     let mut new_user = false;
+    let mut userns = None;
     if let Some(linux) = spec.linux() {
         // With a user namespace, the process's ids must exist in it.
         let ns = namespaces::plan(linux.namespaces().as_deref().unwrap_or_default())?;
         new_user = ns.new_user();
         if let Some(maps) = userns::plan(linux, &ns)? {
             maps.check_process(&plan)?;
+            userns = Some(maps);
         }
     }
     plan::check_mknod(&plan.caps, state.rustlet.device_filter.is_some(), new_user).map_err(|e| {
@@ -202,6 +205,19 @@ pub fn exec(opts: &ExecOptions) -> Result<i32> {
         }
     };
     let (parent_sock, child_sock) = sync::pair()?;
+    // A foreground process in the container's user namespace, without a
+    // terminal, gets stdio pipes it may reopen (see `stdio`).
+    let (child_stdio, pipe_relay) = match (&userns, !opts.detach && !plan.terminal) {
+        (Some(maps), true) => {
+            let (uid, gid) = maps
+                .uid_to_host(plan.uid)
+                .zip(maps.gid_to_host(plan.gid))
+                .ok_or_else(|| Error::invalid("the process's uid and gid must be mapped in its user namespace"))?;
+            let (child, relay) = stdio::pipes(uid, gid)?;
+            (Some(child), Some(relay))
+        }
+        _ => (None, None),
+    };
 
     if !parent_ns.is_empty() {
         // Only our future children are affected (see the module docs).
@@ -222,6 +238,7 @@ pub fn exec(opts: &ExecOptions) -> Result<i32> {
             drop(cgroup_fd);
             drop(parent_sock);
             drop(console_parent);
+            drop(pipe_relay);
             drop(sfd);
             // A POSIX record lock belongs to the parent process: closing our
             // copy of the fd doesn't release it.
@@ -233,6 +250,7 @@ pub fn exec(opts: &ExecOptions) -> Result<i32> {
                 init: &init,
                 namespaces: child_ns,
                 console: console_child,
+                stdio: child_stdio,
                 foreground: !opts.detach,
                 preserve_fds: opts.preserve_fds,
                 no_new_keyring: state.rustlet.no_new_keyring,
@@ -250,6 +268,7 @@ pub fn exec(opts: &ExecOptions) -> Result<i32> {
         Forked::Parent { pid, pidfd } => {
             drop(child_sock);
             drop(console_child);
+            drop(child_stdio);
             drop(cgroup_fd);
             // The process is in the cgroup now (a cgroup with a process in
             // it can't be removed): the container may be changed again.
@@ -269,8 +288,15 @@ pub fn exec(opts: &ExecOptions) -> Result<i32> {
                 Some(sock) => Some(Relay::new(console::receive_master(sock.as_fd())?)?),
                 None => None,
             };
-            let status = run::supervise(&pidfd, &sfd, relay.as_mut(), plan.terminal);
+            let mut pipes = pipe_relay;
+            let io = match (relay.as_mut(), pipes.as_mut()) {
+                (Some(r), _) => Some(run::Io::Pty(r)),
+                (None, Some(p)) => Some(run::Io::Pipes(p)),
+                (None, None) => None,
+            };
+            let status = run::supervise(&pidfd, &sfd, io, plan.terminal);
             drop(relay);
+            drop(pipes);
             guard.0 = None;
             status
         }
@@ -478,6 +504,8 @@ struct Child<'a> {
     init: &'a OwnedFd,
     namespaces: CloneFlags,
     console: Option<OwnedFd>,
+    /// Stdio pipes to install as fds 0-2 (see `stdio`).
+    stdio: Option<ContainerStdio>,
     foreground: bool,
     preserve_fds: u32,
     no_new_keyring: bool,
@@ -494,6 +522,10 @@ impl Child<'_> {
 
     fn try_run(mut self) -> Result<Infallible> {
         let p = self.plan;
+        // First, so that anything said from here on goes through the pipes.
+        if let Some(stdio) = self.stdio.take() {
+            stdio.install()?;
+        }
         // The same clean slate init starts from (see init.rs).
         sigprocmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None).context("clear signal mask")?;
         rustlet_sys::signal::reset_all_to_default().context("reset signal dispositions")?;

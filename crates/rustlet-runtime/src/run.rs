@@ -22,7 +22,7 @@
 //! SIGKILL/SIGSTOP from outside get through): `sleep 100` as init shrugs off
 //! SIGTERM. That is kernel behaviour, not a forwarding bug.
 
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::Signal;
@@ -34,6 +34,7 @@ use crate::cgroups::Cgroup;
 use crate::console::{self, Relay};
 use crate::create::{self, CreateOptions, Spawned};
 use crate::error::{Context, Result};
+use crate::stdio::PipeRelay;
 
 /// Options for [`run`].
 #[derive(Debug, Clone)]
@@ -68,16 +69,61 @@ pub fn run(opts: &RunOptions) -> Result<i32> {
         return Ok(0);
     }
 
-    let status = supervise(&c.pidfd, &c.sfd, relay.as_mut(), c.terminal)?;
+    let mut pipes = c.pipes.take();
+    let io = match (relay.as_mut(), pipes.as_mut()) {
+        (Some(r), _) => Some(Io::Pty(r)),
+        (None, Some(p)) => Some(Io::Pipes(p)),
+        (None, None) => None,
+    };
+    let status = supervise(&c.pidfd, &c.sfd, io, c.terminal)?;
     // Restore the terminal before anything else is printed.
     drop(relay);
+    drop(pipes);
     teardown(&mut c)?;
     Ok(status)
 }
 
-/// Forwards signals, pumps the terminal, and waits for the process behind
-/// `pidfd` (init, or an `exec`'d process) to exit.
-pub(crate) fn supervise(pidfd: &OwnedFd, sfd: &SignalFd, mut relay: Option<&mut Relay>, own_tty: bool) -> Result<i32> {
+/// What [`supervise`] moves besides signals: the terminal relay or, for a
+/// process in a user namespace without a terminal, the stdio pipe relay
+/// (see `stdio`). Both take the same protocol.
+pub(crate) enum Io<'a> {
+    Pty(&'a mut Relay),
+    Pipes(&'a mut PipeRelay),
+}
+
+impl Io<'_> {
+    fn fds(&self) -> Vec<BorrowedFd<'_>> {
+        match self {
+            Io::Pty(r) => r.fds(),
+            Io::Pipes(p) => p.fds(),
+        }
+    }
+
+    fn poll_timeout(&self) -> PollTimeout {
+        match self {
+            Io::Pty(r) => r.poll_timeout(),
+            Io::Pipes(p) => p.poll_timeout(),
+        }
+    }
+
+    fn pump(&mut self, revents: &[PollFlags]) -> Result<bool> {
+        match self {
+            Io::Pty(r) => r.pump(revents),
+            Io::Pipes(p) => p.pump(revents),
+        }
+    }
+
+    fn drain(&mut self) -> Result<()> {
+        match self {
+            Io::Pty(r) => r.drain(),
+            Io::Pipes(p) => p.drain(),
+        }
+    }
+}
+
+/// Forwards signals, pumps the terminal or stdio pipes, and waits for the
+/// process behind `pidfd` (init, or an `exec`'d process) to exit.
+pub(crate) fn supervise(pidfd: &OwnedFd, sfd: &SignalFd, mut relay: Option<Io<'_>>, own_tty: bool) -> Result<i32> {
     let mut relay_open = relay.is_some();
     loop {
         let relay_fds: Vec<_> = match (&relay, relay_open) {
@@ -104,7 +150,7 @@ pub(crate) fn supervise(pidfd: &OwnedFd, sfd: &SignalFd, mut relay: Option<&mut 
             while let Some(info) = sfd.read_signal().context("read signalfd")? {
                 let Ok(sig) = Signal::try_from(info.ssi_signo as i32) else { continue };
                 match (&relay, sig) {
-                    (Some(r), Signal::SIGWINCH) => r.resize()?,
+                    (Some(Io::Pty(r)), Signal::SIGWINCH) => r.resize()?,
                     _ => forward(pidfd, sig, info.ssi_code, own_tty),
                 }
             }

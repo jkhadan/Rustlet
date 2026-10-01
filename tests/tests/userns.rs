@@ -534,3 +534,50 @@ fn us_mount_flags_hold_in_a_user_namespace() {
         assert!(mnt.iter().any(|o| o == flag), "/mnt is not {flag}: {mnt:?}");
     }
 }
+
+/// A foreground container in a user namespace without a terminal gets
+/// stdio pipes of its own, owned by its (mapped) user: `/dev/stdout` and
+/// `/dev/stderr` reopen fd 1 and 2 afresh, and the caller's pipes belong to
+/// host root, whom the namespace doesn't map (`EACCES`, as nginx's
+/// `error.log -> /dev/stderr` found). Input still arrives, and ends.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn us_stdio_can_be_reopened() {
+    let script = "echo out >/dev/stdout; echo err >/dev/stderr; cat /dev/stdin; stat -c %u:%g /proc/self/fd/1";
+    let bundle = TestBundle::new(&userns_sh(script));
+    let out = exec_input(bundle.command(), Some(b"input\n"), TIMEOUT);
+    assert_eq!(out.ok(), "out\ninput\n0:0\n", "{out:#?}");
+    assert_eq!(out.stderr, "err\n", "{out:#?}");
+
+    // A non-root process may reopen them too: they are its user's.
+    let mut s = userns_sh("echo hi >/dev/stdout; echo there >/dev/stderr; id -u");
+    set_user(&mut s, 1000, 1000, &[]);
+    let out = exec_input(TestBundle::new(&s).command(), None, TIMEOUT);
+    assert_eq!(out.ok(), "hi\n1000\n", "{out:#?}");
+    assert_eq!(out.stderr, "there\n");
+}
+
+/// The relay never waits on the container: input it doesn't read can't
+/// stop its output (or its exit) from getting through.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn us_unread_input_does_not_stall_the_relay() {
+    let bundle =
+        TestBundle::new(&userns_sh("i=0; while [ $i -lt 2000 ]; do echo line-$i; i=$((i+1)); done; echo done"));
+    let input = vec![b'x'; 4 << 20];
+    let out = exec_input(bundle.command(), Some(&input), TIMEOUT);
+    let lines: Vec<&str> = out.ok().lines().collect();
+    assert_eq!((lines.len(), lines[1999], lines[2000]), (2001, "line-1999", "done"));
+}
+
+/// `exec` gets the same pipes.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn us_exec_stdio_can_be_reopened() {
+    let c = Container::started(&userns_spec(&["sleep", "3600"]));
+    let out = c.exec_in(&[], &["sh", "-c", "echo out >/dev/stdout; echo err >/dev/stderr"]);
+    assert_eq!(out.ok(), "out\n", "{out:#?}");
+    assert_eq!(out.stderr, "err\n");
+    let out = c.exec_in(&["-u", "1000:1000"], &["sh", "-c", "echo out >/dev/stdout; id -u"]);
+    assert_eq!(out.ok(), "out\n1000\n", "{out:#?}");
+}

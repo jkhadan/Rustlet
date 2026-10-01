@@ -69,6 +69,7 @@ pub mod run;
 pub mod seccomp;
 pub mod spec;
 pub mod state;
+mod stdio;
 mod sync;
 pub mod sysctl;
 pub mod userns;

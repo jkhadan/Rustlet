@@ -47,6 +47,7 @@ use crate::init::{self, InitContext};
 use crate::plan::Plan;
 use crate::rootfs::HostTrees;
 use crate::state::{Lock, Private, State, StateDir, Status, now_rfc3339};
+use crate::stdio::{self, PipeRelay};
 use crate::sync::{self, SyncMsg, SyncSocket};
 use crate::userns::{DirectIdMapper, IdMapper};
 use crate::{console, namespaces};
@@ -93,6 +94,9 @@ pub(crate) struct Spawned {
     /// Our end of the internal console socketpair (foreground run with a
     /// terminal and no `--console-socket`): the PTY master arrives here.
     pub console: Option<OwnedFd>,
+    /// Our side of the stdio pipes (foreground run in a user namespace
+    /// without a terminal; see `stdio`).
+    pub pipes: Option<PipeRelay>,
     /// Reads the signals blocked before `clone3` (foreground forwarding).
     pub sfd: SignalFd,
     /// Whether the container got its own PTY.
@@ -211,6 +215,20 @@ pub(crate) fn spawn(opts: &CreateOptions, foreground: bool) -> Result<Spawned> {
         }
     };
 
+    // Stdio for a foreground container in a user namespace without a
+    // terminal: pipes it may reopen (`/dev/stderr`), see `stdio`.
+    let (child_stdio, pipe_relay) = match (&plan.userns, foreground && !plan.process.terminal) {
+        (Some(maps), true) => {
+            let (uid, gid) = maps
+                .uid_to_host(plan.process.uid)
+                .zip(maps.gid_to_host(plan.process.gid))
+                .ok_or_else(|| Error::invalid("the process's uid and gid must be mapped in its user namespace"))?;
+            let (child, relay) = stdio::pipes(uid, gid)?;
+            (Some(child), Some(relay))
+        }
+        _ => (None, None),
+    };
+
     // The host side of every mount, opened while we are still only in the
     // host's namespaces (see `HostTrees` for why not in init).
     let trees = HostTrees::open(&plan)?;
@@ -232,6 +250,7 @@ pub(crate) fn spawn(opts: &CreateOptions, foreground: bool) -> Result<Spawned> {
             drop(cgroup_fd);
             drop(parent_sock);
             drop(console_parent);
+            drop(pipe_relay);
             drop(sfd);
             // Closing our copy is safe: the lock is a POSIX record lock
             // owned by the parent process, so this doesn't release it.
@@ -246,6 +265,7 @@ pub(crate) fn spawn(opts: &CreateOptions, foreground: bool) -> Result<Spawned> {
                 sync: &child_sock,
                 exec_fifo: &fifo,
                 console: console_child,
+                stdio: child_stdio,
                 foreground,
                 preserve_fds: opts.preserve_fds,
                 no_new_keyring: opts.no_new_keyring,
@@ -272,6 +292,9 @@ pub(crate) fn spawn(opts: &CreateOptions, foreground: bool) -> Result<Spawned> {
         Forked::Parent { pid, pidfd } => {
             drop(child_sock);
             drop(console_child);
+            // Init's ends: with ours still open, it would never see EOF on
+            // stdin, nor we on its stdout.
+            drop(child_stdio);
             drop(cgroup_fd);
             drop(fifo);
             let pidfd = pidfd.expect("CLONE_PIDFD was requested");
@@ -323,6 +346,7 @@ pub(crate) fn spawn(opts: &CreateOptions, foreground: bool) -> Result<Spawned> {
                 sync: parent_sock,
                 cgroup,
                 console: console_parent,
+                pipes: pipe_relay,
                 sfd,
                 terminal: plan.process.terminal,
                 lock: Some(lock),
