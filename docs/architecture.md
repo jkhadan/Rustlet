@@ -453,7 +453,7 @@ Host resources, all prefixed so they're easy to find and remove:
 
 ## 5. Roadmap. Each phase ends with a demo, a `docs/learn` chapter, and a walkthrough.
 
-**Status (2026-10-01):** Phases 0 to 2c are done, and Phase 3 (images) is built: `cargo xtask image-run` pulls `alpine`, `nginx` and `python:3-slim` from Docker Hub and runs them, rootful and with `--userns`. `cargo xtask itest` passes all 240 checks (237 privileged tests plus 3 harness unit tests); `cargo nextest run --workspace` passes 303 unit tests. The independent reviews of Phase 2c part 2 and of Phase 3 are reserved for fresh sessions. Chapter 08 remains untracked and awaits its own citation-check/commit session.
+**Status (2026-10-01):** Phases 0 to 2c are done, and Phase 3 (images) is built: `cargo xtask image-run` pulls `alpine`, `nginx` and `python:3-slim` from Docker Hub and runs them, rootful and with `--userns`. `cargo xtask itest` passes all 241 checks (238 privileged tests plus 3 harness unit tests); `cargo nextest run --workspace` passes 306 unit tests. Phase 3's independent review is done (below); Phase 2c part 2's is still reserved for a fresh session. Chapter 08 remains untracked and awaits its own citation-check/commit session.
 
 Phase 3, as built (images; [chapter 11](learn/11-oci-images.md), [chapter 12](learn/12-overlayfs.md)):
 - **Crate:** `rustlet-image` (§2.4): `reference` → `pull` → `content` → `unpack`/`snapshot` → `rootfs` → `runspec`/`user`, plus `import` (local tars into the store). Pulling needs only write access to the store; unpacking and mounting need root.
@@ -469,7 +469,16 @@ Phase 3, as built (images; [chapter 11](learn/11-oci-images.md), [chapter 12](le
 - **Milestone:** `alpine` (pull, unpack and run in about 3 s; `id` shows Docker's group list), `nginx` (serves its page over loopback in the container's own network namespace; master as root, workers as uid 101), `python:3-slim` (sharing its Debian base layer and snapshot with nginx), each also with `--userns` (`uid_map` `0 1000000 65536`, image owners intact through the idmapped layers), and an interactive TTY shell.
 - **Tests:** 10 `im_` tests (owners, modes and file capabilities as root; confinement; whiteouts, opaque directories and copy-up through a real overlay; digest mismatches leave nothing; shared and concurrent snapshots; imported Alpine images run rootful and remapped) and 3 `us_` stdio tests; the `im_` tests take turns, because they mount on the host. Host mountinfo stays at 24 lines.
 - **Not yet:** no garbage collection or `rmi` (a failed pull can leave verified blobs). Whatever decides which snapshots are in use must keep its own record: for a `--userns` container, mountinfo still names the staged `lower/<n>` paths long after they are gone. Anonymous registry access only; images without layers are refused; the host-side overlay mounts sit under the shared `/` and propagate into other mount namespaces until unmounted (the daemon may make `containers/` a private mount); a supplementary gid of 65536 or more is refused under `--userns`. Cosmetic, for the daemon's CLI: `image-run` says "1 layers", and names a layer by blob digest when unpacking but by chain ID when it was already unpacked.
-- **Independent review:** pending, for a fresh session.
+- **Independent review** (2026-10-01): no high-severity findings, and the build matches the plan apart from the deviations recorded above. Fixed:
+  - the stdio relay (`stdio.rs`) stopped altogether once a process had closed both its stdout and stderr, so input arriving after that never reached it: a process that ran `exec >log 2>&1` and then read its stdin waited forever. The relay now keeps going while input can still be delivered;
+  - nothing tested the blob-digest check. The `im_` case meant to do it flipped a byte that gzip's own checks catch first, and with the check deleted every test still passed. The stored blob is now replaced with the same tar, recompressed: valid gzip, the right diff ID, and only the blob digest tells;
+  - a directory listed twice in one layer got its times from the first entry but its other metadata from the last. Times now follow archive order too;
+  - an old-style (V7) directory entry, typeflag NUL with a name ending in `/`, became a file; Docker (Go's `archive/tar`) and GNU tar make it a directory.
+
+  `rr_userns_input_outlives_closed_output` and new unit tests in `stdio.rs` and `unpack/tests.rs` cover them. **Inputs for Phase 4**, where pulls and unpacks run in the long-lived daemon:
+  - Two places read untrusted input whole, without a size limit. The `tar` crate (0.4.46) reads GNU long-name and PAX extension headers into memory, where Go caps them at 1 MiB, so a small gzipped layer can make the unpacker allocate gigabytes. And `oci-client`'s `pull_manifest_raw` buffers a manifest response whole before the 4 MiB check.
+  - Unpacking in a child process confined to a memory-limited cgroup would bound both, as well as the unpacker's per-entry bookkeeping.
+  - Serializing the unpacks of one chain ID would also close a narrow race: `publish` can move aside a crash-damaged snapshot directory that a concurrent unpack of the same layer has just replaced with a good one.
 
 Phase 2c part 2, as built (eBPF devices; [chapter 10](learn/10-ebpf-devices.md)):
 - **Compiler:** `cgroups/devices/` validates rules, optimises resets/no-ops, emits eBPF and checks it with a small interpreter. A separate reference evaluator implements the per-bit rule semantics (§2.2.2). Defaults compile to 89 instructions; a privileged allow-all to `w0 = 1; exit` (2).
@@ -586,7 +595,8 @@ Differential check: the same bundle under `runc` 1.3.4 gives identical namespace
   - OCI → cgroup v2 mapping, including shares → weight
   - image config → spec (insta snapshots of the parts it sets; the rest must equal the runtime default), USER resolution against image passwd/group files
   - pulls against an in-process fake registry: OCI and Docker indexes and platform selection, bearer tokens, corrupted, short or long blobs and mismatched manifests leave nothing behind, shared layers, pull policies, the download concurrency limit
-  - unpacking without root: names with `..` refused, symlinked parents and hard links kept inside the layer, whiteout and opaque conversion, replacement rules, overlay xattrs dropped, both digests over every byte for gzip, zstd and plain tar
+  - unpacking without root: names with `..` refused, symlinked parents and hard links kept inside the layer, whiteout and opaque conversion, replacement rules (a directory listed twice keeps the later entry's metadata), old-style (V7) directories, overlay xattrs dropped, both digests over every byte for gzip, zstd and plain tar
+  - the stdio relay: input and EOF still reach a process that has closed its outputs, and unread input never stalls output
   - the content store: verified ingest, names in `index.json`, concurrent writers, byte-stable rewrites
   - IPAM, Containerfile and compose parsers, DTO round-trips
 - **Privileged integration tests** (`cargo xtask itest`, inside the limited systemd scope), probes run inside containers:
@@ -609,7 +619,7 @@ Differential check: the same bundle under `runc` 1.3.4 gives identical namespace
   - privileged rootful/userns specs inspected with read-only probes, never sysfs writes
   - image layers unpacked as root (owners, setuid bits, file capabilities, symlink owners, skipped devices), confined writes, whiteouts/opaque/copy-up through a real overlay, digest mismatches leaving no snapshot, shared and concurrent snapshots
   - imported Alpine images run rootful and with `--userns` (idmapped layers: image owners inside, mapped owners for the container's writes), USER/WorkingDir from the image, `-u` overrides
-  - user-namespace stdio: `/dev/stdout`/`/dev/stderr` reopenable in `run` and `exec`, including as non-root; unread input never stalls the relay
+  - user-namespace stdio: `/dev/stdout`/`/dev/stderr` reopenable in `run` and `exec`, including as non-root; unread input never stalls the relay; input still arrives after the process has closed its outputs
   - the host mount table is unchanged after each test (diff of `/proc/self/mountinfo`)
 - **Differential testing:** the same bundle under `runc` and `rustlet-runc`, with a probe binary that dumps namespaces, caps, mounts, cgroup, and rlimits. The outputs are diffed.
 - **Conformance:** youki's `contest` suite run against `rustlet-runc`. It is maintained and cgroup-v2-aware; OCI `runtime-tools` is stale and cgroup-v1-oriented.
