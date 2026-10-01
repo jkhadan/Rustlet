@@ -455,8 +455,14 @@ reference evaluator and eBPF interpreter; real kernel loads/access checks;
 and the common-case differential against runc with explicit differences.
 There are 21 `dv_` tests, plus userns, exec and capability coverage.
 The full run passed 227 checks (224 privileged and 3 harness units),
-and workspace unit tests passed 215. Part 2's independent review is still
-reserved for its own fresh session.
+and workspace unit tests passed 215. The independent review on 2026-10-01
+re-ran those gates successfully, but found an unresolved P1 in `/dev`
+population: an image symlink can redirect a later bind mount over the fresh
+`/dev` mount, and a host tmpfs bind source passes the filesystem-type check.
+Device nodes and symlinks are then created in that host directory. Both
+`/dev -> /mnt` and `/mnt -> /dev` were reproduced with disposable fixtures.
+The fix needs mount-identity verification before population and regression
+tests for both aliases; see [Chapter 08 §5](08-runtime-cves.md#5-rule-2-paths-that-change-under-you).
 
 ## 10. Try it
 
