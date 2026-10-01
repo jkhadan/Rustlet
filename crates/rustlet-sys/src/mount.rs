@@ -170,7 +170,8 @@ impl FsContext {
         self.config(FSCONFIG_SET_STRING, Some(&key), value.as_ptr().cast(), 0)
     }
 
-    /// `fsconfig(FSCONFIG_SET_FD, key, fd)`, e.g. overlay's `"lowerdir+"`.
+    /// `fsconfig(FSCONFIG_SET_FD, key, fd)`, e.g. overlay's `"lowerdir+"`
+    /// with a layer's fd (kernel 6.13; Rustlets passes paths, for 6.8).
     pub fn set_fd(&self, key: &str, fd: BorrowedFd<'_>) -> Result<()> {
         let key = cstr(key)?;
         self.config(FSCONFIG_SET_FD, Some(&key), std::ptr::null(), fd.as_raw_fd())

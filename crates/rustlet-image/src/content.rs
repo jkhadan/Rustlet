@@ -194,10 +194,12 @@ impl ContentStore {
     /// Takes the store's write lock (blocking). Hold it across a whole
     /// read-modify-write of `index.json`.
     ///
-    /// An open-file-description lock (`F_OFD_SETLKW`): unlike a classic POSIX
-    /// record lock it belongs to this *open* of the file, so two threads that
-    /// each call `lock` exclude each other too (the daemon is multithreaded);
-    /// unlike `flock`, nothing else ever opens the file.
+    /// An open-file-description lock (`F_OFD_SETLKW`). A classic POSIX
+    /// record lock belongs to the *process*, so two threads of the daemon
+    /// would both get it; an OFD lock, like an `flock`, belongs to one
+    /// *open* of the file, and every call opens the file anew, so threads
+    /// exclude each other as processes do. (`flock` would do as well; the
+    /// fcntl form is the one `nix` offers for this workspace's Rust.)
     pub fn lock(&self) -> Result<StoreLock> {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -339,7 +341,9 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
             .with_context(|| format!("create {}", tmp.display()))?;
         f.write_all(bytes).with_context(|| format!("write {}", tmp.display()))?;
         f.sync_all().with_context(|| format!("fsync {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| format!("rename {} into place", tmp.display()))
+        std::fs::rename(&tmp, path).with_context(|| format!("rename {} into place", tmp.display()))?;
+        // The rename is durable once the directory is.
+        crate::snapshot::sync_dir(path.parent().unwrap_or(Path::new("/")))
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -401,7 +405,8 @@ impl Ingest {
         std::fs::rename(&self.path, &self.dest)
             .with_context(|| format!("move blob {} into the store", self.expected))?;
         self.done = true;
-        Ok(())
+        // The rename is durable once the directory is.
+        crate::snapshot::sync_dir(self.dest.parent().unwrap_or(Path::new("/")))
     }
 }
 

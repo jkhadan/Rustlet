@@ -195,10 +195,19 @@ impl Meta {
     fn read<R: Read>(entry: &mut tar::Entry<'_, R>, shown: &str) -> Result<Meta> {
         let header = entry.header();
         let bad = |field: &str, e: io::Error| Error::invalid(format!("layer entry {shown:?}: {field}: {e}"));
-        let mut uid = header.uid().map_err(|e| bad("uid", e))?;
-        let mut gid = header.gid().map_err(|e| bad("gid", e))?;
-        let mode = header.mode().map_err(|e| bad("mode", e))?;
-        let secs = header.mtime().map_err(|e| bad("mtime", e))?;
+        // An empty numeric field (all NULs or spaces) reads as 0, as Go's
+        // archive/tar (Docker's, containerd's) reads it; the tar crate
+        // refuses it. Anything else that doesn't parse is an error.
+        let old = header.as_old();
+        let field = |raw: &[u8], parsed: io::Result<u64>, name: &str| match parsed {
+            Ok(v) => Ok(v),
+            Err(_) if raw.iter().all(|&b| b == 0 || b == b' ') => Ok(0),
+            Err(e) => Err(bad(name, e)),
+        };
+        let mut uid = field(&old.uid, header.uid(), "uid")?;
+        let mut gid = field(&old.gid, header.gid(), "gid")?;
+        let mode = field(&old.mode, header.mode().map(u64::from), "mode")? as u32;
+        let secs = field(&old.mtime, header.mtime(), "mtime")?;
         let mut mtime = TimeSpec::new(i64::try_from(secs).unwrap_or(i64::MAX), 0);
         let mut atime = None;
         let mut xattrs = Vec::new();

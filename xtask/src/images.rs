@@ -5,7 +5,7 @@
 //! ```text
 //! cargo xtask images                         names, digests, sizes (≈ docker images --digests)
 //! cargo xtask images inspect nginx           manifest, config, layers with diff and chain IDs
-//! cargo xtask images inspect nginx --json    the exact manifest and config documents
+//! cargo xtask images inspect nginx --json    the manifest and config documents, pretty-printed
 //! cargo xtask images ls snapshots/<chain ID>/fs/etc
 //! cargo xtask images ls -R containers/<id>/upper    (after image-run --keep)
 //! cargo xtask images cat content/index.json          (any regular file in the store, as it is)
@@ -50,7 +50,7 @@ enum ImagesCommand {
     Inspect {
         /// Name (alpine, nginx:1.27, …) or manifest digest (sha256:…).
         image: String,
-        /// Print the manifest and config JSON exactly as stored.
+        /// Print the manifest and config JSON, pretty-printed (`images cat` gives the stored bytes).
         #[arg(long)]
         json: bool,
     },
@@ -118,8 +118,11 @@ fn cat(store: &Store, path: &Path) -> anyhow::Result<()> {
         anyhow::bail!("{} is not a regular file", rel.display());
     }
     let file = rustlet_sys::fs::reopen(handle.as_fd(), nix::fcntl::OFlag::O_RDONLY)?;
-    std::io::copy(&mut std::fs::File::from(file), &mut std::io::stdout().lock())?;
-    Ok(())
+    match std::io::copy(&mut std::fs::File::from(file), &mut std::io::stdout().lock()) {
+        // `images cat … | head`: the reader has all it wanted.
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        r => r.map(drop).map_err(Into::into),
+    }
 }
 
 /// Removes every `containers/<id>`. One whose rootfs is still mounted (a
@@ -296,14 +299,14 @@ fn list_dir(dir: &Path, shown: &Path, recursive: bool, depth: usize) -> anyhow::
             ('l', format!(" -> {}", std::fs::read_link(&path)?.display()))
         } else if std::os::unix::fs::FileTypeExt::is_char_device(&ft) {
             let (major, minor) = (libc_major(m.rdev()), libc_minor(m.rdev()));
-            (
-                'c',
-                if (major, minor) == (0, 0) {
-                    "  [whiteout: deletes it from the lower layers]".to_owned()
-                } else {
-                    String::new()
-                },
-            )
+            let label = match (major, minor) {
+                // Overlay keeps one whiteout in work/work and links new
+                // ones to it; that one deletes nothing itself.
+                (0, 0) if shown.ends_with("work/work") => "  [overlay's shared whiteout]",
+                (0, 0) => "  [whiteout: deletes it from the lower layers]",
+                _ => "",
+            };
+            ('c', label.to_owned())
         } else if std::os::unix::fs::FileTypeExt::is_block_device(&ft) {
             ('b', String::new())
         } else if std::os::unix::fs::FileTypeExt::is_fifo(&ft) {

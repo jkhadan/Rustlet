@@ -19,13 +19,19 @@
 //! never written, so every container of an image shares them.
 //!
 //! The overlay is built with the new mount API. `lowerdir+` (kernel 6.8)
-//! adds one lower layer per `fsconfig` call, top layer first; the old
-//! `lowerdir=a:b:c` string had to fit in one page and needed `:` and `,` in
-//! paths escaped. `redirect_dir`, `metacopy` and `index` are set off
-//! explicitly, whatever the kernel's defaults: with them, upper could hold
-//! references into the lower layers instead of whole files, and a
-//! container's changes would no longer be a self-contained diff (which
-//! `commit` and the builder need, Phase 7). The mount is `nodev`.
+//! adds one lower layer per `fsconfig` call, top layer first. The old
+//! `lowerdir=a:b:c` string needed `:` (and, for `mount(2)`, `,`) escaped,
+//! and doesn't even fit: `fsconfig` takes string values of at most 255
+//! bytes, and three snapshot paths are longer than that. `metacopy` and
+//! `index` are set off and `redirect_dir` to `nofollow`, whatever the
+//! kernel's defaults: with them, upper could hold references into the lower
+//! layers instead of whole entries, and a container's changes would no
+//! longer be a self-contained diff (which `commit` and the builder need,
+//! Phase 7). `nofollow` rather than `off`: `off` creates no redirects but
+//! follows one it finds (with the usual `redirect_always_follow=Y`), and no
+//! layer should ever have one; unpacking drops `trusted.overlay.*` from
+//! images too. The mount is `nodev`, and its source reads `rustlet` in
+//! mountinfo.
 //!
 //! ## With a user namespace (`--userns=remap`)
 //!
@@ -237,7 +243,8 @@ impl Drop for Staged {
 }
 
 /// `fsopen("overlay")`, one `lowerdir+` per layer (top first), upper, work,
-/// the fixed options, `fsmount(nodev)`, attached at `target`.
+/// the fixed options and a source name, `fsmount(nodev)`, attached at
+/// `target`.
 fn mount_overlay(lowers: &[PathBuf], upper: &Path, work: &Path, target: &Path) -> Result<()> {
     let utf8 =
         |p: &Path| p.to_str().map(str::to_owned).ok_or_else(|| Error::invalid(format!("{} is not UTF-8", p.display())));
@@ -252,7 +259,7 @@ fn mount_overlay(lowers: &[PathBuf], upper: &Path, work: &Path, target: &Path) -
     }
     config("upperdir", &utf8(upper)?)?;
     config("workdir", &utf8(work)?)?;
-    for (key, value) in [("redirect_dir", "off"), ("metacopy", "off"), ("index", "off")] {
+    for (key, value) in [("redirect_dir", "nofollow"), ("metacopy", "off"), ("index", "off"), ("source", "rustlet")] {
         config(key, value)?;
     }
     let mnt = ctx

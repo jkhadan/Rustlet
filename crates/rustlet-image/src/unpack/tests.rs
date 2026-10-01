@@ -395,6 +395,29 @@ fn pax_records_override_the_header() {
 }
 
 #[test]
+fn empty_numeric_fields_read_as_zero_and_garbage_is_refused() {
+    let mut h = tar::Header::new_gnu();
+    h.as_old_mut().name[..4].copy_from_slice(b"file");
+    h.set_size(1);
+    h.set_cksum(); // uid, gid, mode and mtime left all-NUL
+    let mut out = tar::Builder::new(Vec::new());
+    out.append(&h, &b"x"[..]).unwrap();
+    let u = unpack_tar(&out.into_inner().unwrap());
+    u.report();
+    assert_eq!(std::fs::metadata(u.path("file")).unwrap().permissions().mode() & 0o7777, 0);
+
+    let mut h = tar::Header::new_gnu();
+    h.as_old_mut().name[..4].copy_from_slice(b"file");
+    h.set_size(0);
+    h.as_old_mut().uid[..3].copy_from_slice(b"abc");
+    h.set_cksum();
+    let mut out = tar::Builder::new(Vec::new());
+    out.append(&h, io::empty()).unwrap();
+    let u = unpack_tar(&out.into_inner().unwrap());
+    assert!(u.error().contains("uid"), "{}", u.error());
+}
+
+#[test]
 fn bad_entries_are_refused() {
     for (tar, why) in [
         (Archive::new().file("a/b", b"", 0o644).file("a/b/c", b"", 0o644).tar(), "not a directory"),

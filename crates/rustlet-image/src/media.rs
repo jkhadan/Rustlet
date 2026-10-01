@@ -22,9 +22,10 @@ pub const DOCKER_CONFIG: &str = "application/vnd.docker.container.image.v1+json"
 pub const DOCKER_LAYER_GZIP: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
 pub const DOCKER_LAYER: &str = "application/vnd.docker.image.rootfs.diff.tar";
 
-/// The `Accept` header for manifest requests. Indexes first: for a
-/// multi-platform image, the registry otherwise has to pick a platform for
-/// us (Docker Hub picks linux/amd64, which happens to be right here).
+/// The `Accept` header for manifest requests. Indexes first: a registry
+/// may answer a client that accepts no index with a platform's manifest of
+/// its own choosing (the reference registry picks linux/amd64), and we want
+/// to choose.
 pub const MANIFEST_TYPES: [&str; 4] = [OCI_INDEX, DOCKER_MANIFEST_LIST, OCI_MANIFEST, DOCKER_MANIFEST];
 
 /// Is `media_type` a multi-platform index (OCI index, Docker manifest list)?

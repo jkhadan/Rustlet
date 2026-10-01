@@ -145,10 +145,19 @@ impl Snapshotter {
     ) -> Result<Vec<Snapshot>> {
         let mut out = Vec::with_capacity(image.layers.len());
         for layer in &image.layers {
-            if let Some(s) = self.get(&layer.chain_id)? {
-                events(SnapshotEvent::Exists { layer });
-                out.push(s);
-                continue;
+            match self.get(&layer.chain_id) {
+                Ok(Some(s)) => {
+                    events(SnapshotEvent::Exists { layer });
+                    out.push(s);
+                    continue;
+                }
+                Ok(None) => {}
+                // A directory under the chain ID whose snapshot.json doesn't
+                // parse: unpacking again replaces it (see `unpack_layer`).
+                Err(e @ (Error::Json { .. } | Error::Invalid(_))) => {
+                    tracing::warn!("snapshot {} is unusable, unpacking it again: {e}", layer.chain_id);
+                }
+                Err(e) => return Err(e),
             }
             events(SnapshotEvent::Unpacking { layer });
             let (snapshot, report) = self.unpack_layer(content, layer)?;
@@ -181,18 +190,45 @@ impl Snapshotter {
         };
         let (info, report) = info;
         let dest = self.dir.join(layer.chain_id.hex());
-        match std::fs::rename(&tmp, &dest) {
-            Ok(()) => {}
-            Err(e) if matches!(e.raw_os_error(), Some(libc::EEXIST | libc::ENOTEMPTY)) => discard(&tmp),
-            Err(e) => {
-                discard(&tmp);
-                return Err(e).with_context(|| format!("move snapshot into {}", dest.display()));
-            }
+        if let Err(e) = self.publish(&tmp, &dest, &info.chain_id) {
+            discard(&tmp);
+            return Err(e);
         }
         let snapshot = self.get(&info.chain_id)?.ok_or_else(|| {
             Error::NotFound(format!("snapshot {} vanished right after it was unpacked", info.chain_id))
         })?;
         Ok((snapshot, report))
+    }
+
+    /// Renames the finished `tmp` to `dest`, durably. If `dest` exists:
+    /// another unpack of the layer finished first (a usable snapshot: ours
+    /// is dropped), or a crash left a directory without a usable
+    /// `snapshot.json` (moved aside and deleted, then ours takes its place).
+    fn publish(&self, tmp: &Path, dest: &Path, chain_id: &Digest) -> Result<()> {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let rename = || std::fs::rename(tmp, dest).with_context(|| format!("move snapshot into {}", dest.display()));
+        match std::fs::rename(tmp, dest) {
+            Ok(()) => {}
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EEXIST | libc::ENOTEMPTY)) => {
+                if matches!(self.get(chain_id), Ok(Some(_))) {
+                    discard(tmp);
+                    return Ok(());
+                }
+                let aside = self.dir.join(format!(
+                    ".broken-{}-{}-{}",
+                    chain_id.short(),
+                    std::process::id(),
+                    N.fetch_add(1, Ordering::Relaxed)
+                ));
+                tracing::warn!("replacing {}, which has no usable snapshot.json", dest.display());
+                std::fs::rename(dest, &aside).with_context(|| format!("move {} aside", dest.display()))?;
+                discard(&aside);
+                rename()?;
+            }
+            Err(e) => return Err(e).with_context(|| format!("move snapshot into {}", dest.display())),
+        }
+        // The rename itself is only durable once the directory is synced.
+        sync_dir(&self.dir)
     }
 
     fn unpack_into(&self, content: &ContentStore, layer: &Layer, tmp: &Path) -> Result<(SnapshotInfo, UnpackReport)> {
@@ -224,8 +260,6 @@ impl Snapshotter {
         if report.diff_id.as_ref() != Some(&layer.diff_id) {
             return Err(mismatch("diff ID", layer.diff_id.to_string(), shown(&report.diff_id)));
         }
-        // Durable before it becomes visible under its final name.
-        nix::unistd::syncfs(&fd).with_context(|| format!("sync {}", fs.display()))?;
         let info = SnapshotInfo {
             chain_id: layer.chain_id.clone(),
             diff_id: layer.diff_id.clone(),
@@ -237,8 +271,19 @@ impl Snapshotter {
         };
         let json = serde_json::to_vec_pretty(&info).context("serialize snapshot.json")?;
         std::fs::write(tmp.join(INFO), json).with_context(|| format!("write {}", tmp.join(INFO).display()))?;
+        // Every file of the snapshot, snapshot.json included, is on disk
+        // before the directory gets its final name: a snapshot that exists
+        // after a crash is complete.
+        nix::unistd::syncfs(&fd).with_context(|| format!("sync {}", fs.display()))?;
         Ok((info, report))
     }
+}
+
+/// `fsync` of a directory: makes the renames and creations in it durable.
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
+    let fd = nix::fcntl::open(dir, OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC, Mode::empty())
+        .with_context(|| format!("open {}", dir.display()))?;
+    nix::unistd::fsync(&fd).with_context(|| format!("fsync {}", dir.display()))
 }
 
 /// Removes a failed or redundant unpack. Best effort: a leftover `.tmp-*`
@@ -257,5 +302,71 @@ fn prefix(e: Error, what: &str) -> Error {
         Error::Io { context, source } => Error::Io { context: format!("{what}: {context}"), source },
         Error::Sys { context, errno } => Error::Sys { context: format!("{what}: {context}"), errno },
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::import::{config, import};
+    use crate::store::Store;
+
+    /// A one-layer image in a fresh store (unpacking works without root:
+    /// files keep the caller as owner).
+    fn store_with_image() -> (tempfile::TempDir, Store, Image) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("store")).unwrap();
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(2);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, "etc/hello", &b"hi"[..]).unwrap();
+        let image =
+            import(store.content(), "local/snap:1", &[b.into_inner().unwrap()], config(&["true"], &[], None).unwrap())
+                .unwrap();
+        (dir, store, image)
+    }
+
+    #[test]
+    fn a_directory_left_by_a_crash_is_replaced() {
+        let (_dir, store, image) = store_with_image();
+        let snapshots = store.snapshots();
+        let chain = &image.layers[0].chain_id;
+        // What a crash between rename and metadata used to leave: the chain
+        // ID's directory, without (or with a torn) snapshot.json.
+        for torn in [None, Some(&b"{\"chain_id\": \"sha"[..])] {
+            let dest = snapshots.dir().join(chain.hex());
+            std::fs::create_dir_all(dest.join("fs/stale")).unwrap();
+            if let Some(bytes) = torn {
+                std::fs::write(dest.join(INFO), bytes).unwrap();
+            }
+            let got = snapshots.ensure(store.content(), &image, &mut |_| {}).unwrap();
+            assert_eq!(std::fs::read_to_string(got[0].fs().join("etc/hello")).unwrap(), "hi");
+            assert!(!got[0].fs().join("stale").exists(), "the leftover was replaced, not merged");
+            let names: Vec<_> = std::fs::read_dir(snapshots.dir()).unwrap().map(|e| e.unwrap().file_name()).collect();
+            assert_eq!(names, [std::ffi::OsString::from(chain.hex())], "nothing left aside");
+            std::fs::remove_dir_all(&dest).unwrap();
+        }
+    }
+
+    #[test]
+    fn snapshots_are_listed_and_found_by_chain_id() {
+        let (_dir, store, image) = store_with_image();
+        let snaps = store.snapshots().ensure(store.content(), &image, &mut |_| {}).unwrap();
+        assert_eq!(store.snapshots().list().unwrap(), snaps);
+        let info = &snaps[0].info;
+        assert_eq!(
+            (&info.chain_id, &info.diff_id, info.parent.as_ref()),
+            (&image.layers[0].chain_id, &image.layers[0].diff_id, None)
+        );
+        assert_eq!((info.entries, info.size), (1, 2));
+        // A second ensure finds it.
+        let mut events = Vec::new();
+        store
+            .snapshots()
+            .ensure(store.content(), &image, &mut |e| events.push(matches!(e, SnapshotEvent::Exists { .. })))
+            .unwrap();
+        assert_eq!(events, [true]);
     }
 }
