@@ -8,6 +8,7 @@
 //! cargo xtask images inspect nginx --json    the exact manifest and config documents
 //! cargo xtask images ls snapshots/<chain ID>/fs/etc
 //! cargo xtask images ls -R containers/<id>/upper    (after image-run --keep)
+//! cargo xtask images cat content/index.json          (any regular file in the store, as it is)
 //! cargo xtask images prune-containers                (delete what --keep left)
 //! ```
 //!
@@ -53,6 +54,11 @@ enum ImagesCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Copy a file inside the store to stdout as it is (a blob, index.json, a config.json).
+    Cat {
+        /// A path relative to the store root, e.g. content/index.json.
+        path: PathBuf,
+    },
     /// Delete the container directories `image-run --keep` left behind (not ones in use).
     PruneContainers,
     /// List a directory inside the store, with overlay's whiteouts and opaque directories marked.
@@ -85,8 +91,35 @@ pub(crate) fn run_as_root(args: &ImagesArgs) -> anyhow::Result<()> {
         ImagesCommand::List => list(&store),
         ImagesCommand::Inspect { image, json } => inspect(&store, &image, json),
         ImagesCommand::Ls { path, recursive } => ls(&store, &path, recursive),
+        ImagesCommand::Cat { path } => cat(&store, &path),
         ImagesCommand::PruneContainers => prune_containers(&store),
     }
+}
+
+/// Copies a regular file below the store root to stdout, byte for byte
+/// (resolved like `ls`, inside the root; never a device or FIFO).
+fn cat(store: &Store, path: &Path) -> anyhow::Result<()> {
+    let root = nix::fcntl::open(
+        store.root(),
+        nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_DIRECTORY,
+        nix::sys::stat::Mode::empty(),
+    )
+    .with_context(|| format!("open {}", store.root().display()))?;
+    let rel = expand_prefix(store, path.strip_prefix("/").unwrap_or(path))?;
+    let handle = openat2(
+        Some(root.as_fd()),
+        &rel,
+        nix::fcntl::OFlag::O_PATH,
+        nix::sys::stat::Mode::empty(),
+        ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS,
+    )
+    .with_context(|| format!("open {} inside the store", rel.display()))?;
+    if rustlet_sys::fs::fstatx(handle.as_fd())?.file_type() != libc::S_IFREG {
+        anyhow::bail!("{} is not a regular file", rel.display());
+    }
+    let file = rustlet_sys::fs::reopen(handle.as_fd(), nix::fcntl::OFlag::O_RDONLY)?;
+    std::io::copy(&mut std::fs::File::from(file), &mut std::io::stdout().lock())?;
+    Ok(())
 }
 
 /// Removes every `containers/<id>`. One whose rootfs is still mounted (a

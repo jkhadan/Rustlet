@@ -230,7 +230,11 @@ impl ContentStore {
     }
 
     fn write_index(&self, index: &ImageIndex) -> Result<()> {
-        let json = serde_json::to_vec_pretty(index).context("serialize index.json")?;
+        // Through a `Value`, whose maps are sorted: annotations are a
+        // HashMap in oci-spec, and the file should only change when its
+        // content does.
+        let value = serde_json::to_value(index).context("serialize index.json")?;
+        let json = serde_json::to_vec_pretty(&value).context("serialize index.json")?;
         atomic_write(&self.index_path(), &json)
     }
 
@@ -526,6 +530,10 @@ mod tests {
         let b = s.resolve("docker.io/library/b:latest").unwrap().unwrap();
         assert_eq!(b.manifest_digest().unwrap(), m2);
         assert_eq!(b.repo_digest, Some(Digest::of(b"index")));
+        // Rewritten deterministically: same content, same bytes.
+        let before = std::fs::read(s.dir.join("index.json")).unwrap();
+        s.set_ref(&entry("docker.io/library/b:latest", &m2)).unwrap();
+        assert_eq!(std::fs::read(s.dir.join("index.json")).unwrap(), before);
         assert!(s.remove_ref("docker.io/library/a:latest").unwrap());
         assert!(!s.remove_ref("docker.io/library/a:latest").unwrap());
         assert_eq!(s.refs().unwrap().len(), 1);
