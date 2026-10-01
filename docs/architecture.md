@@ -141,6 +141,7 @@ Commands follow the OCI runtime spec: `create`, `start`, `state`, `kill`, `delet
       - `setsid` + `TIOCSCTTY`
       - `dup2` the slave onto stdio
       - send the master to the shim over `--console-socket` with `SCM_RIGHTS` (the OCI console-socket protocol)
+      - Without a terminal, a foreground process (`run`, `exec`) **in a user namespace** gets three pipes of its own instead of `rustlet-runc`'s stdio, chowned to its mapped user, and the parent relays them (`stdio.rs`, as runc's `setupProcessPipes`). Inherited host pipes belong to host root, which the namespace doesn't map, so reopening `/dev/stdout` or `/dev/stderr` (nginx's `error.log`) failed with `EACCES`.
    7. **Masked and read-only paths:**
       - Masked paths (`/proc/kcore`, `/proc/keys`, `/proc/timer_list`, `/sys/firmware`, …) get a bind of `/dev/null`, after `fstat` confirms it is char device 1:3; masked directories get a read-only tmpfs.
       - Read-only paths: `/proc/sys`, `/proc/sysrq-trigger`, `/proc/irq`, `/proc/bus`.
@@ -234,36 +235,36 @@ Commands follow the OCI runtime spec: `create`, `start`, `state`, `kill`, `delet
 - The shim `setsid()`s and sets `PR_SET_CHILD_SUBREAPER` itself. The daemon can't use `pre_exec`, which is unsafe, and the daemon forbids unsafe code.
 - It runs `rustlet-runc create`, reports the pid, then runs `start` when told to.
 - **Reaping:** one SIGCHLD handler → a `waitid(P_ALL, WNOHANG)` loop reaps everything (container init, exec processes, runc invocations). No `tokio::process` child handles, because they conflict with a subreaper's reaping.
-- **I/O:** a PTY master (received over the console socket) or stdout/stderr pipes. Logs are JSON-lines (`{ts, stream, log}`) in `/var/lib/rustlet/containers/<id>/container.log`, with size-based rotation.
+- **I/O:** a PTY master (received over the console socket) or stdout/stderr pipes. For a container with a user namespace, the pipes are chowned to the container's mapped user before `create`, as containerd's shim does (`IoUID`/`IoGID`), so the container can reopen `/dev/stdout`. Logs are JSON-lines (`{ts, stream, log}`) in `/var/lib/rustlet/containers/<id>/container.log`, with size-based rotation.
 - **Control socket `/run/rustlet/shims/<id>/shim.sock`:** length-prefixed serde messages: `Start`, `Kill{sig}`, `Exec{spec, tty}`, `Resize`, `Attach`, `Wait`, `Shutdown`.
 - On exit it writes `exit.json` (code, signal, OOM flag from `memory.events`) and notifies the daemon. After a daemon restart, the daemon finds shims again through their sockets.
 - Runtime: tokio `current_thread`.
 
 ### 2.4 `rustlet-image` — OCI images, storage, snapshots
-- **Pull** (`oci-client`):
-  - Download blobs with **`pull_blob` streaming into files**. Don't use `Client::pull`, which holds every layer in memory.
-  - Normalize references (`alpine` → `docker.io/library/alpine:latest`).
-  - Handle bearer auth, multi-arch index selection (`linux/amd64`), and both Docker schema2 and OCI manifests.
-  - Download layers in parallel; verify the compressed sha256 while streaming.
-  - Report NDJSON progress.
-  - Cache test images locally, because Docker Hub rate-limits anonymous pulls.
-- **Content store:** `/var/lib/rustlet/content/` uses **OCI image-layout** (`blobs/sha256/…`, `index.json`), so `save`/`load` are almost trivial. Tags map to digests in SQLite.
-- **Unpack** (the `tar` crate is used only as an entry iterator; files are written by our own code):
-  1. Decompress gzip or zstd into a temporary snapshot directory.
-  2. Resolve every path with `openat2(RESOLVE_BENEATH)`, which rejects `..`, absolute paths, and symlink escapes.
-  3. Preserve owner, mode, and hardlinks. Keep xattrs **except** `trusted.overlay.*` and `user.overlay.*`, which are stripped. Skip device nodes.
-  4. Convert `.wh.<name>` into an overlay whiteout (char device 0:0), and `.wh..wh..opq` into the opaque xattr.
-  5. **Check the uncompressed stream's digest against the image config's `diff_id`** before the atomic rename into `snapshots/<chainID>`. Otherwise one malicious image could poison a snapshot that other images share.
+- **Pull** (`pull/mod.rs`; the registry protocol, bearer tokens and HTTP are `oci-client`'s):
+  - Normalize references (`alpine` → `docker.io/library/alpine:latest`; `reference.rs`).
+  - Fetch the manifest's exact bytes (`pull_manifest_raw`, accepting OCI and Docker schema-2 indexes and manifests); the digest of that first response is the *repo digest*. From an index, pick `linux/amd64` ourselves (the baseline build over `v2`/`v3` variants; attestation entries never match).
+  - Stream the config and layers (`pull_blob_stream`, up to 3 at once) into an `Ingest`, which checks size and sha256 before the rename into `blobs/`. Blobs already stored are skipped, so shared layers download once. Never `Client::pull`, which holds every layer in memory.
+  - Progress events serialize to the NDJSON the daemon will stream. Manifests are capped at 4 MiB, configs at 8 MiB.
+  - Policies `missing` (default), `always` (a `HEAD` first: nothing is downloaded if the tag still points at a stored manifest, and Docker Hub doesn't count a `HEAD` against its anonymous limit), `never`. Anonymous access only.
+- **Content store** (`content.rs`): `/var/lib/rustlet/content/` is a plain **OCI image layout** (`oci-layout`, `index.json`, `blobs/sha256/…`). **Image names live in that `index.json`**, as `org.opencontainers.image.ref.name` annotations plus `io.rustlet.image.repo-digest`, not in SQLite as first planned: the directory stays readable by `skopeo` or `umoci`, and `save`/`load` become copies. `index.json` is replaced atomically, under an open-file-description lock (`store.lock`) that excludes threads as well as processes. Partial downloads live in `ingest/`.
+- **Unpack** (`unpack.rs`; the `tar` crate is only an entry iterator, every file is written by our code):
+  1. compressed → sha256 → gzip, zstd or nothing → sha256 → tar entries. Both streams are read to their very end, end-of-archive padding included, because both digests cover every byte.
+  2. Names are checked as text (`..` refused, a leading `/` dropped), then each parent is resolved with `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS)`, so a symlink planted by an earlier entry resolves *inside* the layer. (First planned as `RESOLVE_BENEATH`, which refuses absolute symlinks outright; `IN_ROOT` gives the semantics of Docker's chroot'ed unpack, and never leaves the layer either.) The final component is never followed; whatever was there is replaced (directories merge). A symlink to a directory the layer doesn't have is refused, as by Docker.
+  3. Owner, then mode (chown clears setuid), then xattrs (chown clears `security.capability`), then times; directory times last. Xattrs come from PAX `SCHILY.xattr.*`, **except** `trusted.overlay.*` and `user.overlay.*`, which are dropped. Hard links must point into the same layer and are made from an fd (`linkat(AT_EMPTY_PATH)`), never to a directory or whiteout. Device nodes are skipped.
+  4. `.wh.<name>` becomes an overlay whiteout (char 0:0), `.wh..wh..opq` the opaque xattr; a directory that meets its own layer's whiteout is opaque too. Other `.wh..wh.*` (AUFS) entries are skipped.
+  5. **The blob digest and the uncompressed stream's digest are checked against the manifest and the config's `diff_id`** before the atomic rename into `snapshots/<chainID>`. Otherwise one malicious image could poison a snapshot that other images share.
 - **Snapshots and rootfs:**
-  - ChainID-keyed layer directories (shared layers are deduplicated).
-  - Container rootfs = overlayfs mounted with the new mount API: `fsconfig("lowerdir+")` (6.8+) sidesteps the one-page option-string limit, and the options `redirect_dir=off,metacopy=off,index=off` are set explicitly so commit diffs stay exact.
-  - For `--userns=remap`: **idmapped lower layers** (`open_tree` + `mount_setattr(MOUNT_ATTR_IDMAP)`), so layers owned by host root appear as container root.
-- **Image config → OCI spec:**
-  - merge Entrypoint/Cmd with overrides
-  - merge Env; apply WorkingDir, StopSignal, ExposedPorts (`-P`), Volumes (anonymous), Healthcheck
-  - resolve `USER` via the container's `/etc/passwd` and `/etc/group`, read through `RESOLVE_IN_ROOT`
+  - `snapshots/<chainID>/{fs/,snapshot.json}` (`snapshot.rs`): one directory per layer, keyed by chain ID; shared layers are unpacked once, and concurrent unpacks of one layer converge on a single snapshot (the first rename wins).
+  - Container rootfs (`rootfs.rs`) = overlayfs at `containers/<id>/rootfs`, with `upper/` and `work/` beside it, built with the new mount API: one `fsconfig("lowerdir+")` per layer (6.8+). `fsconfig` takes string values of at most 255 bytes, so the classic `lowerdir=a:b:c` (which also needs `:` escaped) doesn't fit three snapshot paths. `metacopy=off`, `index=off` and `redirect_dir=nofollow` are set explicitly so a container's changes stay a self-contained diff (`nofollow` rather than `off`, which would still *follow* a redirect it found; no layer should have one, and unpacking drops `trusted.overlay.*`). Mounted `nodev`, with the source name `rustlet`.
+  - For `--userns=remap`: **idmapped lower layers**. A parked helper process (`rustlet_sys::process::UsernsHolder`, sound even in a multithreaded caller) holds a user namespace with the container's maps, written through `IdMapper`; each layer becomes `open_tree(CLONE)` + `mount_setattr(MOUNT_ATTR_IDMAP)`, so on-disk uid 0 is seen as container root (host 1000000). Before 6.15, overlay only takes layers *attached* in the mounter's namespace, so the idmapped trees sit under a 0700 `lower/` only until the overlay exists (it keeps private clones). Upper is owned by the mapped root.
+- **Image config → OCI spec** (`runspec.rs`, `user.rs`):
+  - merge Entrypoint/Cmd with overrides (an overridden entrypoint drops the image's Cmd, as in Docker)
+  - merge Env; apply WorkingDir; StopSignal and ExposedPorts become OCI `conversion.md` annotations; Volumes (anonymous) and Healthcheck wait for Phases 4–5
+  - resolve `USER` via the image's `/etc/passwd` and `/etc/group`, read through `RESOLVE_IN_ROOT` from the mounted rootfs, with runc's `GetExecUser` rules (supplementary groups in the implicit form)
   - covered by `insta` snapshot tests
-- **Commit/diff:** walk the upperdir and convert whiteouts and opaque xattrs back into `.wh.` entries, producing a deterministic tar layer. Used by the builder and `commit`.
+- **Import** (`import.rs`): local tar layers → blobs, config, manifest and a name: the pull pipeline backwards. Used by tests, by `cargo xtask image-run --local-alpine` (offline), and by the builder later.
+- **Commit/diff:** walk the upperdir and convert whiteouts and opaque xattrs back into `.wh.` entries, producing a deterministic tar layer. Used by the builder and `commit` (Phase 7). Found while writing chapter 12: skip `work/`; skip overlay's own attributes (`trusted.overlay.uuid`, `origin`, `impure`); overlay makes whiteouts as hard links to one in `work/work`, so they must not become tar hard links of each other; and a remapped container's upper holds *host* ids (1000000 + n), which must be mapped back.
 
 ### 2.5 `rustlet-net` — host-side networking
 - **Modes:** `bridge` (default), `none`, `host`, `container:<id>`, and user-defined networks.
@@ -390,13 +391,13 @@ Rustlet/
 ├─ profiles/seccomp-default.json
 ├─ packaging/                 # rustletd.service/.socket, NM unmanaged conf, deb metadata
 ├─ scripts/cleanup.sh         # one-command host restore (see §4)
-├─ xtask/                     # cargo xtask itest | rootfs | image-run | gen-ts | dev-storage
+├─ xtask/                     # cargo xtask itest | rootfs | demo | image-run | images | gen-ts | dev-storage
 ├─ tests/                     # privileged integration tests
 └─ docs/architecture.md, docs/learn/NN-*.md
 ```
 
 Host resources, all prefixed so they're easy to find and remove:
-- data: `/var/lib/rustlet/{content,snapshots,containers,volumes,state.db,build-cache}`
+- data: `/var/lib/rustlet/{content,ingest,snapshots,containers,volumes,state.db,build-cache,store.lock}`
 - runtime: `/run/rustlet/{rustlet.sock,runtime,shims,netns}`
 - cgroups: `system.slice/rustletd.service/…`
 - firewall: nft table `inet rustlet`
@@ -452,7 +453,23 @@ Host resources, all prefixed so they're easy to find and remove:
 
 ## 5. Roadmap. Each phase ends with a demo, a `docs/learn` chapter, and a walkthrough.
 
-**Status (2026-09-30):** Phases 0, 1, 2a and 2b are done. Phase 2c parts 1 (user namespaces) and 2 (device filtering) are built. `cargo xtask itest` passes all 227 checks (224 privileged tests plus 3 harness unit tests); `cargo test --workspace` passes 215 unit tests. `cargo xtask demo` supports job control, cgroup limits, `--userns`, `--device PATH[:rwm]` and `--privileged`. Part 2's independent review is reserved for a fresh session. Chapter 08 remains untracked and awaits its own citation-check/commit session; it is not part of Phase 2c's work.
+**Status (2026-10-01):** Phases 0 to 2c are done, and Phase 3 (images) is built: `cargo xtask image-run` pulls `alpine`, `nginx` and `python:3-slim` from Docker Hub and runs them, rootful and with `--userns`. `cargo xtask itest` passes all 240 checks (237 privileged tests plus 3 harness unit tests); `cargo nextest run --workspace` passes 303 unit tests. The independent reviews of Phase 2c part 2 and of Phase 3 are reserved for fresh sessions. Chapter 08 remains untracked and awaits its own citation-check/commit session.
+
+Phase 3, as built (images; [chapter 11](learn/11-oci-images.md), [chapter 12](learn/12-overlayfs.md)):
+- **Crate:** `rustlet-image` (§2.4): `reference` → `pull` → `content` → `unpack`/`snapshot` → `rootfs` → `runspec`/`user`, plus `import` (local tars into the store). Pulling needs only write access to the store; unpacking and mounting need root.
+- **Pull:** `oci-client` 0.18 for the protocol, everything else ours: exact manifest bytes, platform selection, the config checked (parses, one diff ID per layer, `linux/amd64`) before any layer is fetched, up to 3 blobs at once, each through an `Ingest` that only renames a blob into `blobs/` once size and digest match, the manifest stored after everything it names and the name last. Policies `missing`/`always` (one `HEAD`)/`never`. NDJSON-serializable progress events. 14 tests against an in-process fake registry (OCI and Docker indexes, bearer tokens, corrupted, short or long blobs, mismatched manifests, shared layers, the policies, artifacts, the concurrency limit), two more for the event format and for pulls running on any thread, and one ignored live pull.
+- **Store:** a plain OCI image layout. **Deviation:** image names are `org.opencontainers.image.ref.name` annotations in its `index.json` (plus `io.rustlet.image.repo-digest`), written atomically and byte-stably under an OFD lock, not SQLite rows; other OCI tools can read the store as it is.
+- **Unpack:** both digests over every byte, a snapshot renamed into place only once both match and everything in it, `snapshot.json` included, is on disk (`syncfs`, then an fsync of `snapshots/`); a chain-ID directory a crash left without usable metadata is replaced. An empty numeric tar field reads as 0, as in Go's `archive/tar`. **Deviation:** parents resolve with `RESOLVE_IN_ROOT` (Docker's chroot semantics), not `RESOLVE_BENEATH`, with `..` refused as text; a symlink to a directory the layer doesn't have is refused. Whiteouts and opaque markers become overlay's; a directory meeting its own layer's whiteout is opaque. Unprivileged unpacks (unit tests) keep the caller as owner and use `user.overlay.opaque`, the attribute of an overlay mounted with `userxattr`.
+- **Rootfs:** overlay through `lowerdir+` (an `fsconfig` string can't hold three snapshot paths), `metacopy`/`index` off and `redirect_dir=nofollow`, `nodev`, source `rustlet`. With `--userns` the layers are idmapped through a parked helper's user namespace and staged under `containers/<id>/lower/` only until the overlay exists; upper belongs to the mapped root.
+- **Spec:** `default_spec()` plus the image's command, environment, working directory, user and OCI `conversion.md` annotations (labels win over the implicit ones, as conversion.md says). USER follows runc's `GetExecUser`, except that malformed passwd lines are skipped instead of read as uid 0, and the primary gid comes first in `additionalGids`, as in Docker, Podman and containerd since CVE-2022-36109. Volumes, Healthcheck and ExposedPorts are recorded, not acted on, until Phases 4–5.
+- **Runtime fixes the milestone found:**
+  - nginx under `--userns` couldn't reopen `/dev/stderr` (§2.2 step 5.6): foreground `run` and `exec` now give user-namespace processes stdio pipes chowned to their mapped user, and relay them without ever waiting on the process (`stdio.rs`);
+  - `process.user` ids of 4294967295 (`(uid_t)-1`, "leave unchanged" to `setresuid`) are refused at `create` and `exec`.
+- **Tooling:** `cargo xtask image-run [--userns] [--pull P] [-t] [-e] [-u] [-w] [--entrypoint] [--read-only] [--memory/--pids/--cpus] [--keep] [--json-progress] [--local-alpine] IMAGE [ARGS…]` (builds as you, then runs the rest as root through sudo, in a delegated scope like `demo`); `cargo xtask images [inspect IMAGE [--json] | ls [-R] PATH | cat PATH | prune-containers]` to look inside the root-only store.
+- **Milestone:** `alpine` (pull, unpack and run in about 3 s; `id` shows Docker's group list), `nginx` (serves its page over loopback in the container's own network namespace; master as root, workers as uid 101), `python:3-slim` (sharing its Debian base layer and snapshot with nginx), each also with `--userns` (`uid_map` `0 1000000 65536`, image owners intact through the idmapped layers), and an interactive TTY shell.
+- **Tests:** 10 `im_` tests (owners, modes and file capabilities as root; confinement; whiteouts, opaque directories and copy-up through a real overlay; digest mismatches leave nothing; shared and concurrent snapshots; imported Alpine images run rootful and remapped) and 3 `us_` stdio tests; the `im_` tests take turns, because they mount on the host. Host mountinfo stays at 24 lines.
+- **Not yet:** no garbage collection or `rmi` (a failed pull can leave verified blobs). Whatever decides which snapshots are in use must keep its own record: for a `--userns` container, mountinfo still names the staged `lower/<n>` paths long after they are gone. Anonymous registry access only; images without layers are refused; the host-side overlay mounts sit under the shared `/` and propagate into other mount namespaces until unmounted (the daemon may make `containers/` a private mount); a supplementary gid of 65536 or more is refused under `--userns`. Cosmetic, for the daemon's CLI: `image-run` says "1 layers", and names a layer by blob digest when unpacking but by chain ID when it was already unpacked.
+- **Independent review:** pending, for a fresh session.
 
 Phase 2c part 2, as built (eBPF devices; [chapter 10](learn/10-ebpf-devices.md)):
 - **Compiler:** `cgroups/devices/` validates rules, optimises resets/no-ops, emits eBPF and checks it with a small interpreter. A separate reference evaluator implements the per-bit rule semantics (§2.2.2). Defaults compile to 89 instructions; a privileged allow-all to `w0 = 1; exit` (2).
@@ -567,9 +584,10 @@ Differential check: the same bundle under `runc` 1.3.4 gives identical namespace
   - device-node path/mount conflicts and the create/exec `CAP_MKNOD` gate
   - disassembly snapshots
   - OCI → cgroup v2 mapping, including shares → weight
-  - image config → spec (insta)
-  - whiteout conversion, and path-traversal rejection using malicious tar fixtures
-  - diff_id mismatch rejection, xattr stripping
+  - image config → spec (insta snapshots of the parts it sets; the rest must equal the runtime default), USER resolution against image passwd/group files
+  - pulls against an in-process fake registry: OCI and Docker indexes and platform selection, bearer tokens, corrupted, short or long blobs and mismatched manifests leave nothing behind, shared layers, pull policies, the download concurrency limit
+  - unpacking without root: names with `..` refused, symlinked parents and hard links kept inside the layer, whiteout and opaque conversion, replacement rules, overlay xattrs dropped, both digests over every byte for gzip, zstd and plain tar
+  - the content store: verified ingest, names in `index.json`, concurrent writers, byte-stable rewrites
   - IPAM, Containerfile and compose parsers, DTO round-trips
 - **Privileged integration tests** (`cargo xtask itest`, inside the limited systemd scope), probes run inside containers:
   - namespace inodes differ from the host by default and match under `--net=host`/`--pid=host`
@@ -589,6 +607,9 @@ Differential check: the same bundle under `runc` 1.3.4 gives identical namespace
   - per-bit read/write/combined access, node metadata, nested paths and checked user-namespace host binds/FIFOs
   - exactly one attached device program, freed after delete and failed create; exec inherits filtering
   - privileged rootful/userns specs inspected with read-only probes, never sysfs writes
+  - image layers unpacked as root (owners, setuid bits, file capabilities, symlink owners, skipped devices), confined writes, whiteouts/opaque/copy-up through a real overlay, digest mismatches leaving no snapshot, shared and concurrent snapshots
+  - imported Alpine images run rootful and with `--userns` (idmapped layers: image owners inside, mapped owners for the container's writes), USER/WorkingDir from the image, `-u` overrides
+  - user-namespace stdio: `/dev/stdout`/`/dev/stderr` reopenable in `run` and `exec`, including as non-root; unread input never stalls the relay
   - the host mount table is unchanged after each test (diff of `/proc/self/mountinfo`)
 - **Differential testing:** the same bundle under `runc` and `rustlet-runc`, with a probe binary that dumps namespaces, caps, mounts, cgroup, and rlimits. The outputs are diffed.
 - **Conformance:** youki's `contest` suite run against `rustlet-runc`. It is maintained and cgroup-v2-aware; OCI `runtime-tools` is stale and cgroup-v1-oriented.
