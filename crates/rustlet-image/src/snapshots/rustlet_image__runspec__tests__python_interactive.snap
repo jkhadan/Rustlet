@@ -1,0 +1,64 @@
+---
+source: crates/rustlet-image/src/runspec.rs
+expression: decided(&spec)
+---
+{
+  "annotations": {
+    "io.rustlet.image.manifest": "sha256:185c74ed465ed2dbfe87800bce9ae6ad0c859d0916275fac4316392b46120035",
+    "io.rustlet.image.name": "docker.io/library/python:3.13-slim",
+    "org.opencontainers.image.architecture": "amd64",
+    "org.opencontainers.image.created": "2025-04-08T19:45:12Z",
+    "org.opencontainers.image.os": "linux"
+  },
+  "hostname": "py",
+  "linux": {
+    "gidMappings": null,
+    "namespaces": [
+      {
+        "type": "pid"
+      },
+      {
+        "type": "network"
+      },
+      {
+        "type": "ipc"
+      },
+      {
+        "type": "uts"
+      },
+      {
+        "type": "mount"
+      },
+      {
+        "type": "cgroup"
+      }
+    ],
+    "uidMappings": null
+  },
+  "process": {
+    "args": [
+      "python3",
+      "-q"
+    ],
+    "cwd": "/",
+    "env": [
+      "PATH=/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "LANG=en_US.UTF-8",
+      "GPG_KEY=7169605F62C751356D054A26A821E680E5FA6305",
+      "PYTHON_VERSION=3.13.3",
+      "PYTHON_SHA256=40f868bcbdeb8149a3149580bb9bfd407b3321cd48f0be631af955ac92c0e041",
+      "PYTHONDONTWRITEBYTECODE=1",
+      "HOSTNAME=py",
+      "TERM=xterm"
+    ],
+    "terminal": true,
+    "user": {
+      "gid": 0,
+      "uid": 0
+    }
+  },
+  "root": {
+    "path": "/var/lib/rustlet/containers/3f9a2c41d7e8/rootfs",
+    "readonly": false
+  }
+}

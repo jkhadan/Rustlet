@@ -1,0 +1,64 @@
+---
+source: crates/rustlet-image/src/runspec.rs
+expression: decided(&spec)
+---
+{
+  "annotations": {
+    "io.rustlet.image.manifest": "sha256:2b6626ff7466041c779bf1cbccb022b7bd2dde5a72a42999e3718a91ab0e2d25",
+    "org.opencontainers.image.architecture": "amd64",
+    "org.opencontainers.image.author": "Example Ops <ops@example.com>",
+    "org.opencontainers.image.created": "2019-03-01T12:00:00Z",
+    "org.opencontainers.image.exposedPorts": "8080/tcp,8125/udp,9090/tcp",
+    "org.opencontainers.image.os": "linux",
+    "org.opencontainers.image.source": "https://git.example.com/app",
+    "org.opencontainers.image.stopSignal": "SIGINT"
+  },
+  "hostname": "rustlet",
+  "linux": {
+    "gidMappings": null,
+    "namespaces": [
+      {
+        "type": "pid"
+      },
+      {
+        "type": "network"
+      },
+      {
+        "type": "ipc"
+      },
+      {
+        "type": "uts"
+      },
+      {
+        "type": "mount"
+      },
+      {
+        "type": "cgroup"
+      }
+    ],
+    "uidMappings": null
+  },
+  "process": {
+    "args": [
+      "./server",
+      "--listen",
+      ":8080"
+    ],
+    "cwd": "/app",
+    "env": [
+      "APP_ENV=production",
+      "APP_PORT=8080",
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "HOSTNAME=rustlet"
+    ],
+    "terminal": false,
+    "user": {
+      "gid": 1000,
+      "uid": 1000
+    }
+  },
+  "root": {
+    "path": "/var/lib/rustlet/containers/3f9a2c41d7e8/rootfs",
+    "readonly": false
+  }
+}

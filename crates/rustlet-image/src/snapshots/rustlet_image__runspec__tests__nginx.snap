@@ -1,0 +1,68 @@
+---
+source: crates/rustlet-image/src/runspec.rs
+expression: decided(&spec)
+---
+{
+  "annotations": {
+    "io.rustlet.image.manifest": "sha256:d7ccce8b5b83ffa07d51723e69f3e387d664e02fba687690bf21994eda0be5a0",
+    "io.rustlet.image.name": "docker.io/library/nginx:latest",
+    "maintainer": "NGINX Docker Maintainers <docker-maint@nginx.com>",
+    "org.opencontainers.image.architecture": "amd64",
+    "org.opencontainers.image.created": "2025-04-16T20:06:31Z",
+    "org.opencontainers.image.exposedPorts": "80/tcp",
+    "org.opencontainers.image.os": "linux",
+    "org.opencontainers.image.stopSignal": "SIGQUIT"
+  },
+  "hostname": "rustlet",
+  "linux": {
+    "gidMappings": null,
+    "namespaces": [
+      {
+        "type": "pid"
+      },
+      {
+        "type": "network"
+      },
+      {
+        "type": "ipc"
+      },
+      {
+        "type": "uts"
+      },
+      {
+        "type": "mount"
+      },
+      {
+        "type": "cgroup"
+      }
+    ],
+    "uidMappings": null
+  },
+  "process": {
+    "args": [
+      "/docker-entrypoint.sh",
+      "nginx",
+      "-g",
+      "daemon off;"
+    ],
+    "cwd": "/",
+    "env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "NGINX_VERSION=1.27.5",
+      "NJS_VERSION=0.8.10",
+      "NJS_RELEASE=1~bookworm",
+      "PKG_RELEASE=1~bookworm",
+      "DYNPKG_RELEASE=1~bookworm",
+      "HOSTNAME=rustlet"
+    ],
+    "terminal": false,
+    "user": {
+      "gid": 0,
+      "uid": 0
+    }
+  },
+  "root": {
+    "path": "/var/lib/rustlet/containers/3f9a2c41d7e8/rootfs",
+    "readonly": false
+  }
+}

@@ -1,0 +1,85 @@
+---
+source: crates/rustlet-image/src/runspec.rs
+expression: decided(&spec)
+---
+{
+  "annotations": {
+    "io.rustlet.image.manifest": "sha256:c34498eabcf7e03883f7c5b61ff1f447e8832f7c49e1ebb91cc1b0fb210b18a8",
+    "io.rustlet.image.name": "docker.io/library/alpine:3.24",
+    "org.opencontainers.image.architecture": "amd64",
+    "org.opencontainers.image.created": "2026-05-28T17:51:09Z",
+    "org.opencontainers.image.os": "linux"
+  },
+  "hostname": "rustlet",
+  "linux": {
+    "gidMappings": [
+      {
+        "containerID": 0,
+        "hostID": 1000000,
+        "size": 65536
+      }
+    ],
+    "namespaces": [
+      {
+        "type": "pid"
+      },
+      {
+        "type": "network"
+      },
+      {
+        "type": "ipc"
+      },
+      {
+        "type": "uts"
+      },
+      {
+        "type": "mount"
+      },
+      {
+        "type": "cgroup"
+      },
+      {
+        "type": "user"
+      }
+    ],
+    "uidMappings": [
+      {
+        "containerID": 0,
+        "hostID": 1000000,
+        "size": 65536
+      }
+    ]
+  },
+  "process": {
+    "args": [
+      "/bin/sh"
+    ],
+    "cwd": "/",
+    "env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "HOSTNAME=rustlet"
+    ],
+    "terminal": false,
+    "user": {
+      "additionalGids": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        6,
+        10,
+        11,
+        20,
+        26,
+        27
+      ],
+      "gid": 0,
+      "uid": 0
+    }
+  },
+  "root": {
+    "path": "/var/lib/rustlet/containers/3f9a2c41d7e8/rootfs",
+    "readonly": true
+  }
+}
