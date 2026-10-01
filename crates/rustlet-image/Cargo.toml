@@ -1,5 +1,6 @@
 [package]
 name = "rustlet-image"
+description = "OCI images for Rustlets: registry pulls, the OCI-layout content store, safe layer unpacking, chainID snapshots, overlay rootfs, image config to runtime spec."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,3 +11,27 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+rustlet-sys.workspace = true
+rustlet-runtime.workspace = true
+oci-spec.workspace = true
+oci-client.workspace = true
+tokio.workspace = true
+futures.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tar.workspace = true
+flate2.workspace = true
+zstd.workspace = true
+nix.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+insta.workspace = true
+axum.workspace = true
