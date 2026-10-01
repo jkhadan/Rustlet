@@ -225,18 +225,27 @@ is safe. Tests:
 `hd_mount_destinations_are_checked_after_following_symlinks`, the `inroot`
 unit tests.
 
-**Open finding from the Phase 2c part 2 review (2026-10-01):** an image can
-make `/mnt -> /dev`, so a later writable bind mount on `/mnt` covers the
-runtime's `/dev` tmpfs. The reverse alias, `/dev -> /mnt`, also works. When the
-bind source is a host tmpfs directory, the filesystem-type check passes, and
-device population creates nodes and symlinks in that host directory. A
+**Finding from the Phase 2c part 2 review (2026-10-01), now fixed:** an image
+could make `/mnt -> /dev`, so a later writable bind mount on `/mnt` covered the
+runtime's `/dev` tmpfs. The reverse alias, `/dev -> /mnt`, also worked: the
+tmpfs followed the link to `/mnt`, and the bind mount covered it there. When
+the bind source was a host tmpfs directory, the filesystem-type check passed,
+and device population created nodes and symlinks in that host directory. A
 disposable fixture acquired a requested character 1:3 node with mode `0640`,
-uid 12 and gid 34, plus the default devices and symlinks. A later `create`
-failure did not undo those writes. Lexical mount/device conflict checks do not
-catch the aliases. The fix needs to preserve and verify the actual `/dev`
-mount identity before population, with regression tests for both aliases.
-This finding is unresolved; fd-based path confinement alone is not a complete
-proof of host-filesystem protection.
+uid 12 and gid 34, plus the default devices and symlinks, and a later `create`
+failure did not undo those writes. Lexical mount/device conflict checks could
+not catch the aliases, and every lookup had stayed inside the rootfs: the
+problem was *which mount* the path reached, not where it went.
+
+The fix keeps the fd of the tmpfs mount that `rootfs::setup` made for `/dev`
+and populates `/dev` through that fd, never through the path. Before writing
+anything, `dev::populate` checks that `/dev` in the rootfs still leads to the
+root of that very mount (same mount ID, device and inode), and the mount of
+`/dev` refuses a symlinked destination, as `/proc` and `/sys` do. Tests:
+`rr_dev_symlink_cannot_redirect_device_population` and
+`rr_mount_through_a_symlink_cannot_cover_dev`, each of which fails without the
+fix. The lesson stands: fd-based path confinement alone is not a complete
+proof of host-filesystem protection; what an fd refers to must be checked too.
 
 ## 6. Rule 3: restrict mounts over kernel interfaces
 

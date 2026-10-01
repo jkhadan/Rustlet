@@ -156,12 +156,27 @@ pub fn plan(linux: &Linux, ns: &NamespacePlan, mounts: &[MountEntry]) -> Result<
     Ok(DevPlan { nodes, userns: ns.new_user() })
 }
 
-/// Populate only the freshly mounted /dev tmpfs. No container process can
-/// run yet, and conflicting mounts were refused at plan time.
-pub fn populate(root: BorrowedFd<'_>, plan: &DevPlan) -> Result<()> {
-    let dev = inroot::open_dir(root, Path::new("/dev")).context("open /dev in rootfs")?;
-    if fs_magic(dev.as_fd()).context("fstatfs /dev")? != magic::TMPFS_MAGIC {
+/// Populate only the freshly mounted /dev tmpfs, through `dev`, the fd of
+/// that very mount, once every mount of the spec is in place. No container
+/// process can run yet, and conflicting mounts were refused at plan time.
+///
+/// The filesystem type of whatever `/dev` resolves to proves nothing: a
+/// symlink in the image (`/mnt -> /dev`) can send a later bind mount on top
+/// of the fresh tmpfs, and a host directory on tmpfs passes a type check.
+/// So `/dev` in the rootfs must still lead to the root of this mount, or
+/// `create` fails before anything is written.
+pub fn populate(root: BorrowedFd<'_>, dev: BorrowedFd<'_>, plan: &DevPlan) -> Result<()> {
+    if fs_magic(dev).context("fstatfs /dev")? != magic::TMPFS_MAGIC {
         return Err(Error::invalid("the spec must mount a tmpfs on /dev"));
+    }
+    let made = fstatx(dev).context("statx /dev")?;
+    let seen = inroot::open_dir(root, Path::new("/dev")).context("open /dev in rootfs")?;
+    let seen = fstatx(seen.as_fd()).context("statx /dev")?;
+    if (seen.mnt_id, seen.dev, seen.ino) != (made.mnt_id, made.dev, made.ino) {
+        return Err(Error::invalid(
+            "/dev is no longer the tmpfs mounted there: a later mount covers it \
+             (through a symlink to /dev in the rootfs?)",
+        ));
     }
     for (index, (name, major, minor)) in DEFAULT_DEVICES.into_iter().enumerate() {
         let path = PathBuf::from(format!("/dev/{name}"));
@@ -169,13 +184,13 @@ pub fn populate(root: BorrowedFd<'_>, plan: &DevPlan) -> Result<()> {
             continue;
         }
         let n = DeviceNode { index, path, typ: NodeType::Char, major, minor, mode: 0o666, uid: 0, gid: 0 };
-        populate_node(dev.as_fd(), &n, plan.userns, true)?;
+        populate_node(dev, &n, plan.userns, true)?;
     }
     for n in &plan.nodes {
-        populate_node(dev.as_fd(), n, plan.userns, false)?;
+        populate_node(dev, n, plan.userns, false)?;
     }
     for (name, target) in DEV_SYMLINKS {
-        match nix::unistd::symlinkat(target, &dev, name) {
+        match nix::unistd::symlinkat(target, dev, name) {
             Ok(()) | Err(Errno::EEXIST) => {}
             Err(e) => return Err(e).with_context(|| format!("symlink /dev/{name}")),
         }

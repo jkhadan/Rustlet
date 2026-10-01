@@ -456,13 +456,14 @@ and the common-case differential against runc with explicit differences.
 There are 21 `dv_` tests, plus userns, exec and capability coverage.
 The full run passed 227 checks (224 privileged and 3 harness units),
 and workspace unit tests passed 215. The independent review on 2026-10-01
-re-ran those gates successfully, but found an unresolved P1 in `/dev`
-population: an image symlink can redirect a later bind mount over the fresh
-`/dev` mount, and a host tmpfs bind source passes the filesystem-type check.
-Device nodes and symlinks are then created in that host directory. Both
-`/dev -> /mnt` and `/mnt -> /dev` were reproduced with disposable fixtures.
-The fix needs mount-identity verification before population and regression
-tests for both aliases; see [Chapter 08 §5](08-runtime-cves.md#5-rule-2-paths-that-change-under-you).
+re-ran those gates successfully, but found a P1 in `/dev` population: an
+image symlink could redirect a later bind mount over the fresh `/dev` mount,
+and a host tmpfs bind source passed the filesystem-type check. Device nodes
+and symlinks were then created in that host directory. Both `/dev -> /mnt` and
+`/mnt -> /dev` were reproduced with disposable fixtures. It is fixed: `/dev` is
+now populated through the fd of the tmpfs mount itself, only while the path
+`/dev` still leads to that mount, and a symlinked `/dev` is refused. Two `rr_`
+regression tests cover the aliases; see [Chapter 08 §5](08-runtime-cves.md#5-rule-2-paths-that-change-under-you).
 
 ## 10. Try it
 

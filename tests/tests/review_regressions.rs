@@ -1,5 +1,5 @@
-//! Regression tests for the code review findings (Phases 2a, 2b, 2c part
-//! 1 and 3). Each test names the failure it pins down. Run with
+//! Regression tests for the code review findings (Phases 2a, 2b, 2c and
+//! 3). Each test names the failure it pins down. Run with
 //! `cargo xtask itest -- rr_`.
 
 use std::os::unix::fs::PermissionsExt;
@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use rustlet_itests::e2e::*;
 use rustlet_itests::*;
 use rustlet_runtime::oci_spec::runtime::{
-    LinuxIdMappingBuilder, LinuxNamespaceType, PosixRlimitBuilder, PosixRlimitType, Spec,
+    LinuxDeviceBuilder, LinuxDeviceType, LinuxIdMappingBuilder, LinuxNamespaceType, PosixRlimitBuilder,
+    PosixRlimitType, Spec,
 };
 
 /// A `create` SIGKILLed after init was spawned but before it wrote the final
@@ -410,6 +411,77 @@ fn rr_idmap_accepts_the_containers_mapping_in_other_lines() {
     m.set_gid_mappings(Some(split.to_vec()));
     s.set_mounts(Some(mounts));
     assert_eq!(run(&s).ok(), "0\n");
+}
+
+// ── Phase 2c part 2 review ───────────────────────────────────────────────────
+
+/// A spec with a writable bind of a host tmpfs directory on `/mnt` and one
+/// requested device node, over a disposable rootfs in which `/dev` and
+/// `/mnt` are aliased by a symlink. Returns the rootfs and the bind source,
+/// which must stay empty.
+fn dev_alias_spec(dev_is_symlink: bool) -> (Spec, tempfile::TempDir, tempfile::TempDir) {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    if dev_is_symlink {
+        std::fs::create_dir(root.path().join("mnt")).unwrap();
+        symlink("/mnt", root.path().join("dev")).unwrap();
+    } else {
+        std::fs::create_dir(root.path().join("dev")).unwrap();
+        symlink("/dev", root.path().join("mnt")).unwrap();
+    }
+    let source = tempfile::Builder::new().prefix("rustlet-rr-dev-alias-").tempdir_in("/dev/shm").unwrap();
+    let mut s = spec(&["/does-not-exist"]);
+    s.root_mut().as_mut().unwrap().set_path(root.path().to_owned());
+    add_mount(&mut s, "/mnt", "bind", source.path().to_str().unwrap(), &["bind", "rw"]);
+    edit_linux(&mut s, |linux| {
+        let node = LinuxDeviceBuilder::default()
+            .path("/dev/rr-node")
+            .typ(LinuxDeviceType::C)
+            .major(1)
+            .minor(3)
+            .file_mode(0o640u32)
+            .uid(12u32)
+            .gid(34u32)
+            .build()
+            .unwrap();
+        linux.set_devices(Some(vec![node]));
+    });
+    set_cgroup(&mut s, "rr-dev-alias");
+    (s, root, source)
+}
+
+fn assert_untouched(source: &tempfile::TempDir) {
+    let left: Vec<_> = std::fs::read_dir(source.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert!(left.is_empty(), "/dev population wrote into the host's bind source: {left:?}");
+}
+
+/// Phase 2c part 2 review. With `/dev -> /mnt` in the image, the tmpfs for
+/// `/dev` followed the link to `/mnt`, a bind mount of a host tmpfs
+/// directory then covered it, and `/dev` was populated by path, inside the
+/// host directory (`dev::populate` only checked the filesystem type). A
+/// symlinked `/dev` is now refused, as for `/proc` and `/sys`.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn rr_dev_symlink_cannot_redirect_device_population() {
+    let (s, _root, source) = dev_alias_spec(true);
+    let mut c = Container::new(&s);
+    c.create(&[]).refused("/dev is a symlink in the rootfs");
+    c.assert_gone();
+    assert_untouched(&source);
+}
+
+/// The reverse alias, with a real `/dev`: `/mnt -> /dev` sent the bind
+/// mount for `/mnt` on top of the fresh `/dev` tmpfs. `/dev` is now
+/// populated through the fd of the tmpfs mount itself, and only while the
+/// path `/dev` still leads to that mount.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn rr_mount_through_a_symlink_cannot_cover_dev() {
+    let (s, _root, source) = dev_alias_spec(false);
+    let mut c = Container::new(&s);
+    c.create(&[]).refused("a later mount covers it");
+    c.assert_gone();
+    assert_untouched(&source);
 }
 
 /// Phase 3 review. Without a terminal, a foreground process in a user

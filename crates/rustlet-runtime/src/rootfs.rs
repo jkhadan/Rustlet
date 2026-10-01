@@ -25,8 +25,9 @@
 //!    resolve the target with `openat2(RESOLVE_IN_ROOT)`, attach with
 //!    `move_mount` onto that fd. See `inroot` for why.
 //! 4. **Populate `/dev`** ([`crate::dev::populate`]): device nodes (or, in a user
-//!    namespace, bind mounts of the host's) and the standard symlinks, only
-//!    ever inside a tmpfs.
+//!    namespace, bind mounts of the host's) and the standard symlinks, through
+//!    the fd of the tmpfs mounted there in step 3, and only while `/dev` still
+//!    leads to that very mount.
 //! 5. **Switch root** ([`pivot`]): `pivot_root(".", ".")`, then detach the
 //!    old root, which is now stacked on top of the new one.
 //! 6. **Read-only root** ([`make_root_readonly`]), if asked for.
@@ -116,10 +117,20 @@ impl HostTrees {
 pub(crate) fn setup(plan: &Plan, trees: HostTrees) -> Result<()> {
     make_private()?;
     let root = attach_rootfs(trees.rootfs)?;
-    for (m, tree) in plan.mounts.iter().zip(trees.binds) {
-        mount_entry(root.as_fd(), m, tree)?;
+    // The last mount on /dev is the tmpfs `dev::plan` insisted on. Its fd is
+    // kept, so that /dev is populated through the mount that was made, never
+    // through whatever the path `/dev` leads to afterwards.
+    let dev_index = plan.mounts.iter().rposition(|m| m.destination == Path::new("/dev"));
+    let mut dev = None;
+    for (i, (m, tree)) in plan.mounts.iter().zip(trees.binds).enumerate() {
+        let mnt = mount_entry(root.as_fd(), m, tree)?;
+        if Some(i) == dev_index {
+            dev = Some(mnt);
+        }
     }
-    crate::dev::populate(root.as_fd(), &plan.dev)?;
+    let dev = dev.ok_or_else(|| Error::invalid("the spec must mount a tmpfs on /dev"))?;
+    crate::dev::populate(root.as_fd(), dev.as_fd(), &plan.dev)?;
+    drop(dev);
     // The working directory is created (if missing) while we still hold the
     // rootfs fd; `process` chdir()s into it after the identity switch.
     inroot::mkdir_all(root.as_fd(), &plan.process.cwd, Mode::from_bits_truncate(0o755))
@@ -206,8 +217,8 @@ pub fn attach_rootfs(tree: OwnedFd) -> Result<OwnedFd> {
 
 /// Step 3: attaches one mount at its destination: a new filesystem, the
 /// parent's tree for a bind mount (`tree`), or init's copy of the host's
-/// `/sys`.
-pub(crate) fn mount_entry(root: BorrowedFd<'_>, m: &MountEntry, tree: Option<OwnedFd>) -> Result<()> {
+/// `/sys`. Returns an fd for the root of the mount, now attached.
+pub(crate) fn mount_entry(root: BorrowedFd<'_>, m: &MountEntry, tree: Option<OwnedFd>) -> Result<OwnedFd> {
     let ctx = || format!("mount {}", m.describe());
     let (mnt, is_dir) = match &m.kind {
         MountKind::Fs { fstype, source, options } => {
@@ -236,7 +247,9 @@ pub(crate) fn mount_entry(root: BorrowedFd<'_>, m: &MountEntry, tree: Option<Own
         MountKind::HostSysfs => (host_sysfs(m).with_context(ctx)?, true),
     };
     match &m.kind {
-        MountKind::Fs { fstype, .. } if matches!(fstype.as_str(), "proc" | "sysfs") => {
+        MountKind::Fs { fstype, .. }
+            if matches!(fstype.as_str(), "proc" | "sysfs") || m.destination == Path::new("/dev") =>
+        {
             refuse_symlinked_destination(root, m, fstype)?;
         }
         MountKind::HostSysfs => refuse_symlinked_destination(root, m, "sysfs")?,
@@ -253,7 +266,8 @@ pub(crate) fn mount_entry(root: BorrowedFd<'_>, m: &MountEntry, tree: Option<Own
     let target =
         inroot::ensure_mount_target(root, &m.destination, is_dir).with_context(|| format!("{}: mount point", ctx()))?;
     check_resolved_target(m, target.as_fd())?;
-    move_mount_fd(mnt.as_fd(), target.as_fd()).with_context(ctx)
+    move_mount_fd(mnt.as_fd(), target.as_fd()).with_context(ctx)?;
+    Ok(mnt)
 }
 
 /// [`MountKind::HostSysfs`]: a recursive copy of `/sys` from init's copy of
@@ -280,7 +294,9 @@ fn host_sysfs(m: &MountEntry) -> rustlet_sys::Result<OwnedFd> {
 /// if the image made `/proc` a symlink (to `/tmp/p`, say), following it
 /// would put the kernel's files somewhere else and leave the image's own
 /// `proc/` in place, and every later check on "/proc/…" would be looking at
-/// the wrong thing. runc refuses this too, with the same words.
+/// the wrong thing. runc refuses this too, with the same words. The same
+/// goes for the filesystem on `/dev`: a `/dev -> /mnt` link would put the
+/// fresh tmpfs at `/mnt`, where a later mount could cover it.
 fn refuse_symlinked_destination(root: BorrowedFd<'_>, m: &MountEntry, fstype: &str) -> Result<()> {
     let rel = m.destination.strip_prefix("/").unwrap_or(&m.destination);
     match rustlet_sys::fs::open_in_root(root, rel, OFlag::O_NOFOLLOW) {
