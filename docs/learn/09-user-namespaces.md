@@ -14,15 +14,17 @@ they are relative to a namespace. It then follows the order of events
 between `rustlet-runc` and init, and explains why the parent now opens
 the rootfs. After that come `/dev` without `mknod`, the mounts that need
 a namespace the container owns, idmapped mounts, `exec`, and what
-`create` refuses. The device filter, part 2 of Phase 2c, gets chapter 10.
+`create` refuses. The device filter, part 2 of Phase 2c, is covered in
+[chapter 10](10-ebpf-devices.md).
 
 Code: [`userns.rs`](../../crates/rustlet-runtime/src/userns.rs) (maps, checks, `become_root`),
-[`rootfs.rs`](../../crates/rustlet-runtime/src/rootfs.rs) (`HostTrees`, `attach_rootfs`, `populate_dev`, `host_sysfs`),
+[`rootfs.rs`](../../crates/rustlet-runtime/src/rootfs.rs) (`HostTrees`, `attach_rootfs`, `host_sysfs`),
+[`dev.rs`](../../crates/rustlet-runtime/src/dev.rs) (`populate`, moved out of `rootfs.rs` in part 2),
 [`create.rs`](../../crates/rustlet-runtime/src/create.rs) (`prepare_init`), [`init.rs`](../../crates/rustlet-runtime/src/init.rs),
 [`exec.rs`](../../crates/rustlet-runtime/src/exec.rs), [`sysctl.rs`](../../crates/rustlet-runtime/src/sysctl.rs),
 [`namespaces.rs`](../../crates/rustlet-runtime/src/namespaces.rs), [`sync.rs`](../../crates/rustlet-runtime/src/sync.rs), and
 [`xtask/src/rootfs.rs`](../../xtask/src/rootfs.rs) (`--remap`). Tests: [`userns.rs`](../../tests/tests/userns.rs)
-(`cargo xtask itest -- us_`, 20 tests). Design: [architecture.md §2.2](../architecture.md#22-rustlet-runtime-library--rustlet-runc-binary--the-oci-runtime)
+(`cargo xtask itest -- us_`, now 22 tests). Design: [architecture.md §2.2](../architecture.md#22-rustlet-runtime-library--rustlet-runc-binary--the-oci-runtime)
 steps 4.0, 4.3, 5.1, 5.3 and exec step 5, and [§2.2.1](../architecture.md#221-namespace-modes-translated-to-oci-namespaces-by-the-daemon).
 
 All transcripts are real runs on this host (kernel 7.0.0-34-generic). `$R`
@@ -373,7 +375,7 @@ mountinfo:
 §2 showed that `mknod` of a device fails in a user namespace, whatever the
 capabilities. A node on a filesystem mounted from inside one couldn't
 be opened anyway: the kernel marks such superblocks "no devices". So in a
-user namespace, `populate_dev` makes each default node a **bind mount of
+user namespace, `dev::populate` makes each default node a **bind mount of
 the host's**. It takes an `open_tree` of `/dev/null` from init's copy of
 the host's mount table, which is possible because this runs before the
 pivot, while `/dev` is still the host's devtmpfs. It checks that the copy
@@ -642,8 +644,9 @@ shares user namespaces, so nothing needs it.
   for the parent at the same two points, with or without a user namespace.
 - **`/dev/mqueue` shows as `nobody`** (§6).
 
-**Tests.** [`tests/tests/userns.rs`](../../tests/tests/userns.rs) has 20
-black-box tests. They cover the maps as seen inside and from the host,
+**Tests.** [`tests/tests/userns.rs`](../../tests/tests/userns.rs) had 20
+black-box tests at the part 1 milestone recorded below. They cover the
+maps as seen inside and from the host,
 the rootfs owners, unchanged caps and seccomp, and rlimits and
 `oom_score_adj` set from outside. Also: the `/dev` binds, masked and
 read-only paths, sysctls, both sysfs cases, the idmapped mount and the
@@ -660,7 +663,10 @@ running 20 tests
 test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
 ```
 
-The full suite is 203 privileged tests and 195 unit tests, and all pass.
+At that milestone the full suite passed 203 itest checks and 195 unit
+tests. Part 2 adds two `us_` tests for checked spec-device host binds and
+locally created FIFOs, bringing this file to 22 tests; current full-suite
+counts are in [architecture.md §5](../architecture.md#5-roadmap-each-phase-ends-with-a-demo-a-docslearn-chapter-and-a-walkthrough).
 
 ## 10. Try it
 

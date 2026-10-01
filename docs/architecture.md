@@ -106,8 +106,9 @@ Commands follow the OCI runtime spec: `create`, `start`, `state`, `kill`, `delet
    - user mount targets under `/proc` or `/sys`
    - joining a **user** namespace by path (§2.2.1)
    - with a new user namespace (`userns.rs`, `sysctl.rs`): maps the kernel would refuse, or that map host uid or gid 0; uid/gid 0, the process's ids or a filesystem's `uid=`/`gid=` left unmapped; no new PID namespace; mqueue, cgroup2 or sysctls in a namespace the user namespace doesn't own; `kernel.domainname`
-   - until the device filter (Phase 2c, part 2): `--device`, `CAP_MKNOD`, `--privileged`
-2. **Cgroup.** Create the cgroup at `linux.cgroupsPath`, which the daemon places inside its delegated subtree. Write the limits and open the cgroup dirfd for `CLONE_INTO_CGROUP`.
+   - device rules or `linux.devices` without `linux.cgroupsPath`; `CAP_MKNOD` in any capability set without either a device filter or a new user namespace
+   - device nodes outside `/dev`, unclean or conflicting paths, invalid types or numbers, or a default device path with different type/numbers (`dev.rs`)
+2. **Cgroup.** Create the cgroup at `linux.cgroupsPath`, which the daemon places inside its delegated subtree. Write the limits and open the cgroup dirfd for `CLONE_INTO_CGROUP`. Before `clone3`, attach the eBPF device filter through that fd, even when the spec has no device rules. Save its program id in `state.rustlet.device_filter`. The attachment belongs to the cgroup, not the runtime process; deleting the cgroup releases it, including after a failed `create`.
 3. **Sync channels.** Create a `socketpair(SOCK_SEQPACKET)` for sync messages. Create `exec.fifo` and open it `O_PATH`; the child inherits the fd because the path is unreachable after `pivot_root`.
 4. **Namespaces, in this order:**
    0. **Open the host side of every mount** (`rootfs::HostTrees`) while the parent is still only in the host's namespaces. The rootfs becomes a detached recursive copy (`open_tree(OPEN_TREE_CLONE|AT_RECURSIVE)`, with `nodev` on every mount of it), and each bind source a detached copy of its own. Init inherits the fds and only attaches them. There are three reasons. In a user namespace, init is host uid 1000000 and may not even be able to reach the bundle (a `0750` home directory). Only a detached mount can be idmapped. And each host path is resolved exactly once, by the privileged side, before any container process exists. The parent also reads its own and host init's mount-namespace ids here, for step 5.1.
@@ -125,7 +126,7 @@ Commands follow the OCI runtime spec: `create`, `start`, `state`, `kill`, `delet
       - `/proc`: a new instance via `fsopen("proc")`.
       - `/sys`: sysfs read-only. Under a user namespace with a host-owned netns (only the netns's owner may mount sysfs), use a read-only rbind of the host `/sys` instead. Init makes the rbind itself, so the kernel keeps its submounts locked.
       - `/sys/fs/cgroup`: cgroup2 **read-only** unless privileged. With `nsdelegate` (as on this host), the kernel already refuses writes to the namespace root's own limit files (`EPERM`). The read-only mount is a second barrier, and it covers hosts mounted without `nsdelegate`, where container root could raise its own `memory.max` or `pids.max`.
-      - `/dev`: a tmpfs holding null, zero, full, random, urandom and tty (bind-mounted from the host when inside a user namespace, since mknod is denied there).
+      - `/dev`: a tmpfs holding null, zero, full, random, urandom and tty, plus validated `linux.devices` entries (`dev.rs`). Rootful nodes are made with `mknodat` → `fchownat` → `fchmodat` (default mode `0666`, uid/gid 0; chmod last restores requested setid bits). In a user namespace, character/block nodes are bind-mounted from the same host `/dev` path after type and device-number checks; their mode/owner come from the host. FIFOs are created inside, with mapped owners. Defaults and filter rules share one table.
       - `/dev/pts`: devpts `newinstance`, `ptmxmode=0666`, `mode=0620`, `gid=5`. Under a user namespace, the `gid=` (or any filesystem's `uid=`/`gid=`) must be mapped, or `create` refuses.
       - Symlinks: `/dev/ptmx → pts/ptmx`, `/dev/fd`, `/dev/std{in,out,err}`.
       - `/dev/shm`: its own tmpfs, or a bind of container X's shm for `--ipc=container:X`.
@@ -157,7 +158,7 @@ Commands follow the OCI runtime spec: `create`, `start`, `state`, `kill`, `delet
    13. If `noNewPrivileges` is true: `PR_SET_NO_NEW_PRIVS`, then load seccomp **last**, so only `execve` still needs to be allowed. (As built, NNP is set here, after the gate, rather than before it; the effect is the same.)
    14. `execve`, with `args` resolved through the container's `PATH`.
 6. **`exec`** (as built in Phase 2b):
-   1. Lock the container; it must be `created` or `running` (`paused` only with `--ignore-paused`). The process is built from the copy of `config.json` kept in the state directory at `create`, plus the CLI's overrides. With a user namespace, the process's ids must be mapped in it.
+   1. Lock the container; it must be `created` or `running` (`paused` only with `--ignore-paused`). The process is built from the copy of `config.json` kept in the state directory at `create`, plus the CLI's overrides. With a user namespace, the process's ids must be mapped in it. `CAP_MKNOD` from `--cap` or a process JSON needs the saved device-filter id or a new user namespace; an old state with no id does not imply a filter exists.
    2. Open the container's cgroup dirfd (or, without `cgroupsPath`, the cgroup init was born in), and a pidfd for init.
    3. Compare init's namespace inodes with the caller's. The **parent** joins only the PID namespace with `setns(pidfd, …)`. That only affects children, so `rustlet-runc` itself never enters the container's filesystem. (A time namespace switches the caller's own clocks too, so the child joins that one.) Never pass `CLONE_NEWUSER` for the caller's own user namespace; that returns EINVAL.
    4. `clone3(CLONE_INTO_CGROUP | CLONE_PIDFD)`: the child is born in the PID namespace and the cgroup. The lock is released as soon as the child is placed.
@@ -182,10 +183,14 @@ Commands follow the OCI runtime spec: `create`, `start`, `state`, `kill`, `delet
 - **Per-netns sysctls:** the daemon writes `ip_unprivileged_port_start=0` and `ping_group_range=0 2147483647` into every netns it pins, as Docker does. `ping` then works without NET_RAW, and ports below 1024 work under a user namespace.
 - **Devices:**
   - The rootfs is mounted `nodev`; layer unpack skips device nodes.
-  - **Phase 2c** adds a hand-assembled **eBPF cgroup device filter** (`BPF_PROG_TYPE_CGROUP_DEVICE`) attached with `BPF_PROG_ATTACH` + `BPF_F_ALLOW_MULTI`. That attachment lives with the cgroup, whereas a `BPF_LINK_CREATE` link would disappear when `rustlet-runc` exits.
-  - Only once the filter exists are `--device`, `--cap-add MKNOD` and `--privileged` allowed, because the `/dev` tmpfs isn't `nodev`.
+  - Every container cgroup gets a hand-assembled **eBPF cgroup device filter** (`BPF_PROG_TYPE_CGROUP_DEVICE`), before init exists. `BPF_PROG_ATTACH` + `BPF_F_ALLOW_MULTI` makes the attachment live with the cgroup; a transient `BPF_LINK_CREATE` link would disappear when `rustlet-runc` exits.
+  - **Default deny; last matching rule wins per access bit.** The allowed mask starts at zero; an allow ORs bits in, a deny clears them, and every requested bit must remain allowed. Thus denying `w` also denies `rw`. Rule order: spec `linux.resources.devices` → defaults → an implicit `m` allow for each rootful character/block spec node. Defaults come last relative to spec rules, so a spec deny cannot remove them. A node entry permits its creation, not its use: `r`/`w` still need a rule.
+  - **Defaults, all `rwm`:** character devices `1:3`, `1:5`, `1:7`, `1:8`, `1:9`, `5:0`, `5:2`, `136:*` (null, zero, full, random, urandom, tty, ptmx, pty slaves). No blanket character/block `m` permission, no tun `10:200`, no console `5:1`: `/dev/console` is a bind of a pty slave.
+  - Device rules and nodes need `linux.cgroupsPath`. `CAP_MKNOD` needs a filter **or a new user namespace** (device mknod is denied there independently). `spec::add_host_device` translates a host node into a node entry and an access rule; the demo exposes `--device PATH[:rwm]`.
+  - **Boundary:** the filter depends on confinement to the cgroup. The ordinary setup uses a cgroup namespace, `nsdelegate` and a read-only cgroupfs. Host-root capabilities sufficient to change BPF attachments (notably `CAP_SYS_ADMIN`/`CAP_BPF`) defeat this boundary; a privileged-shaped spec is not a promise of isolation from host root.
+  - **Daemon unit:** never set `DevicePolicy=` or `DeviceAllow=` on `rustletd.service`. Ancestor `ALLOW_MULTI` programs also run, and every applicable program must allow; a container's allow-all cannot override systemd's ancestor deny.
 - **Seccomp:** hand-written compiler from OCI `linux.seccomp` to classic BPF (§2.2.4). Ships Docker's default profile (Apache-2.0, vendored in `profiles/`). The daemon resolves the profile's capability-conditional `includes`/`excludes` rules. **Known difference from Docker:** Docker allows i386/x32 binaries; Rustlets initially kills any non-x86_64 arch (i386 support is a stretch goal).
-- **`--privileged` (Phase 2c or later):** all caps, no seccomp, no masked paths, host devices, `/sys` and cgroupfs read-write.
+- **Privileged-shaped specs (Phase 2c):** `spec::privileged` and `cargo xtask demo --privileged`: all supported caps in bounding/effective/permitted (not inheritable/ambient), no seccomp or masked/read-only paths, host devices, allow-all filter, `/sys` and cgroupfs read-write. NNP is left to the caller (the demo retains it). Host enumeration skips symlinks and submounts, including `/dev/pts`; this is development tooling, not yet a daemon/CLI feature.
 
 #### 2.2.3 cgroups v2
 - **Location:** under the daemon's **systemd-delegated subtree**, not directly under `/sys/fs/cgroup`. systemd owns the root, and `io`/`cpuset` aren't enabled there on this host.
@@ -447,14 +452,32 @@ Host resources, all prefixed so they're easy to find and remove:
 
 ## 5. Roadmap. Each phase ends with a demo, a `docs/learn` chapter, and a walkthrough.
 
-**Status (2026-09-29):** Phases 0, 1, 2a and 2b are done (chapter 08 is still to be written). Phase 2c part 1, user namespaces, is built; part 2, the device filter, is still to come. `cargo xtask itest` runs 203 privileged tests, and all pass; `cargo test --workspace` runs 195 unit tests. `cargo xtask demo --memory 64M --pids 64` gives an interactive shell with job control and cgroup limits, and `cargo xtask demo --userns` gives one in a user namespace.
+**Status (2026-09-30):** Phases 0, 1, 2a and 2b are done. Phase 2c parts 1 (user namespaces) and 2 (device filtering) are built. `cargo xtask itest` passes all 227 checks (224 privileged tests plus 3 harness unit tests); `cargo test --workspace` passes 215 unit tests. `cargo xtask demo` supports job control, cgroup limits, `--userns`, `--device PATH[:rwm]` and `--privileged`. Part 2's independent review is reserved for a fresh session. Chapter 08 remains untracked and awaits its own citation-check/commit session; it is not part of Phase 2c's work.
+
+Phase 2c part 2, as built (eBPF devices; [chapter 10](learn/10-ebpf-devices.md)):
+- **Compiler:** `cgroups/devices/` validates rules, optimises resets/no-ops, emits eBPF and checks it with a small interpreter. A separate reference evaluator implements the per-bit rule semantics (§2.2.2). Defaults compile to 89 instructions; a privileged allow-all to `w0 = 1; exit` (2).
+- **Verifier cost:** comparing the persistent major/minor registers directly made path states accumulate quadratically (895,269 processed instructions at 1,000 rules). Scratch-register comparisons let paths merge again: the recorded 2,000-rule case is 20,012 instructions and 46,008 processed. `MAX_RULES = 2000` applies **after optimisation**: up to three conditional comparisons per rule must fit the verifier's 8,192 pending-branch limit, as well as its instruction-processing budget.
+- **Attachment/lifetime:** `create` loads and attaches before `clone3`, saves the program id, then closes the program fd. Default devices, foreground TTYs and `exec -t` work under the filter. `exec` is born in the same filtered cgroup. Tests query the one `ALLOW_MULTI` program and poll its id to `ENOENT` after delete or failed create (release is asynchronous).
+- **Nodes:** `dev.rs` owns the shared defaults and `/dev` population. `linux.devices` supports character (`c` or `u`), block (`b`) and FIFO (`p`) entries, nested paths, mode and ownership. Default paths may be replaced only with the same type/numbers. Non-default existing paths, duplicates, ancestor/descendant node conflicts, symlink/console paths and mount conflicts are refused. `/dev` must be a tmpfs. User-namespace character/block nodes bind the checked host node and retain host metadata; FIFOs are created locally with mapped owners.
+- **Capability gate:** `CAP_MKNOD` in any of the five sets needs a filter or a new user namespace, both at create and exec; rules/nodes always need a cgroup. The milestone is now real: `mknod b 8 0` gets `EPERM` despite effective `CAP_MKNOD`, while `mknod c 1 3` succeeds.
+- **Tooling:** `cargo xtask devices [--bundle DIR] [--disasm]` lists rule origins, optimiser results and the program; `--bundle` uses the actual runtime plan, including node/mount validation and implicit creation rules. `spec::{add_host_device,host_devices,privileged}` builds device/privileged-shaped specs, exercised by `xtask demo`. User-namespace `add_host_device` requires the same host/container path.
+- **Deliberate differences from runc 1.3.4:**
+  - no default `c *:* m`, `b *:* m` or tun access;
+  - ordered, per-bit decisions, including a partial deny against an `rw` request; wildcard allows can have later holes;
+  - type `a` rules must be exactly wildcard numbers plus full `rwm`; out-of-range numbers and negatives other than wildcard `-1` are refused;
+  - no implicit cgroup when `cgroupsPath` is absent: nodes/rules are refused, as is `CAP_MKNOD` unless a new user namespace makes device creation impossible;
+  - device paths must be clean and strictly under `/dev`, with the conflicts above refused;
+  - FIFOs in a user namespace are created rather than bound from the host.
+
+  Shared behaviour: defaults follow spec rules, default nodes are replaced by path, absent metadata means `0666`/uid 0/gid 0, `u` means character, user-namespace devices use host binds, and empty access is refused. `df_devices_match_runc` asserts the common node metadata/access results and explicitly checks the default and partial-deny differences.
+- **Tests:** 21 `dv_` tests, two added `us_` tests, updated capability/exec refusal tests and the device differential test. Random programs agree with the reference evaluator and the real kernel; largest-program and verifier-cost tests load successfully. Full suite, fmt, clippy and unit tests pass; device, privileged and privileged-userns demos run. Host mountinfo remains 24 lines. **Independent review still pending.**
 
 Phase 2c part 1, as built (user namespaces; chapter 09):
 - **Maps:** a new user namespace comes from `linux.uidMappings`/`gidMappings` (`userns.rs`). The remap range is `0 1000000 65536` (`spec::REMAP_HOST_ID`, `REMAP_SIZE`), so container root is host uid 1000000. The parent writes the maps through the `IdMapper` trait (`DirectIdMapper` now, `newuidmap` in Phase 8).
 - **The parent opens the host side of every mount** (`rootfs::HostTrees`, §2.2 step 4.0): the rootfs and each bind source, as detached `open_tree` copies. Init attaches the rootfs tree on top of `/` and pivots into it. This is done for every container, not only those with a user namespace, so there is one code path.
 - **The parent's part** (step 4.3): the maps and idmaps before the first `Proceed`, after which init's first act is `become_root`; rlimits and `oom_score_adj` when init asks for them (`SetLimits`), once its setup as root is done.
 - **In a user namespace:**
-  - `/dev` nodes are bind mounts of the host's, since `mknod` is never allowed there.
+  - `/dev` character/block nodes are bind mounts of the host's, since device `mknod` is never allowed there (part 2 adds locally created FIFOs).
   - `/sys` is a locked, read-only rbind of the host's when the network namespace isn't the container's own.
   - `exec` joins the user namespace in its one `setns` and becomes root before joining the session keyring.
 - **Refused at `create`:**
@@ -468,7 +491,7 @@ Phase 2c part 1, as built (user namespaces; chapter 09):
 - **Deliberate difference from runc:** maps that put host uid or gid 0 in the container are refused, although OCI allows them. Container root would be host root to everything that checks ids rather than capabilities.
 - **Mounts** accept `idmap`/`ridmap`, with the container's own mappings only.
 - **Tooling:** `cargo xtask rootfs --remap` builds `bundles/alpine-remap`, a copy of the Alpine rootfs owned by host ids 1000000 and up. The chown needs root, so it re-runs itself under sudo. `cargo xtask demo --userns` runs a shell in it.
-- **Tests:** `tests/tests/userns.rs` has 20 privileged tests (`cargo xtask itest -- us_`). All 203 itests and 195 unit tests pass.
+- **Tests:** the part 1 milestone passed 203 itest checks and 195 unit tests, with 20 `us_` tests. Part 2 adds checked spec-device binds and FIFO metadata, bringing `us_` to 22.
 - **Known nit:** `/dev/mqueue` shows as owned by `nobody` (65534) inside. `clone3` creates the IPC namespace, and with it the mqueue superblock, while init is still host uid 0, which the namespace doesn't map.
 - **Independent review:** no high-severity findings. The medium one: the parent set init's rlimits before init had mounted anything, so init's own setup ran under the container's limits (`RLIMIT_NOFILE` 8 failed with `EMFILE`). Init now asks for them once its setup as root is done. Also fixed:
   - proc/sysfs flags and maps the kernel refuses, which used to fail halfway through init, are refused at `create`;
@@ -477,10 +500,9 @@ Phase 2c part 1, as built (user namespaces; chapter 09):
   - a read-only-paths test that couldn't fail now checks mountinfo.
 
   `tests/tests/review_regressions.rs` covers each finding, and CI's itest job now builds the remap rootfs.
-- **Still to come:** part 2, the eBPF device filter (`--device`, `CAP_MKNOD`, `--privileged`, chapter 10).
 
 Phase 2b, as built:
-- **Defaults** (`rustlet-runc spec`, the dev bundle): Podman's 11 capabilities (`CapBnd` = `800405fb`, inheritable and ambient empty), `noNewPrivileges`, Docker's seccomp profile resolved for those capabilities, and Docker's masked and read-only paths. A spec without `process.capabilities` is refused; `CAP_MKNOD` waits for Phase 2c.
+- **Defaults** (`rustlet-runc spec`, the dev bundle): Podman's 11 capabilities (`CapBnd` = `800405fb`, inheritable and ambient empty), `noNewPrivileges`, Docker's seccomp profile resolved for those capabilities, and Docker's masked and read-only paths. A spec without `process.capabilities` is refused; Phase 2c now gates `CAP_MKNOD` on a filter or new user namespace (§2.2.2).
 - **Seccomp:** a hand-written compiler (`crates/rustlet-runtime/src/seccomp/`). It does an arch and x32 check, an ENOSYS stub above the profile's highest syscall, and a binary search over ranges of syscall numbers into shared rule blocks, with 64-bit arguments compared as hi/lo halves. Docker's profile compiles to 140 instructions, at most 7 comparisons deep. It is tested with an interpreter plus a reference evaluator, and in real filtered child processes. `cargo xtask seccomp --disasm` prints the program.
 - **exec:** the parent joins only the container's PID namespace; the child joins the rest through init's pidfd (see §2.2 step 6). `-t`, `-d`, `--pid-file`, `-u`, `-e`, `--cwd`, `--cap`, `--no-new-privs`, `--preserve-fds`, `--cgroup` and `--ignore-paused` are supported.
 - **Also:**
@@ -541,6 +563,8 @@ Differential check: the same bundle under `runc` 1.3.4 gives identical namespace
 ## 6. Verification strategy
 - **Unit tests (as your user, with nextest):**
   - the seccomp compiler (forked child loads the filter; assert EPERM, ENOSYS for unknown-new syscalls, and a kill on a wrong arch)
+  - the eBPF device compiler: random rule lists checked against the reference evaluator and interpreter, optimisation equivalence, validation and disassembly snapshots
+  - device-node path/mount conflicts and the create/exec `CAP_MKNOD` gate
   - disassembly snapshots
   - OCI → cgroup v2 mapping, including shares → weight
   - image config → spec (insta)
@@ -560,7 +584,11 @@ Differential check: the same bundle under `runc` 1.3.4 gives identical namespace
   - masked paths unreadable
   - read-only rootfs
   - `uid_map` under remap
-  - mknod denied by the eBPF filter
+  - the eBPF verifier accepts random and maximum-size device programs, with linear processing cost
+  - block/other-character mknod denied despite `CAP_MKNOD`; defaults remain usable, including TTY run and exec
+  - per-bit read/write/combined access, node metadata, nested paths and checked user-namespace host binds/FIFOs
+  - exactly one attached device program, freed after delete and failed create; exec inherits filtering
+  - privileged rootful/userns specs inspected with read-only probes, never sysfs writes
   - the host mount table is unchanged after each test (diff of `/proc/self/mountinfo`)
 - **Differential testing:** the same bundle under `runc` and `rustlet-runc`, with a probe binary that dumps namespaces, caps, mounts, cgroup, and rlimits. The outputs are diffed.
 - **Conformance:** youki's `contest` suite run against `rustlet-runc`. It is maintained and cgroup-v2-aware; OCI `runtime-tools` is stale and cgroup-v1-oriented.

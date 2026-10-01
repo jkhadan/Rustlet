@@ -32,14 +32,17 @@
 //! seccomp, masked paths, sysctls, the sealed self re-exec) and `exec`;
 //! Phase 2c user namespaces (`userns`), for which the parent now opens the
 //! rootfs and bind sources itself (`rootfs::HostTrees`) and sets init's
-//! rlimits, before letting init proceed.
+//! rlimits, before letting init proceed; and device filtering
+//! (`cgroups::devices`), attached before clone3 to every container cgroup.
+//! `dev` validates and populates OCI device nodes; `spec` translates host
+//! devices and builds privileged-shaped specs for development tooling.
 //!
 //! ## What this build does *not* do yet
 //!
 //! Features that `config.json` can ask for but this build can't enforce are
-//! rejected with the phase that adds them (see `plan::reject_unsupported`):
-//! device rules, `CAP_MKNOD` and `--privileged` wait for the eBPF device
-//! filter, the second half of Phase 2c.
+//! rejected explicitly (see `plan::reject_unsupported`). Device rules and
+//! nodes need `linux.cgroupsPath`; `CAP_MKNOD` needs a device filter or a
+//! new user namespace, at create and exec alike.
 
 #![forbid(unsafe_code)]
 
