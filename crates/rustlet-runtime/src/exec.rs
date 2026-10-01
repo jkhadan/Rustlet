@@ -167,13 +167,23 @@ pub fn exec(opts: &ExecOptions) -> Result<i32> {
     let spec = dir.load_config()?;
     let process = exec_process(&spec, &opts.process, opts.tty)?;
     let plan = plan::process_plan(&process)?;
+    let mut new_user = false;
     if let Some(linux) = spec.linux() {
         // With a user namespace, the process's ids must exist in it.
         let ns = namespaces::plan(linux.namespaces().as_deref().unwrap_or_default())?;
+        new_user = ns.new_user();
         if let Some(maps) = userns::plan(linux, &ns)? {
             maps.check_process(&plan)?;
         }
     }
+    plan::check_mknod(&plan.caps, state.rustlet.device_filter.is_some(), new_user).map_err(|e| {
+        let source = match &opts.process {
+            ExecProcess::Json(_) => "exec process.json",
+            ExecProcess::Args(a) if !a.caps.is_empty() => "exec --cap",
+            ExecProcess::Args(_) => "exec process",
+        };
+        Error::container(format!("{source}: {e}"))
+    })?;
     let seccomp = spec.linux().as_ref().and_then(|l| l.seccomp().as_ref()).map(seccomp::compile).transpose()?;
     if plan.terminal && opts.detach && opts.console_socket.is_none() {
         return Err(Error::container("exec -t -d needs --console-socket (somewhere to send the terminal)"));
@@ -402,13 +412,6 @@ fn add_caps(caps: &mut LinuxCapabilities, names: &[String]) -> Result<()> {
                 .map_err(|_| Error::container(format!("exec --cap {n}: unknown capability")))
         })
         .collect::<Result<_>>()?;
-    // Checked again with the rest of the process by `CapsPlan::from_spec`,
-    // but then the message would blame config.json.
-    if parsed.contains(&Capability::Mknod) {
-        return Err(Error::container(
-            "exec --cap MKNOD: not supported until Phase 2c (the eBPF device filter that makes it safe)",
-        ));
-    }
     let add = |set: &Option<Capabilities>, which: &[Capability]| -> Option<Capabilities> {
         let mut s = set.clone().unwrap_or_default();
         s.extend(which.iter().copied());

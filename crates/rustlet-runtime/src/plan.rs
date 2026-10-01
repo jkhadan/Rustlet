@@ -162,6 +162,8 @@ impl Plan {
         if let Some(u) = &userns {
             u.check_process(&process)?;
         }
+        let cgroup = cgroup_plan(linux)?;
+        check_mknod(&process.caps, cgroup.is_some(), namespaces.new_user())?;
         Ok(Plan {
             id: id.to_owned(),
             root,
@@ -171,7 +173,7 @@ impl Plan {
             hostname,
             domainname,
             process,
-            cgroup: cgroup_plan(linux)?,
+            cgroup,
             paths,
             sysctls,
             seccomp,
@@ -202,6 +204,7 @@ fn resolve_root(path: &Path) -> Result<PathBuf> {
 /// asking for `memory.limit` without saying where the cgroup goes is an
 /// error, not a silently unlimited container.
 fn cgroup_plan(linux: &oci_spec::runtime::Linux) -> Result<Option<CgroupPlan>> {
+    let rules = linux.resources().as_ref().and_then(|r| r.devices().as_deref()).unwrap_or_default();
     let settings = match linux.resources() {
         Some(r) => cgroups::settings_for(r)?,
         None => Vec::new(),
@@ -209,13 +212,31 @@ fn cgroup_plan(linux: &oci_spec::runtime::Linux) -> Result<Option<CgroupPlan>> {
     match linux.cgroups_path() {
         Some(p) => {
             let path = CgroupPath::parse(&p.to_string_lossy())?;
-            Ok(Some(CgroupPlan { path, settings, devices: DeviceFilter::build(&[], &[])? }))
+            Ok(Some(CgroupPlan { path, settings, devices: DeviceFilter::build(rules, &[])? }))
+        }
+        None if !rules.is_empty() => {
+            Err(Error::invalid("linux.resources.devices needs a device filter: set linux.cgroupsPath"))
         }
         None if settings.is_empty() => Ok(None),
         None => Err(Error::invalid(
             "linux.resources sets limits but linux.cgroupsPath is missing: limits need a cgroup to live in",
         )),
     }
+}
+
+/// MKNOD may occur in any capability set, including bounding alone. It
+/// needs a cgroup device filter, unless device mknod is already denied by
+/// the kernel because the process is in a new user namespace.
+pub(crate) fn check_mknod(caps: &CapsPlan, filtered: bool, new_user: bool) -> Result<()> {
+    let has_mknod = [caps.bounding, caps.effective, caps.permitted, caps.inheritable, caps.ambient]
+        .iter()
+        .any(|set| set.contains(rustlet_sys::caps::Cap::MKNOD));
+    if has_mknod && !filtered && !new_user {
+        return Err(Error::invalid(
+            "CAP_MKNOD needs a device filter: set linux.cgroupsPath (or use a new user namespace)",
+        ));
+    }
+    Ok(())
 }
 
 /// Validates `process` (also used by `exec` for the process it starts).
@@ -322,11 +343,6 @@ fn reject_unsupported(spec: &Spec) -> Result<()> {
     need(spec.solaris().is_some() || spec.windows().is_some() || spec.vm().is_some(), "non-Linux sections", "never");
 
     if let Some(l) = spec.linux() {
-        if let Some(r) = l.resources() {
-            // Without the eBPF device filter, device rules would be silently
-            // unenforced. (Limits are handled by `cgroups::settings_for`.)
-            need(some_vec(r.devices()), "linux.resources.devices", "Phase 2c");
-        }
         need(some_vec(l.devices()), "linux.devices", "Phase 2c");
         need(
             l.rootfs_propagation().as_deref().is_some_and(|p| !matches!(p, "" | "private" | "rprivate")),
@@ -408,13 +424,23 @@ mod tests {
     #[test]
     fn unsupported_features_name_their_phase() {
         let mut spec = default_spec();
+        spec.set_hooks(Some(Default::default()));
         let linux = spec.linux_mut().as_mut().unwrap();
-        linux.set_devices(Some(vec![Default::default()]));
         linux.set_intel_rdt(Some(Default::default()));
         let (_d, b) = bundle_with(spec);
         let msg = Plan::new("x", &b).unwrap_err().to_string();
-        assert!(msg.contains("linux.devices (Phase 2c)"), "{msg}");
+        assert!(msg.contains("hooks (not planned)"), "{msg}");
         assert!(msg.contains("linux.intelRdt (not planned)"), "{msg}");
+    }
+
+    #[test]
+    fn mknod_needs_a_filter_or_a_new_user_namespace() {
+        let mut caps = process_plan(default_spec().process().as_ref().unwrap()).unwrap().caps;
+        check_mknod(&caps, false, false).unwrap();
+        caps.bounding.insert(rustlet_sys::caps::Cap::MKNOD);
+        assert!(check_mknod(&caps, false, false).unwrap_err().to_string().contains("set linux.cgroupsPath"));
+        check_mknod(&caps, true, false).unwrap();
+        check_mknod(&caps, false, true).unwrap();
     }
 
     fn remapped() -> Spec {

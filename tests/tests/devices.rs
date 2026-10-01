@@ -16,6 +16,9 @@ use nix::sys::stat::{Mode, SFlag, makedev, mknod};
 use rustlet_itests::e2e::*;
 use rustlet_itests::*;
 use rustlet_runtime::cgroups::devices::{Access, DevType, DeviceFilter, MAX_RULES, Origin, Request, Rule, decide};
+use rustlet_runtime::oci_spec::runtime::{
+    LinuxDeviceCgroup, LinuxDeviceCgroupBuilder, LinuxDeviceType, LinuxResourcesBuilder, Spec,
+};
 use rustlet_sys::bpf;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -417,4 +420,116 @@ fn dv_exec_process_is_filtered() {
         out.ok(),
         "access:/mnt/fuse:r EPERM\naccess:/mnt/fuse:w EPERM\naccess:/mnt/fuse:rw EPERM\naccess:/dev/null:rw ok\n"
     );
+}
+
+// ── OCI device rules and CAP_MKNOD ──────────────────────────────────────────
+
+fn device_rule(
+    allow: bool,
+    typ: LinuxDeviceType,
+    major: Option<i64>,
+    minor: Option<i64>,
+    access: &str,
+) -> LinuxDeviceCgroup {
+    let mut b = LinuxDeviceCgroupBuilder::default().allow(allow).typ(typ).access(access);
+    if let Some(n) = major {
+        b = b.major(n);
+    }
+    if let Some(n) = minor {
+        b = b.minor(n);
+    }
+    b.build().unwrap()
+}
+
+fn set_device_rules(s: &mut Spec, rules: Vec<LinuxDeviceCgroup>) {
+    let linux = s.linux_mut().as_mut().unwrap();
+    let mut resources = linux.resources().clone().unwrap_or_else(|| LinuxResourcesBuilder::default().build().unwrap());
+    resources.set_devices(Some(rules));
+    linux.set_resources(Some(resources));
+}
+
+fn give_mknod(s: &mut Spec) {
+    let caps: Vec<&str> = DEFAULT_CAPS.iter().copied().chain(["CAP_MKNOD"]).collect();
+    set_capabilities(s, CapSets::root(&caps));
+    // Isolate the device-cgroup decision from the default seccomp profile,
+    // which was resolved for capabilities without MKNOD.
+    edit_linux(s, |l| {
+        l.set_seccomp(None);
+    });
+}
+
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dv_mknod_of_a_block_device_is_denied_even_with_cap_mknod() {
+    let (mut s, _dir) =
+        device_probe_spec("grep CapEff /proc/self/status; $PROBE mknod:/dev/disk:b:8:0 mknod:/dev/n:c:1:3");
+    give_mknod(&mut s);
+    set_cgroup(&mut s, "dv-milestone");
+    let out = run(&s);
+    let stdout = out.ok();
+    assert_ne!(status_hex(stdout, "CapEff") & (1 << 27), 0);
+    assert!(stdout.contains("mknod:/dev/disk:b:8:0 EPERM\nmknod:/dev/n:c:1:3 ok\n"), "{out:#?}");
+}
+
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dv_mknod_of_other_char_devices_is_denied() {
+    let (mut s, _dir) = device_probe_spec("$PROBE mknod:/dev/fuse:c:10:229 mknod:/dev/tun:c:10:200");
+    give_mknod(&mut s);
+    set_cgroup(&mut s, "dv-other-char");
+    assert_eq!(run(&s).ok(), "mknod:/dev/fuse:c:10:229 EPERM\nmknod:/dev/tun:c:10:200 EPERM\n");
+}
+
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dv_deny_wins_per_bit() {
+    let (mut s, nodes) = device_probe_spec(
+        "$PROBE access:/mnt/fuse:r access:/mnt/fuse:w access:/mnt/fuse:rw access:/mnt/fuse:f access:/dev/null:rw",
+    );
+    mknod(&nodes.path().join("fuse"), SFlag::S_IFCHR, Mode::from_bits_truncate(0o666), makedev(10, 229)).unwrap();
+    set_device_rules(
+        &mut s,
+        vec![
+            device_rule(true, LinuxDeviceType::C, Some(10), Some(229), "rw"),
+            device_rule(false, LinuxDeviceType::C, Some(10), Some(229), "w"),
+            // Built-in defaults are appended last, so this deny is overridden.
+            device_rule(false, LinuxDeviceType::C, Some(1), Some(3), "rwm"),
+        ],
+    );
+    set_cgroup(&mut s, "dv-per-bit");
+    assert_eq!(
+        run(&s).ok(),
+        "access:/mnt/fuse:r ok\naccess:/mnt/fuse:w EPERM\naccess:/mnt/fuse:rw EPERM\naccess:/mnt/fuse:f ok\naccess:/dev/null:rw ok\n"
+    );
+}
+
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dv_device_rules_need_a_cgroup_and_bad_rules_are_refused() {
+    let mut s = spec(&["true"]);
+    set_device_rules(&mut s, vec![device_rule(true, LinuxDeviceType::C, Some(10), Some(229), "rw")]);
+    let mut c = Container::new(&s);
+    c.create(&[]).refused("set linux.cgroupsPath");
+    c.assert_gone();
+    set_cgroup(&mut s, "dv-bad-rules");
+    for rule in [
+        device_rule(true, LinuxDeviceType::A, Some(1), None, "rwm"),
+        device_rule(true, LinuxDeviceType::C, Some(-2), None, "r"),
+        device_rule(true, LinuxDeviceType::C, Some(4096), None, "r"),
+        device_rule(true, LinuxDeviceType::C, Some(10), Some(229), ""),
+        device_rule(true, LinuxDeviceType::C, Some(10), Some(229), "x"),
+    ] {
+        set_device_rules(&mut s, vec![rule]);
+        let mut c = Container::new(&s);
+        c.create(&[]).refused("linux.resources.devices[0]");
+        c.assert_gone();
+    }
+}
+
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dv_mknod_in_a_user_namespace_needs_no_filter() {
+    let mut s = userns_sh("if mknod /dev/n c 1 3 2>/dev/null; then exit 1; fi; echo denied");
+    give_mknod(&mut s);
+    assert_eq!(run(&s).ok(), "denied\n");
 }

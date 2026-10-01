@@ -48,7 +48,7 @@ use oci_spec::runtime::{Capabilities, LinuxCapabilities};
 use rustlet_sys::Errno;
 use rustlet_sys::caps::{self, Cap, CapSet, CapState};
 
-use crate::error::{Context, Error, Result, Unsupported};
+use crate::error::{Context, Error, Result};
 
 /// The default set: Podman's (Docker's without `MKNOD`, `NET_RAW` and
 /// `AUDIT_WRITE`). Enough for package managers, `su` and servers on low
@@ -119,16 +119,6 @@ impl CapsPlan {
     }
 
     fn validate(&self) -> Result<()> {
-        let all = CapSet(self.bounding.0 | self.effective.0 | self.permitted.0 | self.inheritable.0 | self.ambient.0);
-        if all.contains(Cap::MKNOD) {
-            // The container's /dev is a tmpfs without `nodev`: with MKNOD,
-            // root in there could create /dev/sda and read the host's disk.
-            // The eBPF device filter (Phase 2c) is what makes it safe.
-            return Err(Error::Unsupported(vec![Unsupported {
-                field: "process.capabilities: CAP_MKNOD".into(),
-                when: "Phase 2c",
-            }]));
-        }
         let subset = |a: CapSet, b: CapSet| a.0 & !b.0 == 0;
         let names = |s: CapSet| s.names().join(", ");
         if !subset(self.effective, self.permitted) {
@@ -260,7 +250,7 @@ mod tests {
         let i_not_b = build(&[], &[], &[], &[Kill], &[]);
         assert!(CapsPlan::from_spec(&i_not_b, Cap(40)).unwrap_err().to_string().contains("inheritable"));
         let mknod = build(&[Mknod], &[], &[], &[], &[]);
-        assert!(matches!(CapsPlan::from_spec(&mknod, Cap(40)).unwrap_err(), Error::Unsupported(_)));
+        assert!(CapsPlan::from_spec(&mknod, Cap(40)).unwrap().bounding.contains(Cap::MKNOD));
     }
 
     #[test]

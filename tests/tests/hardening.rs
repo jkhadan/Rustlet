@@ -229,19 +229,27 @@ fn hd_missing_capabilities_are_refused() {
     assert_refused(s, "hd-no-caps", "capabilities");
 }
 
-/// CAP_MKNOD needs the eBPF device filter, which arrives in Phase 2c.
+/// CAP_MKNOD needs a filter, including when only in the bounding set.
 #[test]
 #[ignore = "needs root: run with `cargo xtask itest`"]
-fn hd_cap_mknod_is_refused_until_phase_2c() {
+fn hd_cap_mknod_needs_a_device_filter() {
     let with_mknod: Vec<&str> = DEFAULT_CAPS.iter().copied().chain(["CAP_MKNOD"]).collect();
     // Only in the bounding set (where it could later be raised from).
     let mut s = spec(&["true"]);
     set_capabilities(&mut s, CapSets { bounding: &with_mknod, ..CapSets::root(&DEFAULT_CAPS) });
-    assert_refused(s, "hd-mknod-bounding", "Phase 2c");
+    let out = run(&s);
+    assert_eq!(out.status, 1, "{out:#?}");
+    assert!(out.stderr.contains("linux.cgroupsPath"), "{out:#?}");
+    set_cgroup(&mut s, "hd-mknod-bounding");
+    run(&s).ok();
     // In every set.
     let mut s = spec(&["true"]);
     set_capabilities(&mut s, CapSets::all(&with_mknod));
-    assert_refused(s, "hd-mknod-all", "Phase 2c");
+    let out = run(&s);
+    assert_eq!(out.status, 1, "{out:#?}");
+    assert!(out.stderr.contains("linux.cgroupsPath"), "{out:#?}");
+    set_cgroup(&mut s, "hd-mknod-all");
+    run(&s).ok();
 }
 
 /// Capability sets that the kernel's rules make impossible are refused up

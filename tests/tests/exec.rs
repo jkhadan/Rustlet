@@ -414,14 +414,20 @@ fn ex_cap_never_adds_inheritable_so_a_non_root_user_gains_nothing() {
     assert!(!text.lines().any(|l| l == "listening"), "{out:#?}");
 }
 
-/// `--cap CAP_MKNOD` would sidestep the create-time refusal (no device
-/// filter before Phase 2c), so exec refuses it too.
+/// `--cap CAP_MKNOD` is allowed only with a device filter or a userns.
 #[test]
 #[ignore = "needs root: run with `cargo xtask itest`"]
-fn ex_cap_mknod_is_refused() {
+fn ex_cap_mknod_needs_a_device_filter() {
     let c = sleeper("ex-cap-mknod");
-    c.exec_in(&["--cap", "CAP_MKNOD"], &["true"]).refused("Phase 2c");
+    let out = c.exec_in(&["--cap", "CAP_MKNOD"], &["sh", "-c", "grep CapEff /proc/self/status"]);
+    assert_ne!(status_hex(out.ok(), "CapEff") & (1 << 27), 0);
     assert_eq!(c.status(), "running");
+    let c = Container::started(&spec(&["sleep", "3600"]));
+    let out = c.exec_in(&["--cap", "CAP_MKNOD"], &["true"]);
+    out.refused("linux.cgroupsPath");
+    assert!(out.stderr.contains("exec --cap"), "{out:#?}");
+    let c = Container::started(&userns_spec(&["sleep", "3600"]));
+    c.exec_in(&["--cap", "CAP_MKNOD"], &["true"]).ok();
 }
 
 /// `--no-new-privs` sets the flag for a container that doesn't have it.
@@ -483,10 +489,10 @@ fn ex_process_json_without_capabilities_gains_nothing() {
     }
 }
 
-/// CAP_MKNOD in a process.json is refused like `--cap CAP_MKNOD`.
+/// CAP_MKNOD in a process.json uses the same gate as `--cap`.
 #[test]
 #[ignore = "needs root: run with `cargo xtask itest`"]
-fn ex_process_json_with_cap_mknod_is_refused() {
+fn ex_process_json_with_cap_mknod_needs_a_device_filter() {
     let c = sleeper("ex-process-json-mknod");
     let mut s = spec(&["true"]);
     let caps: Vec<&str> = DEFAULT_CAPS.iter().copied().chain(["CAP_MKNOD"]).collect();
@@ -494,7 +500,11 @@ fn ex_process_json_with_cap_mknod_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("process.json");
     std::fs::write(&file, serde_json::to_string_pretty(s.process().as_ref().unwrap()).unwrap()).unwrap();
-    c.exec_in(&["-p", file.to_str().unwrap()], &[]).refused("Phase 2c");
+    c.exec_in(&["-p", file.to_str().unwrap()], &[]).ok();
+    let c = Container::started(&spec(&["sleep", "3600"]));
+    let out = c.exec_in(&["-p", file.to_str().unwrap()], &[]);
+    out.refused("linux.cgroupsPath");
+    assert!(out.stderr.contains("process.json"), "{out:#?}");
 }
 
 // ── detached, and the container's state ──────────────────────────────────────

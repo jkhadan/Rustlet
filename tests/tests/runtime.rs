@@ -10,7 +10,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use rustlet_itests::*;
 use rustlet_runtime::oci_spec::runtime::{
-    LinuxDeviceBuilder, LinuxDeviceType, LinuxNamespaceBuilder, LinuxNamespaceType, PosixRlimitBuilder, PosixRlimitType,
+    LinuxNamespaceBuilder, LinuxNamespaceType, PosixRlimitBuilder, PosixRlimitType,
 };
 
 // ── the Phase 1 milestone: PID 1, own hostname, own mount table ─────────────
@@ -344,13 +344,11 @@ fn setup_failures_are_not_mistaken_for_command_not_found() {
 #[test]
 #[ignore = "needs root: run with `cargo xtask itest`"]
 fn unsupported_features_are_refused_up_front() {
-    // Device nodes need the eBPF device filter first (Phase 2c).
     let mut s = spec(&["true"]);
-    let dev = LinuxDeviceBuilder::default().path("/dev/sda").typ(LinuxDeviceType::B).major(8).minor(0).build().unwrap();
-    s.linux_mut().as_mut().unwrap().set_devices(Some(vec![dev]));
+    s.set_hooks(Some(Default::default()));
     let out = run(&s);
     assert_eq!(out.status, 1);
-    assert!(out.stderr.contains("linux.devices (Phase 2c)"), "{}", out.stderr);
+    assert!(out.stderr.contains("hooks (not planned)"), "{}", out.stderr);
 }
 
 #[test]
