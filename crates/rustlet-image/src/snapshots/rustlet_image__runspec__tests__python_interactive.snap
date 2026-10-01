@@ -53,6 +53,9 @@ expression: decided(&spec)
     ],
     "terminal": true,
     "user": {
+      "additionalGids": [
+        0
+      ],
       "gid": 0,
       "uid": 0
     }

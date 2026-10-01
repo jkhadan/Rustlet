@@ -29,7 +29,7 @@
 //!    kept: the digest is of the bytes, and re-serialized JSON would hash
 //!    differently. If the reference pins a digest (`name@sha256:…`), the
 //!    bytes must hash to it. An index is narrowed to one manifest by
-//!    platform ([`manifest::select_platform`]), which is then fetched by
+//!    platform ([`crate::manifest::select_platform`]), which is then fetched by
 //!    digest and must have exactly the digest and size the index gave.
 //! 2. **Config.** It is small and says what the image is, so it comes
 //!    first: it must parse, list one diff ID per layer and be for this

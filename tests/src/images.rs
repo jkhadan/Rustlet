@@ -19,7 +19,13 @@ pub struct TestStore {
     pub dir: tempfile::TempDir,
     pub store: Store,
     mounts_before: Vec<(String, String, String)>,
+    /// Image tests take turns: unlike the others, they mount overlays on
+    /// the host itself, and a test's "host mount table unchanged" check
+    /// must not see its neighbour's.
+    _turn: std::sync::MutexGuard<'static, ()>,
 }
+
+static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl Default for TestStore {
     fn default() -> Self {
@@ -30,9 +36,12 @@ impl Default for TestStore {
 impl TestStore {
     pub fn new() -> TestStore {
         assert!(nix::unistd::geteuid().is_root(), "{}", crate::PRIVILEGED);
+        // A test that failed while holding the lock poisons it; the next
+        // one may still go.
+        let turn = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::Builder::new().prefix("rustlet-itest-store-").tempdir().unwrap();
         let store = Store::open(dir.path().join("store")).unwrap();
-        TestStore { dir, store, mounts_before: host_mounts() }
+        TestStore { dir, store, mounts_before: host_mounts(), _turn: turn }
     }
 
     /// Imports `layers` (uncompressed tars) with `cmd`/`env`/`user`.

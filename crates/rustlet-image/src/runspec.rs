@@ -56,15 +56,15 @@
 //!
 //! **User.** [`user::resolve`] against the image's own files, read through
 //! the mounted rootfs. `process.user` gets the uid, the gid and the
-//! supplementary gids (`additionalGids`, omitted when there are none);
-//! `umask` stays unset, so the runtime's 0022 applies. Docker also puts the
-//! primary gid first in `additionalGids` (its fix for CVE-2022-36109): a
-//! process that runs a setgid program would otherwise leave its primary
-//! group behind, and with it whatever a group-deny permission (`rw----r--`:
-//! anyone but the group may read) kept from it. The default spec's
-//! `noNewPrivileges` already stops `execve` from changing ids, so the list
-//! is left as the image's files make it; whatever turns NNP off should add
-//! the gid the way Docker does.
+//! supplementary gids, **the primary gid first** (`additionalGids`); `umask`
+//! stays unset, so the runtime's 0022 applies. Putting the primary gid in
+//! the supplementary list is what a login does (`initgroups(3)`), and what
+//! Docker, Podman and containerd do since CVE-2022-36109: a process that
+//! runs a setgid program would otherwise leave its primary group behind,
+//! and with it whatever a group-deny permission (`rw----r--`: anyone but
+//! the group may read) kept from it. The default spec's `noNewPrivileges`
+//! already stops `execve` from changing ids; this keeps the list right
+//! whatever the spec's NNP setting.
 //!
 //! **Root.** `root.path` is the mounted overlay, as an absolute path (the
 //! runtime would read a relative one against the bundle directory, not the
@@ -183,7 +183,9 @@ pub fn build_with_user(image: &Image, rootfs: &Path, user: &ResolvedUser, option
     let mut process_user = User::default();
     process_user.set_uid(user.uid);
     process_user.set_gid(user.gid);
-    process_user.set_additional_gids((!user.additional_gids.is_empty()).then(|| user.additional_gids.clone()));
+    let mut gids = vec![user.gid];
+    gids.extend(user.additional_gids.iter().copied().filter(|&g| g != user.gid));
+    process_user.set_additional_gids(Some(gids));
     process.set_user(process_user);
 
     let mut root = Root::default();
@@ -779,11 +781,11 @@ mod tests {
             spec.process().as_ref().unwrap().user().clone()
         };
         let web = user_for(&RunOptions::default());
-        assert_eq!((web.uid(), web.gid(), web.additional_gids().clone()), (101, 101, Some(vec![4])));
+        assert_eq!((web.uid(), web.gid(), web.additional_gids().clone()), (101, 101, Some(vec![101, 4])));
         let empty = RunOptions { user: Some(String::new()), ..RunOptions::default() };
         assert_eq!(user_for(&empty), web, "an empty -u is no -u");
         let root = user_for(&RunOptions { user: Some("root".into()), ..RunOptions::default() });
-        assert_eq!((root.uid(), root.gid(), root.additional_gids().clone()), (0, 0, None));
+        assert_eq!((root.uid(), root.gid(), root.additional_gids().clone()), (0, 0, Some(vec![0])));
         let ghost = build(&image, dir.path(), &RunOptions { user: Some("ghost".into()), ..RunOptions::default() });
         assert!(matches!(ghost, Err(Error::Invalid(m)) if m.contains("\"ghost\"")));
         // And the namespaces of a remapped run include a user namespace.

@@ -71,7 +71,8 @@ impl ImageRef {
         self.inner.digest().map(|d| Digest::parse(d).expect("checked in parse"))
     }
 
-    /// The same repository, pinned to `digest` (keeping the tag, if any).
+    /// The same repository, pinned to `digest` (any tag is dropped: a
+    /// digest says everything a tag could).
     pub fn with_digest(&self, digest: &Digest) -> ImageRef {
         ImageRef { inner: self.inner.clone_with_digest(digest.to_string()) }
     }

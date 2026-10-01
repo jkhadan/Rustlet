@@ -78,7 +78,7 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsFd, BorrowedFd};
 
 use nix::fcntl::OFlag;
 use nix::sys::stat::Mode;
@@ -257,20 +257,25 @@ pub fn resolve(rootfs: BorrowedFd<'_>, spec: Option<&str>) -> Result<ResolvedUse
 /// Reads `path` (relative to the image's root) if it is a regular file of
 /// at most [`MAX_FILE_BYTES`]; a missing file reads as empty.
 fn read_image_file(rootfs: BorrowedFd<'_>, path: &str) -> Result<String> {
-    let flags = OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_NOCTTY;
     let in_root = ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS;
-    let fd = match openat2(Some(rootfs), path, flags, Mode::empty(), in_root) {
+    // Found as an O_PATH handle first, which opens nothing: a device node
+    // there must not have its driver's open() called just to be refused.
+    // (The container rootfs is mounted nodev as well.)
+    let handle = match openat2(Some(rootfs), path, OFlag::O_PATH, Mode::empty(), in_root) {
         Ok(fd) => fd,
         // No such file, a dangling symlink, or an `etc` that isn't a
         // directory: no file, as in an image built `FROM scratch`.
         Err(Errno::ENOENT | Errno::ENOTDIR) => return Ok(String::new()),
         Err(e) => return Err(e).with_context(|| format!("open the image's /{path}")),
     };
-    let file = File::from(fd);
-    let meta = file.metadata().with_context(|| format!("stat the image's /{path}"))?;
-    if !meta.is_file() {
+    let st = rustlet_sys::fs::fstatx(handle.as_fd()).with_context(|| format!("stat the image's /{path}"))?;
+    if st.file_type() != libc::S_IFREG {
         return Err(Error::invalid(format!("the image's /{path} is not a regular file")));
     }
+    // Then opened for reading through the handle, so it is the same inode.
+    let fd = rustlet_sys::fs::reopen(handle.as_fd(), OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_NOCTTY)
+        .with_context(|| format!("open the image's /{path}"))?;
+    let file = File::from(fd);
     let mut bytes = Vec::new();
     file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes).with_context(|| format!("read the image's /{path}"))?;
     if bytes.len() as u64 > MAX_FILE_BYTES {
