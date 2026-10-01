@@ -4,6 +4,7 @@
 //! run with `rustlet-runc`. No registry: pulls are unit-tested against a fake
 //! one in `rustlet-image`. Run with `cargo xtask itest -- im_`.
 
+use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 
@@ -221,12 +222,27 @@ fn im_digest_mismatches_leave_no_snapshot() {
     let e = s.store.snapshots().ensure(content, &bad, &mut |_| {}).unwrap_err();
     assert!(matches!(&e, Error::DigestMismatch { what, .. } if what.contains("diff ID")), "{e}");
 
-    // A blob changed on disk after it was verified.
+    // A blob replaced on disk after it was verified, by one that still
+    // decompresses to the very same tar (gzip isn't canonical): the diff ID
+    // matches, and only the blob digest can tell.
     let blob = content.blob_path(&image.layers[0].blob);
-    let mut bytes = std::fs::read(&blob).unwrap();
-    let n = bytes.len();
-    bytes[n - 9] ^= 0xff; // inside gzip's CRC trailer: still decompresses
-    std::fs::write(&blob, &bytes).unwrap();
+    let original = std::fs::read(&blob).unwrap();
+    let mut tar = Vec::new();
+    flate2::read::GzDecoder::new(&original[..]).read_to_end(&mut tar).unwrap();
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+    gz.write_all(&tar).unwrap();
+    let recompressed = gz.finish().unwrap();
+    assert_ne!(recompressed, original);
+    std::fs::write(&blob, &recompressed).unwrap();
+    let e = s.store.snapshots().ensure(content, &image, &mut |_| {}).unwrap_err();
+    assert!(matches!(&e, Error::DigestMismatch { what, .. } if what.contains("blob digest")), "{e}");
+
+    // One that no longer decompresses (the deflate stream's last byte, just
+    // before gzip's 8-byte trailer): refused while reading it.
+    let mut corrupt = original;
+    let n = corrupt.len();
+    corrupt[n - 9] ^= 0xff;
+    std::fs::write(&blob, &corrupt).unwrap();
     let e = s.store.snapshots().ensure(content, &image, &mut |_| {}).unwrap_err();
     assert!(matches!(e, Error::DigestMismatch { .. } | Error::Io { .. }), "{e}");
 

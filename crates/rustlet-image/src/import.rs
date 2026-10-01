@@ -13,7 +13,7 @@
 //! 4. the **name** points at the manifest in `index.json`.
 //!
 //! Tests use it to build images in a few lines; `cargo xtask image-run
-//! --import` makes one from the Alpine minirootfs for offline use.
+//! --local-alpine` makes one from the Alpine minirootfs for offline use.
 
 use std::io::Write;
 

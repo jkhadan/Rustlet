@@ -139,8 +139,10 @@ impl PipeRelay {
         if self.pending.is_empty() { PollTimeout::NONE } else { PollTimeout::ZERO }
     }
 
-    /// Moves whatever is ready. `Ok(false)` once the process has closed both
-    /// its stdout and stderr.
+    /// Moves whatever is ready. `Ok(false)` once nothing is left to move:
+    /// the process has closed its stdout and stderr, and our input has
+    /// ended and been delivered (or the process closed its stdin). Closed
+    /// outputs alone aren't the end: the process may still be reading.
     pub fn pump(&mut self, revents: &[PollFlags]) -> Result<bool> {
         let mut events = revents.iter().copied();
         let mut next =
@@ -168,7 +170,7 @@ impl PipeRelay {
             // Delivered everything: closing our end is the process's EOF.
             self.to_process = None;
         }
-        Ok(self.from_stdout.is_some() || self.from_stderr.is_some())
+        Ok(self.from_stdout.is_some() || self.from_stderr.is_some() || self.to_process.is_some())
     }
 
     /// After the process exited: copies what its pipes still hold, without
@@ -314,18 +316,24 @@ mod tests {
         (relay, in_w, out_r, err_r, child)
     }
 
+    /// One poll (20 ms at most) and one pump, as `supervise` does them;
+    /// what `pump` returned.
+    fn pump_once(relay: &mut PipeRelay) -> bool {
+        let fds = relay.fds();
+        let mut pfds: Vec<PollFd<'_>> = fds.iter().map(|f| PollFd::new(*f, PollFlags::POLLIN)).collect();
+        poll(&mut pfds, PollTimeout::from(20u8)).unwrap();
+        let revents: Vec<PollFlags> = pfds.iter().map(|p| p.revents().unwrap_or(PollFlags::empty())).collect();
+        drop(pfds);
+        drop(fds);
+        relay.pump(&revents).unwrap()
+    }
+
     fn pump_until(relay: &mut PipeRelay, mut done: impl FnMut(&PipeRelay) -> bool) {
         for _ in 0..1000 {
             if done(relay) {
                 return;
             }
-            let fds = relay.fds();
-            let mut pfds: Vec<PollFd<'_>> = fds.iter().map(|f| PollFd::new(*f, PollFlags::POLLIN)).collect();
-            poll(&mut pfds, PollTimeout::from(20u8)).unwrap();
-            let revents: Vec<PollFlags> = pfds.iter().map(|p| p.revents().unwrap_or(PollFlags::empty())).collect();
-            drop(pfds);
-            drop(fds);
-            relay.pump(&revents).unwrap();
+            pump_once(relay);
         }
         panic!("relay didn't get there");
     }
@@ -375,6 +383,28 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5));
         assert!(!relay.pending.is_empty(), "input waits for the process, it isn't dropped");
         drop(child);
+    }
+
+    #[test]
+    fn input_still_flows_after_the_outputs_close() {
+        let (mut relay, in_w, _out_r, _err_r, child) = relay();
+        let ContainerStdio { stdin, stdout, stderr } = child;
+        // The process closes both outputs first (`exec >log 2>&1`)…
+        drop((stdout, stderr));
+        pump_until(&mut relay, |r| r.from_stdout.is_none() && r.from_stderr.is_none());
+        assert!(pump_once(&mut relay), "the relay gave up while input could still come");
+        // …and input that only arrives now still gets there, then EOF.
+        nix::unistd::write(&in_w, b"late").unwrap();
+        drop(in_w);
+        let mut pumps = 0;
+        while pump_once(&mut relay) {
+            pumps += 1;
+            assert!(pumps < 1000, "the relay never finished");
+        }
+        let mut buf = [0u8; 16];
+        let n = nix::unistd::read(&stdin, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"late");
+        assert_eq!(nix::unistd::read(&stdin, &mut buf).unwrap(), 0, "EOF after the input");
     }
 
     #[test]

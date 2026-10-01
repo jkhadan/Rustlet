@@ -298,7 +298,13 @@ impl<'a> Unpacker<'a> {
         self.report.entries += 1;
         let raw = entry.path_bytes().into_owned();
         let shown = String::from_utf8_lossy(&raw).into_owned();
-        let kind = entry.header().entry_type();
+        let mut kind = entry.header().entry_type();
+        // An old-style (V7) archive's directory: typeflag NUL, which the tar
+        // crate reads as a regular file, and a name ending in `/`. Go's
+        // archive/tar (Docker's) reads it as a directory, as GNU tar does.
+        if entry.header().as_old().linkflag[0] == 0 && raw.ends_with(b"/") {
+            kind = EntryType::Directory;
+        }
         if matches!(kind, EntryType::XGlobalHeader) {
             self.report.skipped_other.push(shown);
             return Ok(());
@@ -592,8 +598,10 @@ impl<'a> Unpacker<'a> {
     }
 
     /// `linkat(fd, "", dir, name, AT_EMPTY_PATH)`: link the inode we hold.
-    /// That needs `CAP_DAC_READ_SEARCH`; without it (unprivileged tests) the
-    /// fd's magic link names the same inode.
+    /// The kernel allows that with `CAP_DAC_READ_SEARCH` and, in recent
+    /// kernels, for an fd the caller opened itself; where an unprivileged
+    /// caller (the unit tests) gets `ENOENT`, the fd's magic link names the
+    /// same inode.
     fn link_fd(&self, src: BorrowedFd<'_>, dir: BorrowedFd<'_>, name: &OsStr) -> rustlet_sys::Result<()> {
         match nix::unistd::linkat(src, "", dir, name, AtFlags::AT_EMPTY_PATH) {
             Err(Errno::ENOENT) if !self.privileged => {
@@ -668,9 +676,10 @@ impl<'a> Unpacker<'a> {
         Ok(())
     }
 
-    /// Directory times, last.
+    /// Directory times, last, in archive order: a directory listed twice
+    /// ends up with the later entry's times, as with its other metadata.
     fn finish(&mut self) -> Result<()> {
-        for (rel, atime, mtime) in self.dir_times.iter().rev() {
+        for (rel, atime, mtime) in &self.dir_times {
             let p = if rel.as_os_str().is_empty() { Path::new(".") } else { rel.as_path() };
             match openat2(
                 Some(self.root),

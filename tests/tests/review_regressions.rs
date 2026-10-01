@@ -1,5 +1,5 @@
-//! Regression tests for the code review findings (Phases 2a, 2b and 2c
-//! part 1). Each test names the failure it pins down. Run with
+//! Regression tests for the code review findings (Phases 2a, 2b, 2c part
+//! 1 and 3). Each test names the failure it pins down. Run with
 //! `cargo xtask itest -- rr_`.
 
 use std::os::unix::fs::PermissionsExt;
@@ -410,4 +410,46 @@ fn rr_idmap_accepts_the_containers_mapping_in_other_lines() {
     m.set_gid_mappings(Some(split.to_vec()));
     s.set_mounts(Some(mounts));
     assert_eq!(run(&s).ok(), "0\n");
+}
+
+/// Phase 3 review. Without a terminal, a foreground process in a user
+/// namespace gets stdio pipes that `rustlet-runc` relays. One that closes
+/// its stdout and stderr and only then gets input must still receive it,
+/// and then EOF. The relay used to stop altogether once both outputs had
+/// ended, leaving the process blocked on its stdin forever.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn rr_userns_input_outlives_closed_output() {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    let script =
+        "echo closing; exec >/dev/null 2>&1; read line; [ \"$line\" = hello ] || exit 1; cat >/dev/null; exit 7";
+    let bundle = TestBundle::new(&userns_sh(script));
+    let mut cmd = bundle.command();
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let (mut stdin, mut stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+    // Input only once the container has closed both outputs: after its
+    // last line, and a moment for the relay to see both pipes end.
+    let mut said = Vec::new();
+    let mut byte = [0u8; 1];
+    while !said.ends_with(b"closing\n") {
+        stdout.read_exact(&mut byte).expect("the container exited before closing its outputs");
+        said.push(byte[0]);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    stdin.write_all(b"hello\nmore input\n").unwrap();
+    drop(stdin);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the container never got its input (or its EOF)");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(7));
 }

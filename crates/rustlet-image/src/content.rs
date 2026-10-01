@@ -382,7 +382,8 @@ impl Ingest {
 
     /// Verifies size and digest, makes the data durable, and moves the blob
     /// into place. If the store meanwhile got the same blob from elsewhere
-    /// (a concurrent pull), the copy is simply dropped: same digest, same bytes.
+    /// (a concurrent pull), the rename replaces it with the same bytes: same
+    /// digest, same content, and a reader of the old file keeps reading it.
     pub fn commit(mut self) -> Result<()> {
         if let Some(size) = self.size
             && self.written != size

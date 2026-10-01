@@ -443,3 +443,40 @@ fn clean_names() {
     assert_eq!(pax_time("1.123456789999"), Some(TimeSpec::new(1, 123_456_789)));
     assert_eq!(pax_time("x"), None);
 }
+
+#[test]
+fn a_directory_listed_twice_keeps_the_later_entrys_metadata() {
+    // Mode and times both come from the second entry, as with tar.
+    let mut out = tar::Builder::new(Vec::new());
+    for (mtime, mode) in [(1_000_000_000u64, 0o700u32), (MTIME, 0o751)] {
+        let mut h = Archive::header(b"d/", EntryType::Directory, 0, mode);
+        h.set_mtime(mtime);
+        h.set_cksum();
+        out.append(&h, io::empty()).unwrap();
+    }
+    let u = unpack_tar(&out.into_inner().unwrap());
+    u.report();
+    let m = std::fs::metadata(u.path("d")).unwrap();
+    assert_eq!((m.permissions().mode() & 0o7777, m.mtime()), (0o751, MTIME as i64));
+}
+
+#[test]
+fn old_style_directories_are_directories() {
+    // A V7 archive has no directory type: a directory is a regular-file
+    // entry (`\0`) whose name ends in `/`.
+    let mut out = tar::Builder::new(Vec::new());
+    for (name, data) in [(&b"d/"[..], &b""[..]), (b"d/f", b"x")] {
+        let mut h = tar::Header::new_old();
+        h.as_old_mut().name[..name.len()].copy_from_slice(name);
+        h.as_old_mut().linkflag[0] = 0;
+        h.set_size(data.len() as u64);
+        h.set_mode(0o755);
+        h.set_mtime(MTIME);
+        h.set_cksum();
+        out.append(&h, data).unwrap();
+    }
+    let u = unpack_tar(&out.into_inner().unwrap());
+    u.report();
+    assert!(u.path("d").is_dir());
+    assert_eq!(u.read("d/f"), "x");
+}
