@@ -272,11 +272,13 @@ pub(crate) fn process_plan(p: &Process) -> Result<ProcessPlan> {
         return Err(Error::invalid(format!("process.cwd {} must be absolute", p.cwd().display())));
     }
     let user = p.user();
-    // (uid_t)-1 and (gid_t)-1 mean "leave this id unchanged" to setresuid,
-    // setresgid and setgroups' neighbours: a process told to run as one of
-    // them would quietly keep running as root.
+    // (uid_t)-1 and (gid_t)-1 mean "leave this id unchanged" to setresuid
+    // and setresgid: a process told to run as one of them would quietly keep
+    // running as root.
     let unchanged = u32::MAX;
-    if user.uid() == unchanged || user.gid() == unchanged || user.additional_gids().iter().flatten().any(|&g| g == unchanged)
+    if user.uid() == unchanged
+        || user.gid() == unchanged
+        || user.additional_gids().iter().flatten().any(|&g| g == unchanged)
     {
         return Err(Error::invalid(format!(
             "process.user: {unchanged} is (uid_t)-1, which the kernel reads as \"don't change the id\""
