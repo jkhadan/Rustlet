@@ -29,7 +29,9 @@ pub(crate) fn run(extra: &[String]) -> anyhow::Result<()> {
     if !dev_dir().join("bundles/alpine-remap/rootfs/bin/busybox").exists() {
         bail!("the user-namespace test rootfs is missing: run `cargo xtask rootfs --remap` first");
     }
-    run_cmd(cargo().args(["build", "--quiet", "-p", "rustlet-runc"]))?;
+    // The binaries the tests run: the runtime, the shim (and, from Phase 4,
+    // the daemon and CLI tests start them too).
+    run_cmd(cargo().args(["build", "--quiet", "-p", "rustlet-runc", "-p", "rustlet-shim"]))?;
     let binaries = test_binaries()?;
 
     let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
@@ -55,12 +57,16 @@ pub(crate) fn run(extra: &[String]) -> anyhow::Result<()> {
         }
     }
     // Each test binary uses its own `--root` (/run/rustlet/itest-<pid>);
-    // remove the ones that ended up empty. (A failed run leaves its
+    // remove the ones that ended up empty (shim tests leave an empty
+    // `shims/` in them). (A failed run leaves its
     // containers there on purpose, for inspection; `scripts/cleanup.sh`
     // removes everything.)
     let _ = Command::new("sudo")
         .args(["/usr/bin/systemd-run", "--scope", "--quiet", "--collect", "--"])
-        .args(["/usr/bin/find", "/run/rustlet", "-maxdepth", "1", "-name", "itest-*", "-empty", "-delete"])
+        // Depth-first (implied by -delete): an empty `itest-*/shims` goes
+        // first, then its parent if that left it empty.
+        .args(["/usr/bin/find", "/run/rustlet", "-mindepth", "1", "-maxdepth", "2", "-path", "/run/rustlet/itest-*"])
+        .args(["-empty", "-delete"])
         .status();
     if !failed.is_empty() {
         bail!("integration tests failed in: {failed:?}");

@@ -32,6 +32,7 @@
 #![forbid(unsafe_code)]
 
 pub mod client;
+pub mod logfile;
 pub mod paths;
 pub mod protocol;
 

@@ -119,7 +119,10 @@ pub enum Request {
     /// Let init `execve` the program (`rustlet-runc start`). → `Ok`.
     Start,
     /// `rustlet-runc kill [--all] <id> <signal>`. → `Ok`.
-    Kill { signal: i32, all: bool },
+    Kill {
+        signal: i32,
+        all: bool,
+    },
     /// `rustlet-runc pause` / `resume`. → `Ok`.
     Pause,
     Resume,
@@ -128,21 +131,28 @@ pub enum Request {
     Wait,
     /// Stream the container's output from now on, and with `stdin` take
     /// input for it. → `Ok`, then the stream.
-    Attach { stdin: bool },
+    Attach {
+        stdin: bool,
+    },
     /// Run another process (`rustlet-runc exec -d`), reaped by the shim.
     /// → [`Response::Started`], then the stream.
     Exec(ExecRequest),
     /// The terminal size: of the container's terminal as a request of its
     /// own or in an attach stream, of the exec's in an exec stream. → `Ok`
     /// (only as a request of its own).
-    Resize { rows: u16, cols: u16 },
+    Resize {
+        rows: u16,
+        cols: u16,
+    },
     /// In a stream: the client's input ended. The process's stdin is closed
     /// if it is an exec's, or the container's when it was started with
     /// `stdin_once`.
     CloseStdin,
     /// `rustlet-runc delete [--force]`: remove the runtime's state and
     /// cgroup once the container has exited (`force`: kill it first). → `Ok`.
-    Delete { force: bool },
+    Delete {
+        force: bool,
+    },
     /// Exit the shim once the reply is sent. → `Ok`.
     Shutdown,
 }
@@ -179,12 +189,17 @@ pub struct ExecUser {
 pub enum Response {
     Ok,
     /// An exec runs, with this host PID.
-    Started { pid: i32 },
+    Started {
+        pid: i32,
+    },
     Status(ShimStatus),
     Exited(ExitStatus),
     /// `exit_code`: `rustlet-runc`'s, when it failed (127: the program
     /// wasn't found, 126: it couldn't be executed).
-    Error { message: String, exit_code: Option<i32> },
+    Error {
+        message: String,
+        exit_code: Option<i32>,
+    },
 }
 
 /// How a process ended.

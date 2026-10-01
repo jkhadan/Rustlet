@@ -21,6 +21,9 @@ doc = false
 rustlet-runtime.workspace = true
 rustlet-image.workspace = true
 rustlet-sys.workspace = true
+rustlet-shim.workspace = true
+rustlet-spec.workspace = true
+tokio.workspace = true
 # Building image layers in the image tests.
 tar.workspace = true
 flate2.workspace = true

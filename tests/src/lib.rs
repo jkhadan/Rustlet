@@ -13,6 +13,7 @@
 
 pub mod e2e;
 pub mod images;
+pub mod shim;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -45,6 +46,14 @@ pub fn runc_binary() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
     let p = exe.parent().and_then(Path::parent).unwrap().join("rustlet-runc");
     assert!(p.exists(), "missing {}: run via `cargo xtask itest` (it builds rustlet-runc)", p.display());
+    p
+}
+
+/// `target/debug/<name>`: a binary of this workspace, built by `cargo xtask
+/// itest` next to `rustlet-runc`.
+pub fn workspace_binary(name: &str) -> PathBuf {
+    let p = runc_binary().with_file_name(name);
+    assert!(p.exists(), "missing {}: run via `cargo xtask itest` (it builds it)", p.display());
     p
 }
 

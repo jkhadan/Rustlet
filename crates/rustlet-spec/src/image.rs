@@ -179,9 +179,15 @@ mod tests {
             r#"{"status":"downloading","kind":"layer","digest":"sha256:ab","current":1,"total":2}"#,
         )
         .unwrap();
-        assert_eq!(e, PullEvent::Downloading { kind: BlobKind::Layer, digest: "sha256:ab".into(), current: 1, total: 2 });
+        assert_eq!(
+            e,
+            PullEvent::Downloading { kind: BlobKind::Layer, digest: "sha256:ab".into(), current: 1, total: 2 }
+        );
         let ready = PullEvent::Ready { reference: "r".into(), manifest: "sha256:cd".into() };
-        assert_eq!(serde_json::to_string(&ready).unwrap(), r#"{"status":"ready","reference":"r","manifest":"sha256:cd"}"#);
+        assert_eq!(
+            serde_json::to_string(&ready).unwrap(),
+            r#"{"status":"ready","reference":"r","manifest":"sha256:cd"}"#
+        );
     }
 
     #[test]

@@ -1940,10 +1940,13 @@ dependencies = [
  "nix",
  "rustlet-image",
  "rustlet-runtime",
+ "rustlet-shim",
+ "rustlet-spec",
  "rustlet-sys",
  "serde_json",
  "tar",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
