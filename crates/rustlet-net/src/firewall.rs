@@ -11,9 +11,9 @@
 //! | chain | rules |
 //! |---|---|
 //! | `raw_prerouting` | a packet for a container subnet (IPv4 or IPv6) that didn't arrive on that subnet's bridge is dropped before anything else sees it (the LAN can't route to `10.89.0.0/24` through us; containers of another network can't either). As Docker 28 does. |
-//! | `prerouting` (nat) | published ports: a packet for a local address (or the given host address) and the port is rewritten to the container's address and port, unless it came from the port's own bridge (hairpin traffic goes to the proxy instead); IPv4 to its IPv4 address and, on a network with IPv6, IPv6 to its IPv6 address |
+//! | `prerouting` (nat) | published ports: a packet for a local address (or the given host address) and the port is rewritten to the container's address and port, from wherever it came, a container on the same bridge included (hairpin traffic, see `postrouting`); IPv4 to its IPv4 address and, on a network with IPv6, IPv6 to its IPv6 address |
 //! | `output` (nat) | the same for the host's own connections to one of its non-loopback addresses (`127.0.0.1` and `::1` are the proxy's: DNAT to a container would need `route_localnet`) |
-//! | `postrouting` (nat) | traffic from a subnet that leaves through anything but its bridge is masqueraded, IPv6 as well as IPv4 (except internal networks) |
+//! | `postrouting` (nat) | traffic from a subnet that leaves through anything but its bridge is masqueraded, IPv6 as well as IPv4 (except internal networks); and so is DNATed traffic that goes back out of the bridge it came from (hairpin: a container reaching a port published on its own network through the host's address), to the bridge's address, so that the server's answer comes back through the host and is un-NATed on the way |
 //! | `forward` (filter) | to a bridge: only replies (`ct state established,related`), published ports (`ct status dnat`) and traffic within the bridge; from a bridge: out (internal networks: nowhere); and for each family whose forwarding Rustlets turned on, nothing else of that family is forwarded at all |
 //!
 //! The whole table is replaced in one `nft -j -f -` transaction: "add" (so
@@ -80,8 +80,6 @@ pub struct PortRule {
     /// IPv4 or IPv6: the rule is of that family.
     pub container_ip: IpAddr,
     pub container_port: u16,
-    /// The bridge the container is on.
-    pub bridge: String,
     /// For the rule's comment: whose port it is.
     pub container: String,
 }
@@ -149,11 +147,7 @@ impl Ruleset {
                 Some(ip) => family.addr_match("daddr", "==", json!(ip.to_string())),
                 None => fib_local(),
             };
-            cmds.push(rule(
-                "prerouting",
-                vec![family.only(), ifname("iifname", "!=", &p.bridge), local(), dport.clone(), to()],
-                what.clone(),
-            ));
+            cmds.push(rule("prerouting", vec![family.only(), local(), dport.clone(), to()], what.clone()));
             let mut out = vec![family.only(), local()];
             if p.host_ip.is_none() {
                 out.push(family.addr_match("daddr", "!=", family.loopback()));
@@ -168,11 +162,29 @@ impl Ruleset {
                     "postrouting",
                     vec![
                         family.only(),
-                        family.addr_match("saddr", "==", net),
+                        family.addr_match("saddr", "==", net.clone()),
                         ifname("oifname", "!=", &n.bridge),
                         json!({"masquerade": null}),
                     ],
                     format!("{text} out"),
+                ));
+                // Hairpin: without it, the server would answer the client
+                // straight across the bridge, from its own address rather
+                // than the one the client connected to, and the client
+                // would drop the answer. Only DNATed traffic: the rest of
+                // what stays on a bridge never reaches these hooks (it is
+                // switched, not routed), unless br_netfilter makes it, and
+                // then it must keep its addresses.
+                cmds.push(rule(
+                    "postrouting",
+                    vec![
+                        family.only(),
+                        family.addr_match("saddr", "==", net),
+                        ifname("oifname", "==", &n.bridge),
+                        json!({"match": {"op": "in", "left": {"ct": {"key": "status"}}, "right": "dnat"}}),
+                        json!({"masquerade": null}),
+                    ],
+                    format!("{text} hairpin"),
                 ));
             }
         }
@@ -413,7 +425,6 @@ mod tests {
                     host_port: 8080,
                     container_ip: Ipv4Addr::new(10, 89, 0, 2).into(),
                     container_port: 80,
-                    bridge: "rustlet0".into(),
                     container: "web".into(),
                 },
                 PortRule {
@@ -422,7 +433,6 @@ mod tests {
                     host_port: 5353,
                     container_ip: Ipv4Addr::new(10, 89, 0, 3).into(),
                     container_port: 53,
-                    bridge: "rustlet0".into(),
                     container: "dns".into(),
                 },
                 PortRule {
@@ -431,7 +441,6 @@ mod tests {
                     host_port: 8443,
                     container_ip: "fd00:89:0:2::2".parse().unwrap(),
                     container_port: 443,
-                    bridge: "rlbfedcba987654".into(),
                     container: "web6".into(),
                 },
             ],
@@ -485,9 +494,27 @@ mod tests {
     #[test]
     fn internal_networks_are_not_masqueraded() {
         let json = sample().to_json().to_string();
-        assert!(json.contains("10.89.0.0/24 out"));
-        assert!(!json.contains("10.89.1.0/24 out"));
-        assert!(json.contains("fd00:89:0:2::/64 out"), "NAT66 too");
+        assert!(json.contains("10.89.0.0/24 out") && json.contains("10.89.0.0/24 hairpin"));
+        assert!(!json.contains("10.89.1.0/24 out") && !json.contains("10.89.1.0/24 hairpin"));
+        assert!(json.contains("fd00:89:0:2::/64 out") && json.contains("fd00:89:0:2::/64 hairpin"), "NAT66 too");
+    }
+
+    #[test]
+    fn hairpin_traffic_is_dnated_and_masqueraded() {
+        let json = sample().to_json();
+        let rules: Vec<&Value> = json["nftables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["add"]["rule"].as_object().map(|_| &c["add"]["rule"]))
+            .collect();
+        // A published port's DNAT applies whatever the packet came in on.
+        let dnat = rules.iter().find(|r| r["chain"] == "prerouting").unwrap();
+        assert!(!dnat.to_string().contains("iifname"), "{dnat}");
+        // Back out of the bridge it came from: masqueraded, if DNATed only.
+        let hairpin = rules.iter().find(|r| r["comment"] == "10.89.0.0/24 hairpin").unwrap().to_string();
+        assert!(hairpin.contains(r#""right":"rustlet0""#) && hairpin.contains(r#""op":"==""#), "{hairpin}");
+        assert!(hairpin.contains(r#""right":"dnat""#), "{hairpin}");
     }
 
     #[test]

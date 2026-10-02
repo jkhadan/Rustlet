@@ -538,29 +538,24 @@ fn port_rules(l: &Live) -> Vec<PortRule> {
     let (v4, v6) = (route_v4(&l.endpoints), route_v6(&l.endpoints));
     let mut rules = Vec::new();
     for p in l.ports.iter().filter(|p| !p.host_ip.is_loopback()) {
-        let rule = |e: &EndpointRun, container_ip: IpAddr, host_ip: Option<IpAddr>| PortRule {
+        let rule = |container_ip: IpAddr, host_ip: Option<IpAddr>| PortRule {
             protocol: p.protocol.to_string(),
             host_ip,
             host_port: p.host_port,
             container_ip,
             container_port: p.container_port,
-            bridge: e.bridge.clone(),
             container: l.name.clone(),
         };
         let specific = (!p.host_ip.is_unspecified()).then_some(p.host_ip);
         if p.host_ip.is_ipv4()
-            && let Some(e) = v4
-            && let Some(ip) = e.ip
+            && let Some(ip) = v4.and_then(|e| e.ip)
         {
-            rules.push(rule(e, ip.into(), specific));
+            rules.push(rule(ip.into(), specific));
         }
         // 0.0.0.0 is every address, IPv6 too.
         let six = p.host_ip.is_ipv6() || p.host_ip.is_unspecified();
-        if six
-            && let Some(e) = v6
-            && let Some(ip6) = e.ip6
-        {
-            rules.push(rule(e, ip6.into(), specific.filter(IpAddr::is_ipv6)));
+        if six && let Some(ip6) = v6.and_then(|e| e.ip6) {
+            rules.push(rule(ip6.into(), specific.filter(IpAddr::is_ipv6)));
         }
     }
     rules
@@ -1729,8 +1724,8 @@ mod tests {
         };
         let rules = port_rules(&live);
         assert_eq!(rules.len(), 2, "{rules:?}");
-        assert_eq!((rules[0].container_ip, rules[0].bridge.as_str()), ("10.89.2.2".parse().unwrap(), "br-front"));
-        assert_eq!((rules[1].container_ip, rules[1].bridge.as_str()), ("fd00:3::2".parse().unwrap(), "br-six"));
+        assert_eq!(rules[0].container_ip, "10.89.2.2".parse::<IpAddr>().unwrap());
+        assert_eq!(rules[1].container_ip, "fd00:3::2".parse::<IpAddr>().unwrap());
         assert_eq!((rules[0].host_ip, rules[1].host_ip), (None, None));
     }
 }

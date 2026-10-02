@@ -114,7 +114,6 @@ fn net_bridge_nat_published_ports_and_guards() {
             host_port: 8080,
             container_ip: C1.into(),
             container_port: 80,
-            bridge: "rustlet0".into(),
             container: "c1".into(),
         }],
         isolate_forwarding: true,
@@ -148,6 +147,10 @@ fn net_bridge_nat_published_ports_and_guards() {
     assert!(fetch(host, addr(Ipv4Addr::LOCALHOST, 8080), b"").is_err());
     // 3. The container reaches the LAN, masqueraded as the host.
     assert_eq!(fetch(&c1, addr(TestLan::LAN_IP, 9000), b"").unwrap(), "lan 192.0.2.2");
+    //    And its own published port through the host's address (hairpin:
+    //    DNAT, then masqueraded to the bridge's address on the way back
+    //    out of the bridge, so that the answer returns through the host).
+    assert_eq!(fetch(&c1, addr(TestLan::HOST_IP, 8080), b"").unwrap(), "container 10.89.0.1");
     // 4. The LAN can't reach the container directly, even with a route to
     //    its subnet through the host.
     world.lan.route(Ipv4Addr::new(10, 89, 0, 0), 16, TestLan::HOST_IP);
@@ -218,7 +221,6 @@ fn net_ipv6_bridge_nat66_published_ports_and_guards() {
             host_port: 8086,
             container_ip: ip6.into(),
             container_port: 80,
-            bridge: "rlb6test".into(),
             container: "c6".into(),
         }],
         isolate_forwarding: false,
@@ -253,8 +255,10 @@ fn net_ipv6_bridge_nat66_published_ports_and_guards() {
     // 2. The host through its own address; not through ::1 (the proxy's).
     assert_eq!(fetch(host, v6(TestLan::HOST_IP6, 8086), b"").unwrap(), "c6 2001:db8::2");
     assert!(fetch(host, v6(Ipv6Addr::LOCALHOST, 8086), b"").is_err());
-    // 3. The container reaches the LAN, masqueraded as the host (NAT66).
+    // 3. The container reaches the LAN, masqueraded as the host (NAT66),
+    //    and its own published port through the host's address (hairpin).
     assert_eq!(fetch(&c6, v6(TestLan::LAN_IP6, 9000), b"").unwrap(), "lan 2001:db8::2");
+    assert_eq!(fetch(&c6, v6(TestLan::HOST_IP6, 8086), b"").unwrap(), "c6 fd00:89:0:5::1");
     // 4. The LAN can't reach the container's IPv6 address, even with a route.
     world.lan.route("fd00:89::".parse::<Ipv6Addr>().unwrap(), 48, TestLan::HOST_IP6);
     assert!(fetch(&world.lan, v6(ip6, 80), b"").is_err());

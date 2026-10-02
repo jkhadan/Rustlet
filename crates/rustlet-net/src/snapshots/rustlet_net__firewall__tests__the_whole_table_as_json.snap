@@ -329,17 +329,6 @@ expression: sample().to_json()
             {
               "match": {
                 "left": {
-                  "meta": {
-                    "key": "iifname"
-                  }
-                },
-                "op": "!=",
-                "right": "rustlet0"
-              }
-            },
-            {
-              "match": {
-                "left": {
                   "fib": {
                     "flags": [
                       "daddr"
@@ -469,17 +458,6 @@ expression: sample().to_json()
             {
               "match": {
                 "left": {
-                  "meta": {
-                    "key": "iifname"
-                  }
-                },
-                "op": "!=",
-                "right": "rustlet0"
-              }
-            },
-            {
-              "match": {
-                "left": {
                   "payload": {
                     "field": "daddr",
                     "protocol": "ip"
@@ -583,17 +561,6 @@ expression: sample().to_json()
                 },
                 "op": "==",
                 "right": "ipv6"
-              }
-            },
-            {
-              "match": {
-                "left": {
-                  "meta": {
-                    "key": "iifname"
-                  }
-                },
-                "op": "!=",
-                "right": "rlbfedcba987654"
               }
             },
             {
@@ -761,6 +728,71 @@ expression: sample().to_json()
       "add": {
         "rule": {
           "chain": "postrouting",
+          "comment": "10.89.0.0/24 hairpin",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "op": "==",
+                "right": "ipv4"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "saddr",
+                    "protocol": "ip"
+                  }
+                },
+                "op": "==",
+                "right": {
+                  "prefix": {
+                    "addr": "10.89.0.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "op": "==",
+                "right": "rustlet0"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "ct": {
+                    "key": "status"
+                  }
+                },
+                "op": "in",
+                "right": "dnat"
+              }
+            },
+            {
+              "masquerade": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "postrouting",
           "comment": "10.89.2.0/24 out",
           "expr": [
             {
@@ -815,6 +847,71 @@ expression: sample().to_json()
       "add": {
         "rule": {
           "chain": "postrouting",
+          "comment": "10.89.2.0/24 hairpin",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "op": "==",
+                "right": "ipv4"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "saddr",
+                    "protocol": "ip"
+                  }
+                },
+                "op": "==",
+                "right": {
+                  "prefix": {
+                    "addr": "10.89.2.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "op": "==",
+                "right": "rlbfedcba987654"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "ct": {
+                    "key": "status"
+                  }
+                },
+                "op": "in",
+                "right": "dnat"
+              }
+            },
+            {
+              "masquerade": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "postrouting",
           "comment": "fd00:89:0:2::/64 out",
           "expr": [
             {
@@ -854,6 +951,71 @@ expression: sample().to_json()
                 },
                 "op": "!=",
                 "right": "rlbfedcba987654"
+              }
+            },
+            {
+              "masquerade": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "postrouting",
+          "comment": "fd00:89:0:2::/64 hairpin",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "op": "==",
+                "right": "ipv6"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "saddr",
+                    "protocol": "ip6"
+                  }
+                },
+                "op": "==",
+                "right": {
+                  "prefix": {
+                    "addr": "fd00:89:0:2::",
+                    "len": 64
+                  }
+                }
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "op": "==",
+                "right": "rlbfedcba987654"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "ct": {
+                    "key": "status"
+                  }
+                },
+                "op": "in",
+                "right": "dnat"
               }
             },
             {

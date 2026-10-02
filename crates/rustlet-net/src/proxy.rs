@@ -2,14 +2,17 @@
 //!
 //! A published port is mostly the firewall's job: a `DNAT` rule rewrites a
 //! packet arriving for `host:8080` to `10.89.0.2:80` before routing, and
-//! the kernel does the rest. Three kinds of traffic never pass such a rule:
+//! the kernel does the rest, for clients on the LAN, on the host itself
+//! (through one of its own addresses) and in containers (hairpin traffic
+//! too, which the firewall masquerades on its way back out of the bridge).
+//! Two kinds of traffic never pass such a rule:
 //!
-//! - **to `127.0.0.1`**: rewriting a loopback destination to a container
-//!   address would need `route_localnet`, which lets anyone on the LAN
-//!   reach the host's loopback services (CVE-2020-8558);
-//! - **over IPv6**: the containers have IPv4 addresses only;
-//! - **from a container on the same bridge** to the host's address
-//!   (hairpin): the DNAT rules skip traffic from the port's own bridge.
+//! - **to `127.0.0.1` (or `::1`)**: rewriting a loopback destination to a
+//!   container address would need `route_localnet`, which lets anyone on
+//!   the LAN reach the host's loopback services (CVE-2020-8558);
+//! - **over IPv6, to a container without an IPv6 address** (one on an
+//!   IPv4-only network): NAT can't turn an IPv6 connection into an IPv4
+//!   one.
 //!
 //! So the daemon also listens on the published port itself (which
 //! reserves it, too: nothing else on the host can take it) and relays
@@ -43,9 +46,10 @@
 //!
 //! Answering from the right address takes asking. A socket bound to
 //! `0.0.0.0` or `[::]` sends from whichever address the kernel picks for
-//! the route: to a container's hairpin datagram, the bridge gateway's; over
-//! IPv6, perhaps a temporary address. The client would take such an answer
-//! for somebody else's (a connected socket never even sees it). So the
+//! the route: to a client that wrote to one of the host's addresses,
+//! perhaps another of them; over IPv6, perhaps a temporary address. The
+//! client would take such an answer for somebody else's (a connected
+//! socket never even sees it). So the
 //! kernel is asked for each datagram's destination (`IP_PKTINFO`,
 //! `IPV6_PKTINFO`), and the answers name it as their source, as
 //! docker-proxy's do.

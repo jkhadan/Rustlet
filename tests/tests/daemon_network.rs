@@ -177,6 +177,10 @@ fn dn_published_ports() {
             "hello\n",
             "IPv6, through the proxy"
         );
+        // A container on the same network, through the host's address
+        // (hairpin: DNAT, masqueraded on the way back out of the bridge).
+        let (_, out) = run(&c, &sh("nc 192.0.2.2 8080 </dev/null")).await;
+        assert_eq!(out, "hello\n");
         let summary = c.list_containers(false).await.unwrap();
         assert_eq!(summary[0].ports.len(), 2);
         // The port is taken: a second container's start fails, cleanly.
