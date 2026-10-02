@@ -16,19 +16,30 @@
 //! whatever arrives there to the container, as Docker's `docker-proxy`
 //! does. The daemon binds the sockets (it needs the port number, and an
 //! error it can report); a [`Proxy`] serves one of them until dropped.
+//! What it relays to is a [`Backend`], the container's address, which the
+//! daemon can change while the proxy runs: the published socket outlives
+//! the address it leads to (see [`Proxy`] for why).
 //!
 //! - **TCP**: each accepted client gets its own connection to the backend
-//!   (given up after [`CONNECT_TIMEOUT`]; the client is then closed), and
-//!   bytes are copied both ways until both sides are done; one side's end
-//!   of input is passed on as a half-close, so request/response protocols
-//!   that shut down their write side keep working.
+//!   as it is at that moment (given up after [`CONNECT_TIMEOUT`]; the
+//!   client is then closed, and at once if there is no backend), and bytes
+//!   are copied both ways until both sides are done; one side's end of
+//!   input is passed on as a half-close, so request/response protocols
+//!   that shut down their write side keep working. A connection stays with
+//!   its backend to its end: a change only reaches the clients accepted
+//!   after it.
 //! - **UDP**: each client gets a socket of its own, connected to the
 //!   backend; what it sends goes there, and what the backend answers comes
 //!   back to it from the published socket, *from the address the client
 //!   sent to*. A client is an address and port, and the address of ours it
 //!   sends to. A client that has sent nothing for [`UDP_IDLE`] is forgotten
 //!   (its socket closed). At most [`MAX_UDP_CLIENTS`] at once; datagrams
-//!   from more are dropped.
+//!   from more are dropped. With no connection to see to its end, each
+//!   datagram goes to the backend as it is when the datagram arrives: one
+//!   from a client whose socket leads to an earlier backend gets the
+//!   client a new socket first (answers still on their way through the old
+//!   one are lost), and one that arrives while there is no backend is
+//!   dropped.
 //!
 //! Answering from the right address takes asking. A socket bound to
 //! `0.0.0.0` or `[::]` sends from whichever address the kernel picks for
@@ -47,7 +58,7 @@ use std::collections::hash_map::Entry;
 use std::io::{self, IoSlice, IoSliceMut};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::AsRawFd;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use nix::sys::socket::{
@@ -69,8 +80,45 @@ pub const MAX_UDP_CLIENTS: usize = 1024;
 /// over IPv4).
 const MAX_DATAGRAM: usize = 65_535;
 
+/// Where a proxy relays to: a container's address, which the daemon can
+/// change while the proxy runs, or none at all (the container is on no
+/// network its ports can lead to). Clones share the value.
+#[derive(Debug, Clone)]
+pub struct Backend(Arc<RwLock<Option<SocketAddr>>>);
+
+impl Backend {
+    /// Starts at `addr`, or with none.
+    pub fn new(addr: Option<SocketAddr>) -> Backend {
+        Backend(Arc::new(RwLock::new(addr)))
+    }
+
+    /// The address as it is now.
+    pub fn get(&self) -> Option<SocketAddr> {
+        // A poisoned lock is used as it is: whoever holds it copies an
+        // address in or out, and nothing else, so no panic can have left
+        // the value half-written.
+        *self.0.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Takes effect for what arrives afterwards (see [`Proxy`]).
+    pub fn set(&self, addr: Option<SocketAddr>) {
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = addr;
+    }
+}
+
 /// Relays one published socket to a container address, until dropped
 /// (which stops accepting and ends every relayed connection).
+///
+/// The address is a [`Backend`], which the daemon can change while the
+/// proxy runs, as networks are connected to the container and disconnected
+/// from it: its ports lead to its address on the network that carries its
+/// default route, so when that network is disconnected, they must lead to
+/// its address on another one, or nowhere until there is one. The
+/// published socket outlives such a change: it is what reserves the port,
+/// and closing it to bind a new one would leave the port free in between,
+/// for any other program to take. A change takes effect for what arrives
+/// after it: a TCP client accepted, a datagram received. A TCP connection
+/// relayed already stays with the old address to its end.
 ///
 /// The drop aborts the proxy's task, which owns the socket and the tasks
 /// of the connections or clients. They end, and the socket closes, when
@@ -83,23 +131,25 @@ pub struct Proxy {
 
 impl Proxy {
     /// Accepts on `listener` (bound and listening already; made
-    /// non-blocking here) and relays each connection to `backend`. Must be
-    /// called inside a tokio runtime.
-    pub fn tcp(listener: std::net::TcpListener, backend: SocketAddr) -> std::io::Result<Proxy> {
+    /// non-blocking here) and relays each connection to `backend` as it is
+    /// when the connection is accepted (none: the client is closed). Must
+    /// be called inside a tokio runtime.
+    pub fn tcp(listener: std::net::TcpListener, backend: Backend) -> std::io::Result<Proxy> {
         Proxy::tcp_with(listener, backend, CONNECT_TIMEOUT)
     }
 
     /// [`Proxy::tcp`], giving up on the backend after `connect_timeout`.
-    fn tcp_with(listener: std::net::TcpListener, backend: SocketAddr, connect_timeout: Duration) -> io::Result<Proxy> {
+    fn tcp_with(listener: std::net::TcpListener, backend: Backend, connect_timeout: Duration) -> io::Result<Proxy> {
         listener.set_nonblocking(true)?;
         let listener = TcpListener::from_std(listener)?;
         Ok(Proxy { task: tokio::spawn(serve_tcp(listener, backend, connect_timeout)) })
     }
 
     /// Relays the datagrams arriving on `socket` (bound already; made
-    /// non-blocking here) to `backend`, and the backend's answers back.
-    /// Must be called inside a tokio runtime.
-    pub fn udp(socket: std::net::UdpSocket, backend: SocketAddr) -> std::io::Result<Proxy> {
+    /// non-blocking here) to `backend` as it is when each arrives (none:
+    /// the datagram is dropped), and the backend's answers back. Must be
+    /// called inside a tokio runtime.
+    pub fn udp(socket: std::net::UdpSocket, backend: Backend) -> std::io::Result<Proxy> {
         Proxy::udp_with(socket, backend, UDP_IDLE, MAX_UDP_CLIENTS)
     }
 
@@ -107,7 +157,7 @@ impl Proxy {
     /// `max_clients`.
     fn udp_with(
         socket: std::net::UdpSocket,
-        backend: SocketAddr,
+        backend: Backend,
         idle: Duration,
         max_clients: usize,
     ) -> io::Result<Proxy> {
@@ -120,6 +170,7 @@ impl Proxy {
             max_clients,
             clients: HashMap::new(),
             turned_away: false,
+            stranded: false,
         };
         Ok(Proxy { task: tokio::spawn(relay.serve()) })
     }
@@ -142,20 +193,34 @@ impl Drop for Proxy {
 }
 
 /// Accepts until the proxy is dropped; each connection is relayed by a
-/// task of its own.
-async fn serve_tcp(listener: TcpListener, backend: SocketAddr, connect_timeout: Duration) {
+/// task of its own, to the backend there was when it was accepted.
+async fn serve_tcp(listener: TcpListener, backend: Backend, connect_timeout: Duration) {
     // Dropped with this task, which aborts every connection's task.
     let mut connections = JoinSet::new();
     let mut backoff = Backoff::new();
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
-                Ok((client, _)) => {
+                Ok((client, from)) => {
                     backoff.reset();
-                    connections.spawn(relay_tcp(client, backend, connect_timeout));
+                    // Read once, here: whatever the daemon sets later is
+                    // for the clients after this one.
+                    if let Some(to) = backend.get() {
+                        connections.spawn(relay_tcp(client, to, connect_timeout));
+                    } else {
+                        // Nothing to connect it to; accepted already, it
+                        // can only be closed.
+                        tracing::debug!(%from, "no backend to relay a connection to: closed");
+                        drop(client);
+                    }
                 }
                 Err(e) => {
-                    tracing::warn!(%backend, "accept on a published port: {e}");
+                    // The backend of the moment, which tells the proxy
+                    // apart (no field while there is none).
+                    tracing::warn!(
+                        backend = backend.get().map(tracing::field::display),
+                        "accept on a published port: {e}"
+                    );
                     backoff.wait().await;
                 }
             },
@@ -224,7 +289,7 @@ impl Backoff {
 /// from, each with a socket of its own connected to the backend.
 struct UdpRelay {
     published: Arc<UdpSocket>,
-    backend: SocketAddr,
+    backend: Backend,
     idle: Duration,
     max_clients: usize,
     /// By the client's address and the address of ours it sent to.
@@ -232,6 +297,9 @@ struct UdpRelay {
     /// Whether a client has been turned away since there was last room:
     /// the log says so once, not for every datagram.
     turned_away: bool,
+    /// Whether a datagram has been dropped for want of a backend since
+    /// there was last one: likewise, said once.
+    stranded: bool,
 }
 
 impl UdpRelay {
@@ -255,7 +323,10 @@ impl UdpRelay {
                         self.forward(&datagram[..len], from, local).await;
                     }
                     Err(e) => {
-                        tracing::warn!(backend = %self.backend, "receive on a published port: {e}");
+                        tracing::warn!(
+                            backend = self.backend.get().map(tracing::field::display),
+                            "receive on a published port: {e}"
+                        );
                         backoff.wait().await;
                     }
                 },
@@ -270,15 +341,34 @@ impl UdpRelay {
 
     /// Sends `datagram` on to the backend through the socket of the client
     /// that sent it (from `from` to our address `local`), made now for a new
-    /// client if there is room for one.
+    /// client if there is room for one, or for a client whose socket leads
+    /// to an earlier backend.
     async fn forward(&mut self, datagram: &[u8], from: SocketAddr, local: Option<IpAddr>) {
+        // Read for each datagram: a change of backend reaches each client
+        // with its next one.
+        let Some(backend) = self.backend.get() else {
+            if !self.stranded {
+                tracing::debug!("no backend: datagrams to a published port are dropped");
+                self.stranded = true;
+            }
+            return;
+        };
+        self.stranded = false;
+        let key = (from, local);
+        // A socket stays with the backend it was made for (see
+        // `Client::backend`): after a change, the client is forgotten and
+        // made again, with a socket for the backend of now. The answers
+        // still on their way through the old socket are lost.
+        if self.clients.get(&key).is_some_and(|client| client.backend != backend) {
+            self.clients.remove(&key);
+        }
         let full = self.clients.len() >= self.max_clients;
-        let client = match self.clients.entry((from, local)) {
+        let client = match self.clients.entry(key) {
             Entry::Occupied(known) => known.into_mut(),
             Entry::Vacant(_) if full => {
                 if !self.turned_away {
                     tracing::warn!(
-                        backend = %self.backend,
+                        %backend,
                         "{} UDP clients already: datagrams from new ones are dropped",
                         self.max_clients
                     );
@@ -286,17 +376,17 @@ impl UdpRelay {
                 }
                 return;
             }
-            Entry::Vacant(new) => match Client::new(&self.published, self.backend, from, local).await {
+            Entry::Vacant(new) => match Client::new(&self.published, backend, from, local).await {
                 Ok(client) => new.insert(client),
                 Err(e) => {
-                    tracing::warn!(backend = %self.backend, %from, "a socket for a new UDP client: {e}");
+                    tracing::warn!(%backend, %from, "a socket for a UDP client: {e}");
                     return;
                 }
             },
         };
         client.last_sent = Instant::now();
         if let Err(e) = client.socket.send(datagram).await {
-            tracing::debug!(backend = %self.backend, %from, "forward a datagram: {e}");
+            tracing::debug!(%backend, %from, "forward a datagram: {e}");
         }
     }
 
@@ -313,9 +403,14 @@ impl UdpRelay {
 
 /// A UDP client, as the relay remembers it.
 struct Client {
-    /// Connected to the backend, so the kernel hands it the backend's
+    /// Connected to `backend`, so the kernel hands it that backend's
     /// datagrams only: whatever arrives on it is an answer for this client.
     socket: Arc<UdpSocket>,
+    /// The backend there was when the socket was made. Another one gets
+    /// the client a new socket, not this one connected again: it would
+    /// keep its family, and the source address it was given for the route
+    /// to the old backend.
+    backend: SocketAddr,
     /// When the client last sent something. Answers don't count: the
     /// backend can't keep a client that has gone away remembered.
     last_sent: Instant,
@@ -341,8 +436,9 @@ impl Client {
         let socket = UdpSocket::bind(any).await?;
         socket.connect(backend).await?;
         let socket = Arc::new(socket);
-        let answers = tokio::spawn(relay_answers(socket.clone(), published.clone(), from, local)).abort_handle();
-        Ok(Client { socket, last_sent: Instant::now(), answers })
+        let answers = relay_answers(socket.clone(), published.clone(), backend, from, local);
+        let answers = tokio::spawn(answers).abort_handle();
+        Ok(Client { socket, backend, last_sent: Instant::now(), answers })
     }
 }
 
@@ -352,9 +448,16 @@ impl Drop for Client {
     }
 }
 
-/// Passes the backend's answers on to one client: through the published
-/// socket, from the address of ours the client sent to.
-async fn relay_answers(socket: Arc<UdpSocket>, published: Arc<UdpSocket>, client: SocketAddr, local: Option<IpAddr>) {
+/// Passes the answers of `backend` (which `socket` is connected to) on to
+/// one client: through the published socket, from the address of ours the
+/// client sent to.
+async fn relay_answers(
+    socket: Arc<UdpSocket>,
+    published: Arc<UdpSocket>,
+    backend: SocketAddr,
+    client: SocketAddr,
+    local: Option<IpAddr>,
+) {
     // Capacity, not length: `recv_buf` receives into memory that hasn't
     // been zeroed first, so the buffer only takes up memory as far as the
     // answers reach, not 64 KiB for each of up to 1024 clients.
@@ -365,11 +468,11 @@ async fn relay_answers(socket: Arc<UdpSocket>, published: Arc<UdpSocket>, client
             // An ICMP error that an earlier datagram met (`ECONNREFUSED`:
             // nothing listens on the backend's port yet). Each is reported
             // to one read, and the client may well try again.
-            tracing::debug!(%client, "an answer from the backend: {e}");
+            tracing::debug!(%backend, %client, "an answer from the backend: {e}");
             continue;
         }
         if let Err(e) = send_answer(&published, &answer, client, local).await {
-            tracing::debug!(%client, "pass an answer on: {e}");
+            tracing::debug!(%backend, %client, "pass an answer on: {e}");
         }
     }
 }
@@ -469,7 +572,7 @@ mod tests {
 
     // TCP
 
-    fn tcp_proxy(backend: SocketAddr) -> (Proxy, SocketAddr) {
+    fn tcp_proxy(backend: Backend) -> (Proxy, SocketAddr) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let published = listener.local_addr().unwrap();
         (Proxy::tcp(listener, backend).unwrap(), published)
@@ -500,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_relays_both_ways() {
-        let (_proxy, published) = tcp_proxy(tcp_echo().await);
+        let (_proxy, published) = tcp_proxy(Backend::new(Some(tcp_echo().await)));
         let mut client = TcpStream::connect(published).await.unwrap();
         client.write_all(b"hello").await.unwrap();
         let mut got = [0u8; 5];
@@ -532,7 +635,7 @@ mod tests {
             stream.read_to_end(&mut request).await.unwrap();
             stream.write_all(format!("got {} bytes", request.len()).as_bytes()).await.unwrap();
         });
-        let (_proxy, published) = tcp_proxy(backend);
+        let (_proxy, published) = tcp_proxy(Backend::new(Some(backend)));
         let mut client = TcpStream::connect(published).await.unwrap();
         client.write_all(b"request").await.unwrap();
         client.shutdown().await.unwrap();
@@ -545,7 +648,7 @@ mod tests {
     async fn tcp_closes_the_client_when_the_backend_refuses() {
         // A port nothing listens on any more.
         let backend = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-        let (_proxy, published) = tcp_proxy(backend);
+        let (_proxy, published) = tcp_proxy(Backend::new(Some(backend)));
         let mut client = TcpStream::connect(published).await.unwrap();
         // Well before CONNECT_TIMEOUT: a refusal is final.
         let mut buf = [0u8; 1];
@@ -570,7 +673,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let published = listener.local_addr().unwrap();
         let connect_timeout = Duration::from_millis(300);
-        let _proxy = Proxy::tcp_with(listener, backend, connect_timeout).unwrap();
+        let _proxy = Proxy::tcp_with(listener, Backend::new(Some(backend)), connect_timeout).unwrap();
         let mut client = TcpStream::connect(published).await.unwrap();
         let connected = Instant::now();
         assert!(is_closed(&mut client).await);
@@ -580,7 +683,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_relays_connections_side_by_side() {
-        let (_proxy, published) = tcp_proxy(tcp_echo().await);
+        let (_proxy, published) = tcp_proxy(Backend::new(Some(tcp_echo().await)));
         let mut clients = Vec::new();
         for _ in 0..8 {
             clients.push(TcpStream::connect(published).await.unwrap());
@@ -606,7 +709,7 @@ mod tests {
         };
         let published = listener.local_addr().unwrap();
         let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let _proxy = Proxy::tcp(listener, backend.local_addr().unwrap()).unwrap();
+        let _proxy = Proxy::tcp(listener, Backend::new(Some(backend.local_addr().unwrap()))).unwrap();
         let mut client = TcpStream::connect(published).await.unwrap();
         client.write_all(b"over IPv6").await.unwrap();
 
@@ -624,7 +727,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_drop_ends_the_connections_and_the_listener() {
-        let (proxy, published) = tcp_proxy(tcp_echo().await);
+        let (proxy, published) = tcp_proxy(Backend::new(Some(tcp_echo().await)));
         let mut client = TcpStream::connect(published).await.unwrap();
         client.write_all(b"ping").await.unwrap();
         let mut got = [0u8; 4];
@@ -638,15 +741,68 @@ mod tests {
         assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
     }
 
+    /// Reads as many bytes from `stream` as `expected` has, and checks
+    /// they are those.
+    async fn read_back(stream: &mut TcpStream, expected: &[u8]) {
+        let mut got = vec![0u8; expected.len()];
+        within(stream.read_exact(&mut got)).await.unwrap();
+        assert_eq!(got, expected, "read {:?}", String::from_utf8_lossy(&got));
+    }
+
+    #[tokio::test]
+    async fn tcp_closes_the_client_at_once_without_a_backend() {
+        let backend = Backend::new(None);
+        let (_proxy, published) = tcp_proxy(backend.clone());
+        let mut client = TcpStream::connect(published).await.unwrap();
+        // Well before CONNECT_TIMEOUT: there is nothing to wait for.
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await;
+        assert!(matches!(read, Ok(Ok(0) | Err(_))), "{read:?}");
+
+        // The published socket stays, for the clients that come once there
+        // is a backend again.
+        backend.set(Some(tcp_echo().await));
+        let mut client = TcpStream::connect(published).await.unwrap();
+        client.write_all(b"served").await.unwrap();
+        read_back(&mut client, b"served").await;
+    }
+
+    #[tokio::test]
+    async fn tcp_a_change_of_backend_reaches_new_clients_only() {
+        let old = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let new = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = Backend::new(Some(old.local_addr().unwrap()));
+        let (_proxy, published) = tcp_proxy(backend.clone());
+        let mut before = TcpStream::connect(published).await.unwrap();
+        before.write_all(b"before").await.unwrap();
+        let (mut at_old, _) = within(old.accept()).await.unwrap();
+        read_back(&mut at_old, b"before").await;
+
+        backend.set(Some(new.local_addr().unwrap()));
+        let mut after = TcpStream::connect(published).await.unwrap();
+        after.write_all(b"after").await.unwrap();
+        let (mut at_new, _) = within(new.accept()).await.unwrap();
+        read_back(&mut at_new, b"after").await;
+
+        // The connection relayed already still leads to the old backend,
+        // both ways.
+        before.write_all(b"still there?").await.unwrap();
+        read_back(&mut at_old, b"still there?").await;
+        at_old.write_all(b"yes").await.unwrap();
+        read_back(&mut before, b"yes").await;
+        at_new.write_all(b"and here").await.unwrap();
+        read_back(&mut after, b"and here").await;
+    }
+
     // UDP
 
-    fn udp_proxy_with(backend: SocketAddr, idle: Duration, max_clients: usize) -> (Proxy, SocketAddr) {
+    fn udp_proxy_with(backend: Backend, idle: Duration, max_clients: usize) -> (Proxy, SocketAddr) {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let published = socket.local_addr().unwrap();
         (Proxy::udp_with(socket, backend, idle, max_clients).unwrap(), published)
     }
 
-    fn udp_proxy(backend: SocketAddr) -> (Proxy, SocketAddr) {
+    fn udp_proxy(backend: Backend) -> (Proxy, SocketAddr) {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let published = socket.local_addr().unwrap();
         (Proxy::udp(socket, backend).unwrap(), published)
@@ -698,7 +854,7 @@ mod tests {
     #[tokio::test]
     async fn udp_relays_requests_and_answers() {
         let (backend, _) = udp_echo().await;
-        let (_proxy, published) = udp_proxy(backend);
+        let (_proxy, published) = udp_proxy(Backend::new(Some(backend)));
         let client = udp_client("127.0.0.1:0", published).await;
         assert_eq!(exchange(&client, b"ping").await, b"ping");
         // The largest datagram IPv4 carries.
@@ -709,7 +865,7 @@ mod tests {
     #[tokio::test]
     async fn udp_clients_get_sockets_and_answers_of_their_own() {
         let (backend, mut heard) = udp_echo().await;
-        let (_proxy, published) = udp_proxy(backend);
+        let (_proxy, published) = udp_proxy(Backend::new(Some(backend)));
         let a = udp_client("127.0.0.1:0", published).await;
         let b = udp_client("127.0.0.1:0", published).await;
         a.send(b"from a").await.unwrap();
@@ -734,7 +890,7 @@ mod tests {
         };
         let published = socket.local_addr().unwrap();
         let (backend, mut heard) = udp_echo().await;
-        let _proxy = Proxy::udp(socket, backend).unwrap();
+        let _proxy = Proxy::udp(socket, Backend::new(Some(backend))).unwrap();
         let client = udp_client("[::1]:0", published).await;
         assert_eq!(exchange(&client, b"over IPv6").await, b"over IPv6");
         let via = heard.recv().await.unwrap();
@@ -778,7 +934,8 @@ mod tests {
     async fn udp_forgets_an_idle_client() {
         let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let idle = Duration::from_millis(500);
-        let (_proxy, published) = udp_proxy_with(backend.local_addr().unwrap(), idle, MAX_UDP_CLIENTS);
+        let (_proxy, published) =
+            udp_proxy_with(Backend::new(Some(backend.local_addr().unwrap())), idle, MAX_UDP_CLIENTS);
         let client = udp_client("127.0.0.1:0", published).await;
         let mut buf = [0u8; 16];
 
@@ -806,7 +963,7 @@ mod tests {
     #[tokio::test]
     async fn udp_turns_away_clients_beyond_the_limit() {
         let (backend, _) = udp_echo().await;
-        let (_proxy, published) = udp_proxy_with(backend, UDP_IDLE, 2);
+        let (_proxy, published) = udp_proxy_with(Backend::new(Some(backend)), UDP_IDLE, 2);
         let a = udp_client("127.0.0.1:0", published).await;
         let b = udp_client("127.0.0.1:0", published).await;
         let c = udp_client("127.0.0.1:0", published).await;
@@ -823,7 +980,7 @@ mod tests {
     async fn udp_a_forgotten_client_makes_room() {
         let (backend, _) = udp_echo().await;
         let idle = Duration::from_millis(500);
-        let (_proxy, published) = udp_proxy_with(backend, idle, 1);
+        let (_proxy, published) = udp_proxy_with(Backend::new(Some(backend)), idle, 1);
         let a = udp_client("127.0.0.1:0", published).await;
         let b = udp_client("127.0.0.1:0", published).await;
         assert_eq!(exchange(&a, b"a").await, b"a");
@@ -836,7 +993,7 @@ mod tests {
     #[tokio::test]
     async fn udp_drop_stops_relaying() {
         let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (proxy, published) = udp_proxy(backend.local_addr().unwrap());
+        let (proxy, published) = udp_proxy(Backend::new(Some(backend.local_addr().unwrap())));
         let client = udp_client("127.0.0.1:0", published).await;
         let mut buf = [0u8; 16];
         client.send(b"one").await.unwrap();
@@ -852,5 +1009,60 @@ mod tests {
         assert!(heard.is_err(), "the backend heard {heard:?}");
         // The published socket is closed: its port can be bound again.
         std::net::UdpSocket::bind(published).unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_a_client_follows_a_change_of_backend() {
+        let old = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let new = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend = Backend::new(Some(old.local_addr().unwrap()));
+        let (_proxy, published) = udp_proxy(backend.clone());
+        let client = udp_client("127.0.0.1:0", published).await;
+        let mut buf = [0u8; 16];
+        client.send(b"one").await.unwrap();
+        let (n, via_old) = within(old.recv_from(&mut buf)).await.unwrap();
+        assert_eq!(&buf[..n], b"one");
+
+        backend.set(Some(new.local_addr().unwrap()));
+        // The same client's next datagram goes to the new backend, and the
+        // answer comes back to it from the published address (the only one
+        // it takes datagrams from).
+        client.send(b"two").await.unwrap();
+        let (n, via_new) = within(new.recv_from(&mut buf)).await.unwrap();
+        assert_eq!(&buf[..n], b"two");
+        new.send_to(b"answer", via_new).await.unwrap();
+        let n = within(client.recv(&mut buf)).await.unwrap();
+        assert_eq!(&buf[..n], b"answer");
+
+        // The old backend reaches the client no more.
+        old.send_to(b"too late", via_old).await.unwrap();
+        nothing_arrives(&client).await;
+    }
+
+    #[tokio::test]
+    async fn udp_drops_datagrams_without_a_backend() {
+        let (first, mut heard_first) = udp_echo().await;
+        let (second, mut heard_second) = udp_echo().await;
+        let backend = Backend::new(None);
+        let (_proxy, published) = udp_proxy(backend.clone());
+        let client = udp_client("127.0.0.1:0", published).await;
+        client.send(b"from a new client").await.unwrap();
+        nothing_arrives(&client).await;
+
+        backend.set(Some(first));
+        assert_eq!(exchange(&client, b"one").await, b"one");
+        within(heard_first.recv()).await.unwrap();
+
+        // A known client, whose socket still leads to the first backend.
+        backend.set(None);
+        client.send(b"from a known client").await.unwrap();
+        nothing_arrives(&client).await;
+        assert!(heard_first.try_recv().is_err(), "the first backend heard it");
+        assert!(heard_second.try_recv().is_err(), "the second backend heard it");
+
+        backend.set(Some(second));
+        assert_eq!(exchange(&client, b"two").await, b"two");
+        within(heard_second.recv()).await.unwrap();
+        assert!(heard_first.try_recv().is_err(), "the first backend heard it");
     }
 }
