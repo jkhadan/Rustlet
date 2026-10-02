@@ -8,6 +8,8 @@ empty directory of its own for its changes, and overlayfs merges them
 into one tree. Nothing is copied when a container starts, and nothing it
 does reaches the image. With `--userns`, the same snapshots, owned by
 uid 0 on disk, appear as the container's own through idmapped mounts.
+And what must outlive a container lives outside its layers: volumes,
+bind mounts and tmpfs mounts (§10, added in Phase 5).
 
 Code: [`rootfs.rs`](../../crates/rustlet-image/src/rootfs.rs) (`ContainerRootfs`,
 `mount_overlay`, `stage_idmapped`), [`snapshot.rs`](../../crates/rustlet-image/src/snapshot.rs),
@@ -16,10 +18,15 @@ Code: [`rootfs.rs`](../../crates/rustlet-image/src/rootfs.rs) (`ContainerRootfs`
 [`mount.rs`](../../crates/rustlet-sys/src/mount.rs) (`FsContext`), the runtime's
 [`rootfs.rs`](../../crates/rustlet-runtime/src/rootfs.rs) (`HostTrees`, `open_rootfs`),
 [`xtask/src/imagerun.rs`](../../xtask/src/imagerun.rs) and [`xtask/src/images.rs`](../../xtask/src/images.rs).
+Volumes (§10): the daemon's [`volumes.rs`](../../crates/rustletd/src/volumes.rs) (`resolve_mounts`,
+`prepare_volumes`, `create_volume`, `remove_volume`) and [`spec.rs`](../../crates/rustletd/src/spec.rs)
+(`add_mounts`, `oci_mount`), [`copyup.rs`](../../crates/rustlet-image/src/copyup.rs) (`copy_up`, `is_empty`), and the
+mount syntaxes in [`rustlet-spec`'s `volume.rs`](../../crates/rustlet-spec/src/volume.rs).
 Tests: [`images.rs`](../../tests/tests/images.rs) (`cargo xtask itest -- im_`, 10 tests;
 the overlay ones are `im_overlay_applies_whiteouts_and_opaque_directories`,
 `im_container_writes_go_to_the_upper_layer` and `im_userns_idmapped_layers_show_container_root`)
-and the unpack unit tests in [`unpack/tests.rs`](../../crates/rustlet-image/src/unpack/tests.rs).
+and the unpack unit tests in [`unpack/tests.rs`](../../crates/rustlet-image/src/unpack/tests.rs); for volumes the three
+`vol_` tests in [`daemon_network.rs`](../../tests/tests/daemon_network.rs) and copy-up's 14 unit tests.
 Design: [architecture.md §2.4](../architecture.md#24-rustlet-image--oci-images-storage-snapshots).
 
 The transcripts were recorded on 2026-10-01, kernel 7.0.0-34-generic, as
@@ -31,8 +38,10 @@ digests (64 hex digits) are shortened to 12 characters plus `…`, which
 `images ls` and `images cat` accept as prefixes; yours will differ. The host's
 `/proc/self/mountinfo` had 24 lines before the first run and 24 after
 the last, with every container gone and the kept ones pruned. §2, §9 and
-§10 were recorded again later that day, after the mount gained a `source`
-name and `redirect_dir=nofollow` (§3).
+§11 were recorded again later that day, after the mount gained a `source`
+name and `redirect_dir=nofollow` (§3). §10's were recorded on 2026-10-02,
+against the installed daemon of Phase 5 (`rustlet` is `sudo
+target/debug/rustlet`).
 
 ## 1. One image, many writable roots
 
@@ -109,7 +118,7 @@ With [chapter 02](02-mounts-pivot-root.md)'s field guide:
   `/` has the same one: the same filesystem, not a second overlay (§8).
 - **The mount point** is below mount 32, the host's `/`. `shared:472`
   says the overlay joined a peer group, because it was attached below a
-  shared mount (§10). The container's root is private: no such field.
+  shared mount (§11). The container's root is private: no such field.
 - **`nodev`** comes from `fsmount` (§3). **`rustlet`** is the source: an
   overlay has no device behind it, so the name is only a label, which
   `mount_overlay` sets to tell its mounts apart.
@@ -561,7 +570,184 @@ ids, so a commit of it (Phase 7) will have to map them back.
 `im_userns_idmapped_layers_show_container_root` checks this section, down
 to a single new host mount with no staged layer left.
 
-## 10. Limits and gotchas
+## 10. Volumes: storage outside the layers
+
+Everything so far happens in a container's own upper layer: written by the
+container, mapped to host ids under `--userns`, gone with `rm`. Data that
+must outlive the container, or be shared between containers, or be
+written fast and often without overlay's copy-up, belongs outside the
+layers altogether: in mounts over parts of the tree, which the overlay
+never sees. Phase 5 added three kinds ([`volume.rs`](../../crates/rustlet-spec/src/volume.rs) in
+`rustlet-spec`, with Docker's three syntaxes `-v`, `--mount` and
+`--tmpfs`):
+
+| kind | what is mounted | lives |
+|---|---|---|
+| volume | `<data root>/volumes/<name>/_data`, a directory the daemon keeps | until `volume rm` (an anonymous one: until its container is removed with `--rm` or `rm -v`) |
+| bind | a host directory or file | it is the host's |
+| tmpfs | a new tmpfs (`nosuid,nodev,noexec` unless asked otherwise) | until the container stops |
+
+**A volume** is a directory and a row in `state.db`
+([`volumes.rs`](../../crates/rustletd/src/volumes.rs) in the daemon): `volumes/` is `0700`, root's,
+`<name>/_data` is what containers see. `-v data:/var/lib/data` names one,
+and creates it if it doesn't exist (Docker's rule); `-v /var/lib/data`
+names none, and so does every `VOLUME` of the image that no mount covers:
+those become **anonymous** volumes with 64-hex-digit names. All of this is
+decided once, at `create`, and recorded with the container (its
+`Record.mounts`), so every start mounts the same volumes. A volume named in
+any container's record, running or not, is in use and can't be removed;
+`rm -v` and `--rm` take a container's anonymous volumes with it:
+
+```text
+$ rustlet run -d --name anon -v /scratch alpine sleep 60; rustlet inspect anon | grep -B2 -A6 '"mounts"'; rustlet volume ls; rustlet rm -f -v anon; rustlet volume ls
+db18d39d52dc7b6dc8b26b4cc4dd08fe587c58576155838b65c06413500c0f4f
+…   (first, the mount as given at create: no source)
+    "mounts": [
+      {
+        "destination": "/scratch",
+        "name": "fa36074633c968dd090da5919530b1a119f411e47a377464890b8f1451202c18",
+        "read_only": false,
+        "source": "/var/lib/rustlet/volumes/fa36074633c9…/_data",
+        "type": "volume"
+DRIVER    VOLUME NAME
+local     fa36074633c968dd090da5919530b1a119f411e47a377464890b8f1451202c18
+local     pgdata
+anon
+DRIVER    VOLUME NAME
+local     pgdata
+```
+
+The image's `VOLUME`s are untrusted input like the rest of its config: one
+that names a path the runtime keeps for itself (`/`, `/proc`, `/sys`,
+`/dev`, …) is refused at `create`, with the same check a `-v` gets, rather
+than failing every start later in the runtime. (That check was missing
+until this chapter was written, and `VOLUME /sys` would have been
+accepted.)
+
+### Populating an empty volume
+
+The name collides with §4's, so one sentence to keep them apart: §4's
+*copy-up* is overlayfs copying a lower file into upper the first time a
+container writes it; what follows is the daemon copying the image's files
+into a new volume before the container starts. Docker's documentation
+calls both copying up; this chapter calls the second **populating** the
+volume.
+
+A volume mounted over a path where the image has files would hide them:
+`-v pgdata:/var/lib/postgresql/data` over an empty volume, and the program
+finds an empty directory where its image put its defaults. So, as Docker
+does, an **empty** volume gets a copy of what the image has at its mount
+point, at each start, after the overlay is mounted and before the
+container exists (`prepare_volumes`; `-v data:/x:nocopy` or
+`volume-nocopy` says not to):
+
+```text
+$ rustlet run --rm -v pgdata:/etc/apk alpine ls -l /etc/apk; rustlet volume ls; rustlet volume inspect pgdata
+total 20
+-rw-r--r--    1 root     root             7 Sep 17 17:32 arch
+drwxr-xr-x    2 root     root          4096 Sep 17 17:32 keys
+drwxr-xr-x    2 root     root          4096 Sep 17 17:32 protected_paths.d
+-rw-r--r--    1 root     root           103 Sep 17 17:32 repositories
+-rw-r--r--    1 root     root            74 Sep 17 17:32 world
+DRIVER    VOLUME NAME
+local     pgdata
+[
+  {
+    "anonymous": false,
+    "containers": [],
+    …
+    "mountpoint": "/var/lib/rustlet/volumes/pgdata/_data",
+    "name": "pgdata"
+  }
+]
+```
+
+The copy reads the **merged** root filesystem, the overlay: the image's
+layers with the container's own changes on top, whiteouts already applied
+(a deleted file isn't copied, an opaque directory hides its lower
+content) and overlay's own attributes invisible. It is image content, so
+untrusted, and the daemon is root, so it is made the way chapter 11's
+unpacking is ([`copyup.rs`](../../crates/rustlet-image/src/copyup.rs)):
+
+- the mount point is resolved **inside** the root filesystem
+  (`openat2(RESOLVE_IN_ROOT)`): an image whose `/var/run` is a symlink to
+  `/run` gets the container's `/run` copied, never the host's;
+- **below it, nothing is followed**: each entry is examined with
+  `AT_SYMLINK_NOFOLLOW`, only regular files and directories are opened
+  (`O_NOFOLLOW`, and `O_NONBLOCK|O_NOCTTY` in case something else took
+  their place), and a symlink is copied as a symlink, whatever it names;
+- the volume is written only **through fds** below its directory, every
+  entry created exclusively (`O_EXCL`, `mkdirat`, `symlinkat`, `mkfifoat`,
+  `linkat`);
+- **kept**: contents, owners, modes (after the owner, since `chown` clears
+  setuid bits), extended attributes (after the owner, which clears
+  `security.capability`), times (a directory's last, once its contents
+  are done), hard links within the copied tree, FIFOs; **skipped**, and
+  listed in the daemon's log: device nodes and sockets;
+- the volume's directory takes the source directory's owner and mode
+  (Docker's `copyOwnership`), and the walk uses a stack of its own, at
+  most 4096 levels deep, not the daemon's.
+
+One copy runs at a time per volume. A copy that fails halfway empties the
+volume again: half a copy would count as content, and no later start would
+try again. A volume that isn't empty is never touched, so a second
+container mounting it elsewhere sees the first one's data:
+`vol_named_volumes_copy_up_once_and_persist` writes a marker through one
+container and reads it through another, with no second copy.
+
+### Volumes under `--userns=remap`
+
+Through §9's idmapped layers, the image's files appear as owned by
+1000000 + their ids, and a remapped container's root is host uid
+1000000. A volume populated as it reads, and written by that root, would
+hold host ids: usable by remapped containers, owned by an unmapped
+"nobody" for everyone else. Rustlets mounts volumes into a remapped
+container **idmapped** instead, with the same `MOUNT_ATTR_IDMAP` as §9's
+layers (the runtime's `idmap` mount option, set by
+[`spec::oci_mount`](../../crates/rustletd/src/spec.rs)), so that on-disk uid 0 *is* container root,
+and populating translates the shifted owners back (and the ids a file
+capability or an ACL names). The same volume, used by a remapped
+container:
+
+```text
+$ rustlet run --rm --userns remap -v pgdata:/etc/apk alpine sh -c 'touch /etc/apk/remapped; ls -ln /etc/apk; cat /proc/self/uid_map'
+-rw-r--r--    1 0        0                7 Sep 17 17:32 arch
+drwxr-xr-x    2 0        0             4096 Sep 17 17:32 keys
+…
+-rw-r--r--    1 0        0                0 Oct  2 08:15 remapped
+…
+         0    1000000      65536
+$ sudo ls -ln /var/lib/rustlet/volumes/pgdata/_data
+…
+-rw-r--r-- 1 0 0    0 Oct  2 04:15 remapped
+…
+```
+
+Container root (host uid 1000000) created `remapped`, and it is uid 0 on
+disk: one volume, the same files, whichever kind of container mounts it
+(`vol_userns_volumes_are_idmapped` checks both). Host directories bound
+with `-v /host:/c` keep the host's owners (host root shows as `nobody`
+inside, as with Docker) unless the mount says `idmap`, as Podman offers.
+Docker solves the same problem differently: with `userns-remap` it keeps a
+separate data root, volumes included, per remapping
+(`/var/lib/docker/1000000.1000000/`).
+
+### The mounts, as the runtime gets them
+
+[`spec::add_mounts`](../../crates/rustletd/src/spec.rs) turns the recorded mounts into OCI mounts: a
+volume is an `rbind` of its `_data`, a bind an `rbind` of the host path,
+both `rprivate` (the runtime allows no other propagation), `ro` or `rw`, and
+`idmap` as above; a tmpfs gets `nosuid,nodev,noexec`, then the user's
+flags (the runtime takes the last word of each pair, so `exec` undoes
+`noexec`), `size=` and `mode=`. They are sorted by depth, so `/data` is
+mounted before `/data/cache`; a mount on a default destination (`--tmpfs
+/dev/shm`) replaces the default; and the generated `/etc/hosts`,
+`hostname` and `resolv.conf` ([chapter 16](16-dns.md)) are skipped where a mount
+covers them. `vol_anonymous_bind_and_tmpfs_mounts` checks a read-only
+bind, a host directory `-v` created, an image `VOLUME` and a tmpfs with its
+options, all in one container.
+
+## 11. Limits and gotchas
 
 - **500 lower layers** is overlay's `OVL_MAX_STACK`. `ContainerRootfs::mount`
   refuses more, and none, before it calls the kernel.
@@ -598,7 +784,7 @@ to a single new host mount with no staged layer left.
   it. `sudo scripts/cleanup.sh` unmounts everything under
   `/var/lib/rustlet` and `/run/rustlet`; `--purge` deletes the store too.
 
-## 11. Try it
+## 12. Try it
 
 From the repository, as your normal user, with chapter 11's images:
 
@@ -614,6 +800,13 @@ cargo xtask image-run --userns --keep alpine sh -c 'stat -c "%u:%g %n" / /bin/bu
 cargo xtask images ls containers/<id>/upper        # made-here belongs to 1000000
 cargo xtask images prune-containers
 grep -c . /proc/self/mountinfo                     # the number you started with
+# §10, with the daemon installed (chapter 13):
+R="sudo target/debug/rustlet"
+$R run --rm -v apk:/etc/apk alpine ls /etc/apk     # populated from the image
+sudo ls -ln /var/lib/rustlet/volumes/apk/_data
+$R run --rm --userns remap -v apk:/etc/apk alpine touch /etc/apk/x && sudo ls -ln /var/lib/rustlet/volumes/apk/_data/x
+$R run --rm -v /etc/apk alpine true; $R volume ls  # an anonymous volume, left behind by rm without -v
+$R volume prune -f; $R volume rm apk
 ```
 
 ## Check yourself
@@ -641,6 +834,15 @@ grep -c . /proc/self/mountinfo                     # the number you started with
 8. A remapped container's `chown 5:5 /etc/issue` is stored as
    1000005:1000005. What must a commit of it do with owners, and why does
    a container without a user namespace need nothing?
+9. §4's copy-up and §10's populating of a volume both copy files. Which
+   copies what, when, and on whose behalf?
+10. Why does the daemon populate a volume through the mounted overlay
+    rather than from the snapshot directories, and why must it never
+    follow a symlink below the mount point? What does `RESOLVE_IN_ROOT`
+    still follow, and why is that safe?
+11. A remapped container and a plain one share a volume. Who owns, on
+    disk, a file the remapped container's root creates there, and what
+    would the owner be if volumes weren't idmapped?
 
 ## Experiments
 
@@ -652,9 +854,17 @@ grep -c . /proc/self/mountinfo                     # the number you started with
   `etc/a` and `doc/x` are hidden. Append to `m/etc/keep`, `rm m/etc/motd`,
   then read `getfattr -d -m - up up/etc/keep` and `ls -l up/etc/motd`.
   Why does mountinfo say `redirect_dir=nofollow`?
-- **Propagation.** Repeat §10's companion with `--propagation private`.
+- **Propagation.** Repeat §11's companion with `--propagation private`.
   Does the overlay appear? How could a daemon keep rootfs mounts from
   propagating into every namespace on the host?
 - **Read-only root.** Run `image-run --read-only --keep alpine touch /x`
   and look at upper. Which refused the write, the overlay or the
   runtime's mount of it (chapter 02 §8)?
+- **Where writes go.** Run a container that writes 100 MB into a volume
+  (`-v big:/big`) and 100 MB into its root filesystem, with `--rm` off.
+  Compare `upper/` and the volume's `_data` (`du -sh`), then `rm` the
+  container and look again.
+- **Not empty, not copied.** Put one file into a new volume (`$R run --rm
+  -v v:/x alpine touch /x/mine`), then mount it over `/etc/apk`. What does
+  the container see in `/etc/apk`, and why? Then try `-v v2:/etc/apk:nocopy`
+  on a new volume.
