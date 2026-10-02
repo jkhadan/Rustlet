@@ -203,10 +203,16 @@ $ sudo cat /var/lib/rustlet/containers/d7bea92313ba…/container.log
 {"ts":"2026-10-02T00:19:02.127292768Z","stream":"stdout","log":"from the API\n"}
 ```
 
-At 10 MiB the file is renamed `container.log.1` (`.1` to `.2`, and so
-on, three files at most) and a new one begun. The daemon reads these
-files itself for `rustlet logs` (`logs.rs`); following one (`logs -f`)
-polls the current file and notices a rotation by its inode.
+An entry that would take the file past 10 MiB starts a new one: the file
+is renamed `container.log.1` (`.1` to `.2`, and so on, three files at
+most) and a new one begun. The daemon reads these files itself for
+`rustlet logs` (`logs.rs`). Following one (`logs -f`) polls the current
+file and tells files apart by inode, never by name. After a rotation it
+reads its own file to the end once more (the shim may have written one
+last entry just before renaming it), then every newer file in order: a
+slow reader may be more than one rotation behind. The first version
+went straight to the new `container.log`, and the review lost entries
+both ways.
 
 **Attach** is the same output, live: every chunk read from the pipes or
 the master also goes to every attached client through a broadcast
@@ -240,7 +246,12 @@ then calls start. The daemon keeps that attach waiting with the
 container; `start` spawns the shim, opens a shim attach stream for each
 waiting client, applies the terminal size the client sent meanwhile
 (`Resize` before `Start`, so the program never sees another size), and
-only then sends `Start` (`attach_and_start` in `lifecycle.rs`).
+only then sends `Start` (`attach_and_start` in `lifecycle.rs`). The
+waiting attach is registered while the daemon handles the HTTP request,
+before it answers `101 Switching Protocols`: the CLI sends the start as
+soon as it has that answer, perhaps before the upgraded connection is
+served. A start that fails ends the attaches waiting for it with its
+error.
 
 **The exit, in order.** When init exits, the shim waits briefly for the
 pipes to drain (they close once every process holding them is gone),
@@ -285,6 +296,14 @@ the lock like any operation. `stop` holds the lock while it waits for the
 exit its signal caused; if the monitor needed the lock too, they would
 wait for each other forever.
 
+An operation also runs to its end when the client that asked for it
+hangs up. hyper drops the handler of a connection that closes, so a
+`start` cut short by Ctrl-C stopped at whatever `.await` it had reached.
+In the review's test that left a shim and a created container that
+nothing watched, the overlay still mounted, and a container that said
+`created`. So every lifecycle request runs in a task of its own, and the
+handler only waits for it (`to_the_end` in `api.rs`).
+
 **Stop** sends the stop signal (the container's `--stop-signal`, else the
 image's `StopSignal`, else `SIGTERM`), waits for the timeout (10 s by
 default), then kills every process in the cgroup (`kill --all KILL`, which
@@ -326,7 +345,12 @@ process when the service stops. The shims and containers in the unit's
 cgroup are left alone (systemd notes them on the next start: "Found
 left-over process … in control group while starting unit. Ignoring.").
 The new daemon finds its containers in `state.db` and asks each one's
-shim for its `Status` (`reconcile` in `lifecycle.rs`):
+shim for its `Status` (`reconcile` in `lifecycle.rs`). It asks even when
+the database says the container isn't running. A daemon that died
+between the shim's `Start` and recording it would otherwise leave a
+running container recorded as `created`. Such a run is taken over like
+any other, and a shim whose container never got its `Start` is shut
+down. Image workers a killed daemon left behind (§9) are stopped too:
 
 ```text
 $ ps -o pid,ppid,user,args -p 114823
@@ -477,11 +501,25 @@ review found too, in which an unpack replacing a crash-damaged directory
 could move aside the good snapshot a concurrent unpack had just put
 there.
 
-`rustlet rmi` removes a name, then deletes the blobs and snapshots that
-no name and no container reaches, and never while a pull or unpack is
-running (a pull stores its blobs before the name that makes them
-reachable). A container keeps its image's layers even after the name is
-gone (`rmi --force`), and they go with its last container.
+`rustlet rmi` removes a name. Then it deletes the blobs and snapshots
+that nothing in `index.json` (named or not) and no container reaches,
+along with the half-written files of killed workers. It never does this
+while a pull, an unpack or a create is running: a pull stores its blobs
+before the name that makes them reachable, and a create has looked up
+its image before its container is recorded. Rather than wait in line for
+its turn, it polls for it, because tokio's lock is fair: a collection
+queued behind a long pull would make every later pull, unpack and create
+queue behind it. What it can't read, it keeps. A manifest that doesn't
+load as an image (an artifact, or a config it can't read just now) keeps
+whatever its JSON names, and every snapshot unless its config says which
+layers are its own. The first version kept only the manifest itself, and
+could delete the layers under a running container.
+
+A container keeps its image's layers even after the name is gone (`rmi
+--force`); they go with its last container, collected in the background.
+A worker dies with the operation that started it. If the whole daemon
+was killed (`KillMode=process` leaves its children), the next daemon
+stops what is left in `workers/` before it touches the store.
 
 ## 10. Keeping mounts to ourselves
 
@@ -534,6 +572,10 @@ root: it holds an OFD lock on `rustletd.lock` in each.
 - **A shim already running keeps the binary it started from**: installing
   a new `rustlet-shim` changes only the next starts.
 - **Logs** are JSON lines in one format; there are no log drivers.
+- **A busy root filesystem** (something outside the container still
+  using it when the container stops) is unmounted lazily, as Docker's
+  overlay driver does, and a later start mounts a new overlay on the same
+  `upper/` and `work/` while the old one may live on.
 - **`/events`** is NDJSON (§8); `--format` and filters are not
   implemented in the CLI; healthchecks wait for Phase 7.
 
@@ -554,7 +596,7 @@ systemd-cgls -u rustletd.service               # daemon, shims, containers/<id>
 $R logs web; $R exec -it web sh; $R stats web  # Ctrl-C ends stats
 sudo systemctl restart rustletd && $R ps       # still up, same pid ($R inspect web)
 $R stop web && $R rm web
-cargo xtask itest -- sh_ dm_ cl_               # the tests behind this chapter
+cargo xtask itest -- sh_ dm_ cl_ rr_           # the tests behind this chapter (rr_: the reviews')
 sudo systemctl stop rustletd                   # or `cargo xtask daemon uninstall`
 ```
 
