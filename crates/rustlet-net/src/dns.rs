@@ -1,5 +1,5 @@
 //! The embedded DNS server: what `127.0.0.11` answers inside a container on
-//! a user-defined network.
+//! user-defined networks.
 //!
 //! ```text
 //!  container netns                         daemon (host netns)
@@ -7,7 +7,7 @@
 //!  │ app → 127.0.0.11:53          │
 //!  │   nft (table ip rustlet_dns) │
 //!  │   DNAT :53 → :<port>         │
-//!  │ socket 127.0.0.11:<port> ────┼──► DnsServer task ── Zone (names on the network)
+//!  │ socket 127.0.0.11:<port> ────┼──► DnsServer task ── Zone (names on its networks)
 //!  └──────────────────────────────┘        │ not ours?
 //!                                          └──► upstream servers, from the host's netns
 //! ```
@@ -22,27 +22,48 @@
 //!
 //! ## What it answers
 //!
-//! One [`Zone`] holds every network's names; each container's server sees
-//! it through a [`View`] (its network, its upstream servers).
+//! One [`Zone`] holds every network's names and their addresses, IPv4 and
+//! IPv6 alike. Each container's server sees it through a [`View`], whose
+//! [`Scope`] lists the user-defined networks the container is on, in the
+//! order it was connected to them, and its upstream servers. The daemon
+//! replaces the scope while the server runs, as the container is connected
+//! to networks and disconnected from them; a query is answered, and
+//! forwarded, with the scope as it was when the query arrived.
 //!
-//! - **`A` for a name on the network** (a container's name, aliases, short
-//!   id, hostname; registered by the daemon with [`Zone::add`]): every
-//!   address registered under that name (several containers can share an
-//!   alias), in random order, TTL [`TTL`], authoritative. Names match
-//!   without regard to case, with or without a trailing dot, bare
-//!   (`web`) or qualified by the network's name (`web.backend`).
-//! - **Any other type for such a name** (`AAAA`, `MX`, …): `NOERROR` with
-//!   no answers. Containers have no IPv6 address, and an empty answer stops
-//!   the client from trying elsewhere.
-//! - **`PTR` for an address on the network**
-//!   (`2.0.89.10.in-addr.arpa`): `<first name>.<network>.`, as Docker's.
-//! - **Everything else** is forwarded to the view's upstream servers, one
+//! - **`A` and `AAAA` for a name on the container's networks** (a
+//!   container's name, aliases, short id, hostname; registered by the
+//!   daemon with [`Zone::add`], once per address): the networks are
+//!   searched in order, and the first that has the name answers, with
+//!   every address of the asked family it has under that name (several
+//!   containers can share an alias), in random order, TTL [`TTL`],
+//!   authoritative. One network answers both types, so that a client that
+//!   asks for both (most do) gets the addresses of the same containers;
+//!   and the networks come in the order they were connected in, so that
+//!   connecting another one never changes the answer for a name the
+//!   container's networks already had. Names match without regard to
+//!   case, with or without a trailing dot, bare (`web`) or qualified by a
+//!   network's name (`web.backend`, which only `backend` has). A network
+//!   the container isn't on is never searched, not even for a name
+//!   qualified by its name: a container learns nothing of the networks it
+//!   isn't on.
+//! - **Any other type for such a name** (`MX`, `TXT`, …), and **a family
+//!   the network has no address of** for it (`AAAA` on a network without
+//!   IPv6): `NOERROR` with no answers. The name is ours, and an empty
+//!   answer stops the client from asking elsewhere about it.
+//! - **`PTR` for an address on the container's networks**
+//!   (`2.0.89.10.in-addr.arpa`; for an IPv6 address its 32 nibbles, least
+//!   significant first, `2.0.0.0.(…).0.0.d.f.ip6.arpa` for `fd00::2`):
+//!   `<first name>.<network>.`, as Docker's, from the first network that
+//!   has the address. A name not exactly of that shape (31 nibbles, `02`
+//!   for a nibble or an octet) is not an address, and goes the way of
+//!   everything else.
+//! - **Everything else** is forwarded to the scope's upstream servers, one
 //!   after the other until one answers ([`FORWARD_TIMEOUT`] each): the
 //!   query's bytes as they came, with a fresh random ID (restored in the
 //!   answer), over the transport it came in on (UDP over UDP, TCP over
 //!   TCP), from a socket of its own in the daemon's (the host's) network
 //!   namespace; the answer is relayed as it is, truncated or not. With no
-//!   upstream servers (an internal network) the answer is `REFUSED`; when
+//!   upstream servers (internal networks) the answer is `REFUSED`; when
 //!   none answers, `SERVFAIL`. At most [`MAX_FORWARDS`] forwards per server
 //!   (UDP and TCP together) are in flight; beyond that a query gets
 //!   `SERVFAIL` at once.
@@ -75,12 +96,12 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
 use hickory_proto::op::{Header, Message, MessageType, Metadata, OpCode, Query, ResponseCode};
-use hickory_proto::rr::rdata::{A, PTR};
+use hickory_proto::rr::rdata::{A, AAAA, PTR};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable, BinEncoder};
 use rand::seq::SliceRandom;
@@ -114,9 +135,11 @@ const UDP_SIZE: u16 = 512;
 /// usually), so that it doesn't spin.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
-/// The names of every network's containers. Shared (`Arc`) by the daemon,
-/// which adds and removes containers as they start and stop, and every
-/// container's [`DnsServer`], which reads it for each query.
+/// The names of every network's containers, and their addresses, IPv4 and
+/// IPv6. Shared (`Arc`) by the daemon, which adds and removes addresses as
+/// containers start and stop and are connected to networks and
+/// disconnected from them, and every container's [`DnsServer`], which
+/// reads it for each query.
 #[derive(Debug, Default)]
 pub struct Zone {
     /// By network name.
@@ -128,10 +151,10 @@ pub struct Zone {
 #[derive(Debug, Default)]
 struct NetworkNames {
     /// Each name and its addresses, in the order they were added.
-    addresses: HashMap<String, Vec<Ipv4Addr>>,
+    addresses: HashMap<String, Vec<IpAddr>>,
     /// Each address and its names, in the order they were added: the first
     /// is what `PTR` answers.
-    names: HashMap<Ipv4Addr, Vec<String>>,
+    names: HashMap<IpAddr, Vec<String>>,
 }
 
 impl Zone {
@@ -140,10 +163,11 @@ impl Zone {
         Arc::new(Zone::default())
     }
 
-    /// Registers `ip` on `network` under `names` (the first is what `PTR`
-    /// answers). Names are stored lowercased; adding an address a name
-    /// already has is a no-op.
-    pub fn add(&self, network: &str, ip: Ipv4Addr, names: &[String]) {
+    /// Registers `ip` (IPv4 or IPv6) on `network` under `names` (the first
+    /// is what `PTR` answers): a container with an address of each family
+    /// is registered twice, under the same names. Names are stored
+    /// lowercased; adding an address a name already has is a no-op.
+    pub fn add(&self, network: &str, ip: IpAddr, names: &[String]) {
         let names: Vec<String> = names.iter().map(|n| normalize(n)).filter(|n| !n.is_empty()).collect();
         if names.is_empty() {
             return;
@@ -159,8 +183,9 @@ impl Zone {
         }
     }
 
-    /// Forgets `ip` on `network`, under every name.
-    pub fn remove(&self, network: &str, ip: Ipv4Addr) {
+    /// Forgets `ip` on `network`, under every name; the names keep their
+    /// other addresses (the container's address of the other family, say).
+    pub fn remove(&self, network: &str, ip: IpAddr) {
         let mut networks = self.write();
         let Some(net) = networks.get_mut(network) else { return };
         for name in net.names.remove(&ip).unwrap_or_default() {
@@ -176,9 +201,9 @@ impl Zone {
         }
     }
 
-    /// The addresses `name` (bare or `name.<network>`, any case, an
-    /// optional trailing dot) has on `network`.
-    pub fn lookup(&self, network: &str, name: &str) -> Vec<Ipv4Addr> {
+    /// Every address (both families) `name` (bare or `name.<network>`, any
+    /// case, an optional trailing dot) has on `network`.
+    pub fn lookup(&self, network: &str, name: &str) -> Vec<IpAddr> {
         let name = normalize(name);
         let networks = self.read();
         let Some(net) = networks.get(network) else { return Vec::new() };
@@ -191,7 +216,7 @@ impl Zone {
     }
 
     /// The name `PTR` answers for `ip` on `network`: `<first name>.<network>`.
-    pub fn reverse(&self, network: &str, ip: Ipv4Addr) -> Option<String> {
+    pub fn reverse(&self, network: &str, ip: IpAddr) -> Option<String> {
         let networks = self.read();
         let first = networks.get(network)?.names.get(&ip)?.first()?;
         Some(format!("{first}.{network}"))
@@ -215,16 +240,53 @@ fn normalize(name: &str) -> String {
     name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase()
 }
 
-/// How one container's server answers.
+/// What one container's server answers for, and where it forwards the
+/// rest. Clones share the scope: the daemon keeps one to change it while
+/// the server runs ([`View::set_scope`]), when the container is connected
+/// to a network or disconnected from one.
 #[derive(Debug, Clone)]
 pub struct View {
-    /// The network it answers for.
-    pub network: String,
     /// Every network's names.
-    pub zone: Arc<Zone>,
+    zone: Arc<Zone>,
+    /// Read once by each query, as it arrives: copied out, so that no query
+    /// holds the lock while it waits (for an upstream server, say).
+    scope: Arc<RwLock<Scope>>,
+}
+
+/// A view's networks and upstream servers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Scope {
+    /// The user-defined networks the container is on, in the order it was
+    /// connected to them: the first that has a name (or an address, for
+    /// `PTR`) answers for it.
+    pub networks: Vec<String>,
     /// Where other questions go (port 53, usually); empty: nowhere
     /// (`REFUSED`).
     pub upstreams: Vec<SocketAddr>,
+}
+
+impl View {
+    /// A view of `zone`, through `scope` until it is replaced.
+    pub fn new(zone: Arc<Zone>, scope: Scope) -> View {
+        View { zone, scope: Arc::new(RwLock::new(scope)) }
+    }
+
+    /// A copy of the current scope.
+    pub fn scope(&self) -> Scope {
+        self.scope.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Replaces the scope; queries arriving afterwards use the new one.
+    pub fn set_scope(&self, scope: Scope) {
+        // A scope is replaced whole, so a writer that panicked (none can)
+        // would leave nothing half done: a poisoned lock is used as it is.
+        *self.scope.write().unwrap_or_else(PoisonError::into_inner) = scope;
+    }
+
+    /// Every network's names.
+    pub fn zone(&self) -> &Arc<Zone> {
+        &self.zone
+    }
 }
 
 /// One container's DNS server: serves its two sockets until dropped.
@@ -240,7 +302,8 @@ pub struct DnsServer {
 
 impl DnsServer {
     /// Starts serving `udp` and `tcp` (bound already, in the container's
-    /// network namespace; made non-blocking here). Must be called inside a
+    /// network namespace; made non-blocking here) as `view` says, with its
+    /// scope as it is when each query arrives. Must be called inside a
     /// tokio runtime; the tasks end when the server is dropped. They log in
     /// the span that is current here.
     pub fn spawn(udp: std::net::UdpSocket, tcp: std::net::TcpListener, view: View) -> std::io::Result<DnsServer> {
@@ -333,19 +396,22 @@ async fn serve_udp(socket: UdpSocket, shared: Arc<Shared>) {
             continue;
         }
         let query = &buf[..len];
-        match answer_locally(query, &shared.view) {
+        // The scope as it is now, for all of this query: its answer, and its
+        // forward if it gets one.
+        let scope = shared.view.scope();
+        match answer_in(query, &shared.view.zone, &scope) {
             Some(answer) => send_answer(&socket, &fit_udp(query, answer), client).await,
             None => match shared.forwards.clone().try_acquire_owned() {
                 Ok(permit) => {
                     let (socket, shared, query) = (socket.clone(), shared.clone(), query.to_vec());
                     let forward = async move {
-                        let answer = shared.forward(Transport::Udp, &query).await;
+                        let answer = shared.forward(Transport::Udp, &query, &scope).await;
                         send_answer(&socket, &answer, client).await;
                         drop(permit);
                     };
                     forwards.spawn(forward.in_current_span());
                 }
-                Err(_) => send_answer(&socket, &failure(query, ResponseCode::ServFail, &shared.view), client).await,
+                Err(_) => send_answer(&socket, &failure(query, ResponseCode::ServFail, &scope), client).await,
             },
         }
     }
@@ -377,7 +443,7 @@ async fn serve_tcp(listener: TcpListener, shared: Arc<Shared>) {
                     connections.spawn(serve_connection(stream, shared.clone()).in_current_span());
                 }
                 Err(e) => {
-                    tracing::warn!(network = %shared.view.network, "dns: accept a TCP connection: {e}");
+                    tracing::warn!(networks = ?shared.view.scope().networks, "dns: accept a TCP connection: {e}");
                     tokio::time::sleep(ACCEPT_BACKOFF).await;
                 }
             },
@@ -400,12 +466,14 @@ async fn serve_connection(mut stream: TcpStream, shared: Arc<Shared>) {
                 return;
             }
         };
-        let answer = match answer_locally(&query, &shared.view) {
+        // As over UDP: the scope as it is now, for all of this query.
+        let scope = shared.view.scope();
+        let answer = match answer_in(&query, &shared.view.zone, &scope) {
             Some(answer) => answer,
             None => match shared.forwards.try_acquire() {
                 // The permit is held until the answer is in.
-                Ok(_permit) => shared.forward(Transport::Tcp, &query).await,
-                Err(_) => failure(&query, ResponseCode::ServFail, &shared.view),
+                Ok(_permit) => shared.forward(Transport::Tcp, &query, &scope).await,
+                Err(_) => failure(&query, ResponseCode::ServFail, &scope),
             },
         };
         if answer.is_empty() {
@@ -448,10 +516,11 @@ async fn write_message(stream: &mut (impl AsyncWrite + Unpin), message: &[u8]) -
 }
 
 impl Shared {
-    /// The answer to `query` from the first upstream server that gives one
-    /// in time, with the client's ID back in it; `SERVFAIL` if none does.
-    async fn forward(&self, transport: Transport, query: &[u8]) -> Vec<u8> {
-        for &upstream in &self.view.upstreams {
+    /// The answer to `query` from the first of `scope`'s upstream servers
+    /// that gives one in time, with the client's ID back in it; `SERVFAIL`
+    /// if none does.
+    async fn forward(&self, transport: Transport, query: &[u8], scope: &Scope) -> Vec<u8> {
+        for &upstream in &scope.upstreams {
             let exchange = async {
                 match transport {
                     Transport::Udp => exchange_udp(query, upstream).await,
@@ -467,7 +536,7 @@ impl Shared {
                 Err(_) => tracing::debug!("dns: forward to {upstream} over {transport:?}: no answer in time"),
             }
         }
-        failure(query, ResponseCode::ServFail, &self.view)
+        failure(query, ResponseCode::ServFail, scope)
     }
 }
 
@@ -526,18 +595,25 @@ fn is_answer_to(message: &[u8], id: [u8; 2]) -> bool {
     message.len() >= HEADER_LEN && message[..2] == id && message[2] & QR != 0
 }
 
-/// The answer to `query` (a whole DNS message) if this server can give it
-/// without asking anyone: `Some(bytes)` for a local name, a `PTR` of the
-/// network, a malformed query or no upstreams; `None` when it must be
-/// forwarded. What [`DnsServer`] does for each message, as a pure function
-/// (but for cutting a long answer to fit a UDP datagram). Something too
-/// short to be a DNS message gets no answer at all: `Some` of no bytes.
+/// The answer to `query` (a whole DNS message) if `view`'s server can give
+/// it without asking anyone, with the view's scope as it is now:
+/// `Some(bytes)` for a name or a `PTR` of one of its networks, a malformed
+/// query or no upstreams; `None` when it must be forwarded. What
+/// [`DnsServer`] does for each message, as a function of the zone and the
+/// scope (but for cutting a long answer to fit a UDP datagram). Something
+/// too short to be a DNS message gets no answer at all: `Some` of no bytes.
 pub fn answer_locally(query: &[u8], view: &View) -> Option<Vec<u8>> {
+    answer_in(query, &view.zone, &view.scope())
+}
+
+/// [`answer_locally`], with a scope read already: the server reads it once
+/// per query, for the answer and the forward alike.
+fn answer_in(query: &[u8], zone: &Zone, scope: &Scope) -> Option<Vec<u8>> {
     let Ok(header) = Header::from_bytes(query) else {
         return Some(Vec::new());
     };
     // The header is all that is certain here, and all that is answered.
-    let reject = |code| Some(encode(&response(&header.metadata, None, code, view)));
+    let reject = |code| Some(encode(&response(&header.metadata, None, code, scope)));
     if header.message_type == MessageType::Response {
         return Some(Vec::new());
     }
@@ -552,51 +628,76 @@ pub fn answer_locally(query: &[u8], view: &View) -> Option<Vec<u8>> {
         return reject(ResponseCode::FormErr);
     };
     let question = &message.queries[0];
-    if let Some(records) = local_records(question, view) {
-        let mut answer = response(&message.metadata, Some(question), ResponseCode::NoError, view);
+    if let Some(records) = local_records(question, zone, scope) {
+        let mut answer = response(&message.metadata, Some(question), ResponseCode::NoError, scope);
         answer.metadata.authoritative = true;
         answer.answers = records;
         return Some(encode(&answer));
     }
-    if view.upstreams.is_empty() {
-        return Some(encode(&response(&message.metadata, Some(question), ResponseCode::Refused, view)));
+    if scope.upstreams.is_empty() {
+        return Some(encode(&response(&message.metadata, Some(question), ResponseCode::Refused, scope)));
     }
     None
 }
 
-/// What the zone has for `question`, if it is about the network: the
-/// records (none, for another type than `A` of a name) for a name or an
-/// address on it; `None` for anything else.
-fn local_records(question: &Query, view: &View) -> Option<Vec<Record>> {
+/// What the zone has for `question`, if it is about one of `scope`'s
+/// networks: the records for a name on one (none, for another type than `A`
+/// and `AAAA`, or a family the network has no address of for it) or for an
+/// address on one; `None` for anything else.
+fn local_records(question: &Query, zone: &Zone, scope: &Scope) -> Option<Vec<Record>> {
     if question.query_class != DNSClass::IN {
         return None;
     }
     let name = &question.name;
     if question.query_type == RecordType::PTR
-        && let Some(target) = reverse_address(name).and_then(|ip| view.zone.reverse(&view.network, ip))
+        && let Some(target) =
+            reverse_address(name).and_then(|ip| scope.networks.iter().find_map(|network| zone.reverse(network, ip)))
     {
         let target = Name::from_ascii(format!("{target}.")).ok()?;
         return Some(vec![Record::from_rdata(name.clone(), TTL, RData::PTR(PTR(target)))]);
     }
-    let mut addresses = view.zone.lookup(&view.network, &name.to_ascii());
-    if addresses.is_empty() {
-        return None;
-    }
-    if question.query_type != RecordType::A {
-        return Some(Vec::new());
-    }
-    addresses.shuffle(&mut rand::rng());
-    Some(addresses.into_iter().map(|ip| Record::from_rdata(name.clone(), TTL, RData::A(A(ip)))).collect())
+    // The first network that has the name answers for it, whatever the type
+    // (see the module docs): a client that asks for `A` and `AAAA` gets the
+    // addresses of the same containers, never IPv4 from one network and
+    // IPv6 from another.
+    let asked = name.to_ascii();
+    let addresses =
+        scope.networks.iter().map(|network| zone.lookup(network, &asked)).find(|addresses| !addresses.is_empty())?;
+    let mut records: Vec<Record> = addresses
+        .into_iter()
+        .filter_map(|ip| match (question.query_type, ip) {
+            (RecordType::A, IpAddr::V4(ip)) => Some(RData::A(A(ip))),
+            (RecordType::AAAA, IpAddr::V6(ip)) => Some(RData::AAAA(AAAA(ip))),
+            _ => None,
+        })
+        .map(|data| Record::from_rdata(name.clone(), TTL, data))
+        .collect();
+    records.shuffle(&mut rand::rng());
+    Some(records)
 }
 
-/// The address a reverse name stands for (`2.0.89.10.in-addr.arpa.`:
-/// 10.89.0.2), if `name` is one: four octets, written as numbers usually are.
-fn reverse_address(name: &Name) -> Option<Ipv4Addr> {
+/// The address a reverse name stands for, if `name` is one:
+/// `2.0.89.10.in-addr.arpa.` is 10.89.0.2, and
+/// `2.0.0.0.(…).0.0.d.f.ip6.arpa.` is fd00::2.
+fn reverse_address(name: &Name) -> Option<IpAddr> {
     let labels: Vec<&[u8]> = name.iter().collect();
-    let &[d, c, b, a, in_addr, arpa] = labels.as_slice() else { return None };
-    if !in_addr.eq_ignore_ascii_case(b"in-addr") || !arpa.eq_ignore_ascii_case(b"arpa") {
+    let (address, &[domain, arpa]) = labels.split_last_chunk::<2>()?;
+    if !arpa.eq_ignore_ascii_case(b"arpa") {
         return None;
     }
+    if domain.eq_ignore_ascii_case(b"in-addr") {
+        reverse_ipv4(address).map(IpAddr::V4)
+    } else if domain.eq_ignore_ascii_case(b"ip6") {
+        reverse_ipv6(address).map(IpAddr::V6)
+    } else {
+        None
+    }
+}
+
+/// The address of the labels before `in-addr.arpa`: four octets, least
+/// significant first, written as numbers usually are.
+fn reverse_ipv4(labels: &[&[u8]]) -> Option<Ipv4Addr> {
+    let &[d, c, b, a] = labels else { return None };
     let octet = |label: &[u8]| {
         let text = std::str::from_utf8(label).ok()?;
         let n: u8 = text.parse().ok()?;
@@ -606,14 +707,28 @@ fn reverse_address(name: &Name) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::new(octet(a)?, octet(b)?, octet(c)?, octet(d)?))
 }
 
+/// The address of the labels before `ip6.arpa`: 32 nibbles, least
+/// significant first, a hex digit each, in either case (RFC 3596 §2.5).
+/// Anything else (a nibble short or one too many, `02` for `2`) is another
+/// name, which no address has.
+fn reverse_ipv6(labels: &[&[u8]]) -> Option<Ipv6Addr> {
+    let labels: &[&[u8]; 32] = labels.try_into().ok()?;
+    let mut bits = 0u128;
+    for label in labels.iter().rev() {
+        let &[digit] = *label else { return None };
+        bits = (bits << 4) | u128::from(char::from(digit).to_digit(16)?);
+    }
+    Some(Ipv6Addr::from_bits(bits))
+}
+
 /// The start of a response to a message with `metadata`: its ID and opcode,
 /// its `RD` and `CD` bits, `question` if it is to be echoed, `code`, and
-/// `RA` if the view has somewhere to forward to.
-fn response(metadata: &Metadata, question: Option<&Query>, code: ResponseCode, view: &View) -> Message {
+/// `RA` if the scope has somewhere to forward to.
+fn response(metadata: &Metadata, question: Option<&Query>, code: ResponseCode, scope: &Scope) -> Message {
     let mut response = Message::response(metadata.id, metadata.op_code);
     response.metadata = Metadata::response_from_request(metadata);
     response.metadata.response_code = code;
-    response.metadata.recursion_available = !view.upstreams.is_empty();
+    response.metadata.recursion_available = !scope.upstreams.is_empty();
     if let Some(question) = question {
         response.add_query(question.clone());
     }
@@ -622,9 +737,9 @@ fn response(metadata: &Metadata, question: Option<&Query>, code: ResponseCode, v
 
 /// A `code` response to `query` (one that parses: it was to be forwarded),
 /// with its question.
-fn failure(query: &[u8], code: ResponseCode, view: &View) -> Vec<u8> {
+fn failure(query: &[u8], code: ResponseCode, scope: &Scope) -> Vec<u8> {
     match Message::from_vec(query) {
-        Ok(query) => encode(&response(&query.metadata, query.queries.first(), code, view)),
+        Ok(query) => encode(&response(&query.metadata, query.queries.first(), code, scope)),
         Err(_) => Vec::new(),
     }
 }
@@ -678,12 +793,20 @@ mod tests {
 
     use super::*;
 
-    const WEB: Ipv4Addr = Ipv4Addr::new(10, 89, 0, 2);
-    const WEB2: Ipv4Addr = Ipv4Addr::new(10, 89, 0, 3);
-    const DB: Ipv4Addr = Ipv4Addr::new(10, 89, 0, 4);
-    const CACHE: Ipv4Addr = Ipv4Addr::new(10, 90, 0, 2);
+    const WEB: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 89, 0, 2));
+    const WEB2: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 89, 0, 3));
+    const DB: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 89, 0, 4));
+    const CACHE: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 90, 0, 2));
+    /// `proxy` on `public`, a dual-stack network (an address of each
+    /// family), and on `backend`.
+    const PROXY: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 91, 0, 2));
+    const PROXY6: IpAddr = IpAddr::V6(Ipv6Addr::new(0xfd00, 0x89, 0, 0x91, 0, 0, 0, 2));
+    const PROXY_BACKEND: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 89, 0, 9));
+    /// `edge`, on `public` only.
+    const EDGE: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 91, 0, 3));
+    const EDGE6: IpAddr = IpAddr::V6(Ipv6Addr::new(0xfd00, 0x89, 0, 0x91, 0, 0, 0, 3));
     /// No addresses (what an unknown name has).
-    const NONE: [Ipv4Addr; 0] = [];
+    const NONE: [IpAddr; 0] = [];
     /// What the fake upstream servers answer.
     const FAR: A = A::new(192, 0, 2, 1);
     /// What they answer when they answer something else.
@@ -707,13 +830,32 @@ mod tests {
 
     /// The network `backend`: `web` (alias `app`, shared with `web2`) and
     /// `db`; and `cache`, on `frontend`.
-    fn view(upstreams: Vec<SocketAddr>) -> View {
+    fn zone() -> Arc<Zone> {
         let zone = Zone::new();
         zone.add("backend", WEB, &names(&["web", "app"]));
         zone.add("backend", WEB2, &names(&["web2", "app"]));
         zone.add("backend", DB, &names(&["db"]));
         zone.add("frontend", CACHE, &names(&["cache"]));
-        View { network: "backend".into(), zone, upstreams }
+        zone
+    }
+
+    /// [`zone`], for a container on `backend`.
+    fn view(upstreams: Vec<SocketAddr>) -> View {
+        View::new(zone(), Scope { networks: names(&["backend"]), upstreams })
+    }
+
+    /// [`zone`], and `public`, a dual-stack network: `proxy` and `edge`
+    /// (alias `app`, both), registered as the daemon does it, once per
+    /// address. `proxy` is on `backend` too. For a container on `networks`,
+    /// connected to them in that order.
+    fn connected(upstreams: Vec<SocketAddr>, networks: &[&str]) -> View {
+        let zone = zone();
+        for (ip, ip6, name) in [(PROXY, PROXY6, "proxy"), (EDGE, EDGE6, "edge")] {
+            zone.add("public", ip, &names(&[name, "app"]));
+            zone.add("public", ip6, &names(&[name, "app"]));
+        }
+        zone.add("backend", PROXY_BACKEND, &names(&["proxy"]));
+        View::new(zone, Scope { networks: names(networks), upstreams })
     }
 
     /// Somewhere to forward to, for tests that never get that far.
@@ -741,15 +883,48 @@ mod tests {
         Message::from_vec(&answer_locally(query, view).expect("a local answer")).unwrap()
     }
 
-    fn addresses(answer: &Message) -> Vec<Ipv4Addr> {
+    fn addresses(answer: &Message) -> Vec<IpAddr> {
         answer
             .answers
             .iter()
             .map(|r| match r.data {
-                RData::A(A(ip)) => ip,
+                RData::A(A(ip)) => IpAddr::V4(ip),
+                RData::AAAA(AAAA(ip)) => IpAddr::V6(ip),
                 ref other => panic!("not an address: {other:?}"),
             })
             .collect()
+    }
+
+    /// The addresses `view` has for `name` (locally), sorted.
+    fn resolve(view: &View, name: &str, record_type: RecordType) -> Vec<IpAddr> {
+        let mut addresses = addresses(&local(&query(1, name, record_type), view));
+        addresses.sort();
+        addresses
+    }
+
+    /// The name `answer`'s one record, a `PTR`, points to.
+    fn ptr_target(answer: &Message) -> String {
+        let [record] = answer.answers.as_slice() else { panic!("not one record: {:?}", answer.answers) };
+        match &record.data {
+            RData::PTR(PTR(name)) => name.to_ascii(),
+            other => panic!("not a PTR: {other:?}"),
+        }
+    }
+
+    /// The name a `PTR` question for `ip` asks about: `2.0.89.10.in-addr.arpa.`
+    /// for 10.89.0.2; for an IPv6 address its 32 nibbles, least significant
+    /// first, then `ip6.arpa.`.
+    fn arpa(ip: IpAddr) -> String {
+        match ip {
+            IpAddr::V4(ip) => {
+                let [a, b, c, d] = ip.octets();
+                format!("{d}.{c}.{b}.{a}.in-addr.arpa.")
+            }
+            IpAddr::V6(ip) => {
+                let nibbles: Vec<String> = (0..32).map(|i| format!("{:x}", (ip.to_bits() >> (4 * i)) & 0xf)).collect();
+                format!("{}.ip6.arpa.", nibbles.join("."))
+            }
+        }
     }
 
     #[test]
@@ -776,7 +951,7 @@ mod tests {
 
     #[test]
     fn several_containers_can_share_a_name() {
-        let zone = view(Vec::new()).zone;
+        let zone = zone();
         // Already there: nothing changes.
         zone.add("backend", WEB, &names(&["APP", "app."]));
         assert_eq!(zone.lookup("backend", "app"), [WEB, WEB2]);
@@ -786,7 +961,7 @@ mod tests {
 
     #[test]
     fn removing_a_container_leaves_the_others() {
-        let zone = view(Vec::new()).zone;
+        let zone = zone();
         zone.remove("backend", WEB);
         assert_eq!(zone.lookup("backend", "app"), [WEB2]);
         assert_eq!(zone.lookup("backend", "web"), NONE);
@@ -818,13 +993,34 @@ mod tests {
 
     #[test]
     fn names_on_another_network_do_not_answer() {
-        let zone = view(Vec::new()).zone;
+        let zone = zone();
         assert_eq!(zone.lookup("backend", "cache"), NONE);
         assert_eq!(zone.lookup("backend", "cache.frontend"), NONE);
         assert_eq!(zone.reverse("backend", CACHE), None);
         assert_eq!(zone.lookup("frontend", "web"), NONE);
         assert_eq!(zone.lookup("elsewhere", "web"), NONE);
         assert_eq!(zone.lookup("frontend", "cache.frontend"), [CACHE]);
+    }
+
+    #[test]
+    fn removing_an_ipv6_address_leaves_the_ipv4_one() {
+        let zone = Zone::new();
+        // As the daemon registers a container on a dual-stack network.
+        zone.add("public", PROXY, &names(&["proxy", "app"]));
+        zone.add("public", PROXY6, &names(&["proxy", "app"]));
+        assert_eq!(zone.lookup("public", "proxy"), [PROXY, PROXY6]);
+        assert_eq!(zone.reverse("public", PROXY6).as_deref(), Some("proxy.public"));
+        zone.remove("public", PROXY6);
+        assert_eq!(zone.lookup("public", "proxy"), [PROXY]);
+        assert_eq!(zone.lookup("public", "app.public"), [PROXY]);
+        assert_eq!(zone.reverse("public", PROXY6), None);
+        assert_eq!(zone.reverse("public", PROXY).as_deref(), Some("proxy.public"));
+        // And the other way round.
+        zone.add("public", PROXY6, &names(&["proxy", "app"]));
+        zone.remove("public", PROXY);
+        assert_eq!(zone.lookup("public", "app"), [PROXY6]);
+        assert_eq!(zone.reverse("public", PROXY), None);
+        assert_eq!(zone.reverse("public", PROXY6).as_deref(), Some("proxy.public"));
     }
 
     #[test]
@@ -853,7 +1049,7 @@ mod tests {
     fn addresses_come_in_random_order() {
         let view = view(somewhere());
         let asked = query(1, "app", RecordType::A);
-        let orders: HashSet<Vec<Ipv4Addr>> = (0..64).map(|_| addresses(&local(&asked, &view))).collect();
+        let orders: HashSet<Vec<IpAddr>> = (0..64).map(|_| addresses(&local(&asked, &view))).collect();
         assert_eq!(orders.len(), 2, "64 answers, all in one order");
     }
 
@@ -867,6 +1063,53 @@ mod tests {
             assert_eq!(answer.queries[0].query_type, record_type);
             assert!(answer.answers.is_empty() && answer.authorities.is_empty() && answer.additionals.is_empty());
         }
+    }
+
+    #[test]
+    fn aaaa_gets_a_name_s_ipv6_addresses_and_a_its_ipv4_ones() {
+        let view = connected(somewhere(), &["public"]);
+        let asked = query(0x6666, "App.Public.", RecordType::AAAA);
+        let answer = local(&asked, &view);
+        assert_eq!((answer.id, answer.response_code), (0x6666, ResponseCode::NoError));
+        assert!(answer.authoritative && answer.recursion_desired && answer.recursion_available);
+        assert!(!answer.truncation);
+        assert!(answer.queries[0].name.eq_case(&Name::from_ascii("App.Public.").unwrap()));
+        assert_eq!(answer.queries[0].query_type, RecordType::AAAA);
+        for record in &answer.answers {
+            assert!(record.name.eq_case(&answer.queries[0].name));
+            assert_eq!((record.ttl, record.dns_class, record.record_type()), (TTL, DNSClass::IN, RecordType::AAAA));
+        }
+        let mut got = addresses(&answer);
+        got.sort();
+        assert_eq!(got, [PROXY6, EDGE6]);
+        // In random order, as A's.
+        let orders: HashSet<Vec<IpAddr>> = (0..64).map(|_| addresses(&local(&asked, &view))).collect();
+        assert_eq!(orders.len(), 2, "64 answers, all in one order");
+        // A, for the same names: the IPv4 addresses, and only them.
+        assert_eq!(resolve(&view, "app", RecordType::A), [PROXY, EDGE]);
+        assert_eq!(resolve(&view, "proxy", RecordType::A), [PROXY]);
+        assert_eq!(resolve(&view, "proxy", RecordType::AAAA), [PROXY6]);
+    }
+
+    #[test]
+    fn a_family_without_addresses_is_an_empty_answer() {
+        let view = view(somewhere());
+        // Only IPv6 (no network of the daemon's makes such a container, but
+        // the zone takes it).
+        let six = IpAddr::V6(Ipv6Addr::new(0xfd00, 0x89, 0, 0x89, 0, 0, 0, 6));
+        view.zone().add("backend", six, &names(&["six"]));
+        for (name, record_type) in
+            [("web", RecordType::AAAA), ("DB.backend.", RecordType::AAAA), ("six", RecordType::A)]
+        {
+            let answer = local(&query(3, name, record_type), &view);
+            assert_eq!((answer.id, answer.response_code), (3, ResponseCode::NoError), "{name}");
+            assert!(answer.authoritative, "{name}");
+            assert_eq!(answer.queries[0].query_type, record_type, "{name}");
+            let empty = answer.answers.is_empty() && answer.authorities.is_empty() && answer.additionals.is_empty();
+            assert!(empty, "{name}");
+        }
+        assert_eq!(resolve(&view, "six", RecordType::AAAA), [six]);
+        assert_eq!(resolve(&view, "web", RecordType::A), [WEB]);
     }
 
     #[test]
@@ -901,6 +1144,78 @@ mod tests {
     }
 
     #[test]
+    fn ptr_of_an_ipv6_address_on_the_network_names_it() {
+        let view = connected(somewhere(), &["public"]);
+        // fd00:89:0:91::2, least significant nibble first, in any case.
+        for name in [
+            "2.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.1.9.0.0.0.0.0.0.9.8.0.0.0.0.d.f.ip6.arpa.",
+            "2.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.1.9.0.0.0.0.0.0.9.8.0.0.0.0.D.F.IP6.ARPA.",
+            "2.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.1.9.0.0.0.0.0.0.9.8.0.0.0.0.D.f.Ip6.arpA.",
+        ] {
+            let answer = local(&query(9, name, RecordType::PTR), &view);
+            assert_eq!((answer.id, answer.response_code), (9, ResponseCode::NoError), "{name}");
+            assert!(answer.authoritative, "{name}");
+            assert_eq!(ptr_target(&answer), "proxy.public.", "{name}");
+            assert_eq!(answer.answers[0].ttl, TTL);
+            assert!(answer.answers[0].name.eq_case(&answer.queries[0].name), "{name}");
+        }
+        // (So the tests' own reverse names are right.)
+        assert_eq!(arpa(PROXY6), "2.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.1.9.0.0.0.0.0.0.9.8.0.0.0.0.d.f.ip6.arpa.");
+        assert_eq!(ptr_target(&local(&query(10, &arpa(EDGE6), RecordType::PTR), &view)), "edge.public.");
+    }
+
+    #[test]
+    fn reverse_names_stand_for_addresses() {
+        let address = |name: &str| reverse_address(&Name::from_ascii(name).unwrap());
+        assert_eq!(address("2.0.89.10.in-addr.arpa."), Some(WEB));
+        assert_eq!(
+            address("2.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.d.f.ip6.arpa."),
+            Some("fd00::2".parse().unwrap())
+        );
+        // Each nibble in its place, in either case.
+        assert_eq!(
+            address("F.e.D.c.B.a.9.8.7.6.5.4.3.2.1.0.f.E.d.C.b.A.9.8.7.6.5.4.3.2.1.0.IP6.Arpa"),
+            Some("123:4567:89ab:cdef:123:4567:89ab:cdef".parse().unwrap())
+        );
+        let name = arpa(PROXY6);
+        let nibbles = name.strip_suffix("ip6.arpa.").unwrap();
+        let mut others = not_quite(&name).to_vec();
+        others.extend([
+            // Another domain, or more after it.
+            format!("{nibbles}ip6.int."),
+            format!("{nibbles}in-addr.arpa."),
+            format!("{name}example."),
+            "0.89.10.in-addr.arpa.".to_owned(),
+            "d.f.ip6.arpa.".to_owned(),
+            "ip6.arpa.".to_owned(),
+            "arpa.".to_owned(),
+            ".".to_owned(),
+        ]);
+        for name in &others {
+            assert_eq!(address(name), None, "{name}");
+        }
+    }
+
+    /// Names close to `name`, an address's `ip6.arpa` name whose first
+    /// nibble is `2`, but not of its shape: a nibble short, one too many,
+    /// two characters for the first one (`02`), and a letter that isn't a
+    /// hex digit for it.
+    fn not_quite(name: &str) -> [String; 4] {
+        assert!(name.starts_with("2.") && name.ends_with(".ip6.arpa."), "{name}");
+        [name[2..].to_owned(), format!("0.{name}"), format!("0{name}"), format!("g{}", &name[1..])]
+    }
+
+    #[test]
+    fn ptr_of_what_is_not_quite_an_ipv6_address_is_forwarded() {
+        let view = connected(somewhere(), &["public"]);
+        let name = arpa(PROXY6);
+        assert!(answer_locally(&query(1, &name, RecordType::PTR), &view).is_some(), "{name}");
+        for name in not_quite(&name) {
+            assert_eq!(answer_locally(&query(1, &name, RecordType::PTR), &view), None, "{name}");
+        }
+    }
+
+    #[test]
     fn other_names_are_forwarded() {
         let view = view(somewhere());
         for name in ["example.com.", "cache", "cache.frontend.", "web.example.com.", "backend."] {
@@ -921,6 +1236,92 @@ mod tests {
         assert!(answer.answers.is_empty());
         // Names on the network still answer.
         assert_eq!(addresses(&local(&query(6, "web", RecordType::A), &view)), [WEB]);
+    }
+
+    #[test]
+    fn the_first_network_with_a_name_answers_for_it() {
+        // Connected to `public`, then to `backend`: both have `app` (other
+        // containers on each) and `proxy` (the same one on both).
+        let view = connected(somewhere(), &["public", "backend"]);
+        assert_eq!(resolve(&view, "app", RecordType::A), [PROXY, EDGE]);
+        assert_eq!(resolve(&view, "app", RecordType::AAAA), [PROXY6, EDGE6]);
+        assert_eq!(resolve(&view, "proxy", RecordType::A), [PROXY]);
+        // A name only the second one has, or qualified by its name: its own.
+        assert_eq!(resolve(&view, "web", RecordType::A), [WEB]);
+        assert_eq!(resolve(&view, "App.Backend.", RecordType::A), [WEB, WEB2]);
+        assert_eq!(resolve(&view, "proxy.backend", RecordType::A), [PROXY_BACKEND]);
+        assert_eq!(resolve(&view, "proxy.public", RecordType::A), [PROXY]);
+
+        // The other way round, `backend` answers for both names, AAAA too,
+        // though it has no IPv6 address for them.
+        let view = connected(somewhere(), &["backend", "public"]);
+        assert_eq!(resolve(&view, "app", RecordType::A), [WEB, WEB2]);
+        assert_eq!(resolve(&view, "proxy", RecordType::A), [PROXY_BACKEND]);
+        for name in ["app", "proxy"] {
+            let answer = local(&query(2, name, RecordType::AAAA), &view);
+            assert_eq!((answer.response_code, answer.authoritative), (ResponseCode::NoError, true), "{name}");
+            assert_eq!(addresses(&answer), NONE, "{name}");
+        }
+        assert_eq!(resolve(&view, "app.public", RecordType::AAAA), [PROXY6, EDGE6]);
+        assert_eq!(resolve(&view, "proxy.public", RecordType::AAAA), [PROXY6]);
+    }
+
+    #[test]
+    fn networks_the_container_is_not_on_never_answer() {
+        // `cache` is on `frontend`, which this container isn't on.
+        let view = connected(somewhere(), &["public", "backend"]);
+        for name in ["cache", "cache.frontend", "Cache.Frontend."] {
+            for record_type in [RecordType::A, RecordType::AAAA, RecordType::TXT] {
+                assert_eq!(answer_locally(&query(1, name, record_type), &view), None, "{name} {record_type}");
+            }
+        }
+        assert_eq!(answer_locally(&query(1, &arpa(CACHE), RecordType::PTR), &view), None);
+        // Without upstream servers: refused, as any name of elsewhere.
+        let view = connected(Vec::new(), &["public", "backend"]);
+        let answer = local(&query(5, "cache.frontend", RecordType::A), &view);
+        assert_eq!((answer.id, answer.response_code), (5, ResponseCode::Refused));
+        assert!(!answer.authoritative && answer.answers.is_empty());
+        // On no network at all, nothing is local.
+        let view = connected(somewhere(), &[]);
+        for name in ["web", "proxy", "app.public"] {
+            assert_eq!(answer_locally(&query(1, name, RecordType::A), &view), None, "{name}");
+        }
+        assert_eq!(answer_locally(&query(1, &arpa(PROXY6), RecordType::PTR), &view), None);
+        // (On `frontend`, the same names answer.)
+        let view = connected(somewhere(), &["frontend"]);
+        assert_eq!(resolve(&view, "cache.frontend", RecordType::A), [CACHE]);
+        assert_eq!(ptr_target(&local(&query(1, &arpa(CACHE), RecordType::PTR), &view)), "cache.frontend.");
+    }
+
+    #[test]
+    fn ptr_searches_the_container_s_networks_in_order() {
+        let view = connected(somewhere(), &["public", "backend"]);
+        let ptr = |ip| ptr_target(&local(&query(1, &arpa(ip), RecordType::PTR), &view));
+        assert_eq!(ptr(DB), "db.backend.");
+        assert_eq!(ptr(PROXY_BACKEND), "proxy.backend.");
+        assert_eq!(ptr(PROXY), "proxy.public.");
+        assert_eq!(ptr(EDGE6), "edge.public.");
+        // An address on two of them (no daemon hands one out twice, but the
+        // zone takes it): the first one's name for it.
+        view.zone().add("backend", EDGE, &names(&["edge-too"]));
+        assert_eq!(ptr(EDGE), "edge.public.");
+        view.set_scope(Scope { networks: names(&["backend", "public"]), upstreams: somewhere() });
+        assert_eq!(ptr(EDGE), "edge-too.backend.");
+    }
+
+    #[test]
+    fn clones_of_a_view_share_its_scope() {
+        let view = view(somewhere());
+        // As the daemon keeps one, while the server has the other.
+        let kept = view.clone();
+        assert_eq!(kept.scope(), Scope { networks: names(&["backend"]), upstreams: somewhere() });
+        assert!(Arc::ptr_eq(kept.zone(), view.zone()));
+        kept.set_scope(Scope { networks: names(&["frontend"]), upstreams: Vec::new() });
+        assert_eq!(view.scope(), Scope { networks: names(&["frontend"]), upstreams: Vec::new() });
+        // The next query sees it.
+        assert_eq!(resolve(&view, "cache", RecordType::A), [CACHE]);
+        let answer = local(&query(2, "web", RecordType::A), &view);
+        assert_eq!((answer.response_code, answer.recursion_available), (ResponseCode::Refused, false));
     }
 
     #[test]
@@ -973,14 +1374,14 @@ mod tests {
     /// addresses than 512 bytes hold.
     fn crowd(zone: &Zone) {
         for i in 0..CROWD {
-            zone.add("backend", Ipv4Addr::new(10, 89, 1, i), &names(&["many"]));
+            zone.add("backend", IpAddr::V4(Ipv4Addr::new(10, 89, 1, i)), &names(&["many"]));
         }
     }
 
     #[test]
     fn long_local_answers_are_cut_to_fit_a_datagram() {
         let view = view(somewhere());
-        crowd(&view.zone);
+        crowd(view.zone());
         let plain = query(1, "many", RecordType::A);
         let whole = answer_locally(&plain, &view).unwrap();
         assert_eq!(
@@ -1014,6 +1415,7 @@ mod tests {
         send_sync::<DnsServer>();
         send_sync::<Zone>();
         send_sync::<View>();
+        send_sync::<Scope>();
     }
 
     /// A UDP socket and a TCP listener on 127.0.0.1, on ports the kernel
@@ -1075,9 +1477,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ipv6_and_several_networks_answer_over_udp_and_tcp() {
+        let (udp, tcp, udp_address, tcp_address) = sockets();
+        let _server = DnsServer::spawn(udp, tcp, connected(Vec::new(), &["public", "backend"])).unwrap();
+        let answer = parse(ask_udp(udp_address, &query(1, "proxy", RecordType::AAAA), PATIENCE).await);
+        assert_eq!((answer.id, addresses(&answer)), (1, vec![PROXY6]));
+        let answer = parse(ask_udp(udp_address, &query(2, &arpa(EDGE6), RecordType::PTR), PATIENCE).await);
+        assert_eq!((answer.id, ptr_target(&answer)), (2, "edge.public.".to_owned()));
+        let mut stream = TcpStream::connect(tcp_address).await.unwrap();
+        let answer = ask_tcp(&mut stream, &query(3, "proxy", RecordType::A)).await;
+        assert_eq!((answer.id, addresses(&answer)), (3, vec![PROXY]));
+        let answer = ask_tcp(&mut stream, &query(4, "proxy.backend.", RecordType::A)).await;
+        assert_eq!((answer.id, addresses(&answer)), (4, vec![PROXY_BACKEND]));
+        let answer = ask_tcp(&mut stream, &query(5, &arpa(DB), RecordType::PTR)).await;
+        assert_eq!((answer.id, ptr_target(&answer)), (5, "db.backend.".to_owned()));
+        // Not a network of the container's: refused, as there is nowhere to
+        // forward to.
+        let answer = ask_tcp(&mut stream, &query(6, "cache.frontend", RecordType::A)).await;
+        assert_eq!((answer.id, answer.response_code), (6, ResponseCode::Refused));
+    }
+
+    #[tokio::test]
     async fn long_answers_are_cut_over_udp_but_not_tcp() {
         let view = view(Vec::new());
-        crowd(&view.zone);
+        crowd(view.zone());
         let (_server, udp, tcp) = serve(view, QUICK);
         let asked = query(4, "many", RecordType::A);
         let over_udp = ask_udp(udp, &asked, PATIENCE).await.expect("an answer");
@@ -1245,7 +1668,7 @@ mod tests {
         let mut stream = TcpStream::connect(tcp).await.unwrap();
         let over_tcp = ask_tcp(&mut stream, &asked).await;
         for answer in [over_udp, over_tcp] {
-            assert_eq!((answer.id, addresses(&answer)), (0x0202, vec![FAR.0]));
+            assert_eq!((answer.id, addresses(&answer)), (0x0202, vec![IpAddr::V4(FAR.0)]));
         }
     }
 
@@ -1261,7 +1684,7 @@ mod tests {
         let mut stream = TcpStream::connect(tcp).await.unwrap();
         let answer = ask_tcp(&mut stream, &asked).await;
         assert!(!answer.truncation);
-        assert_eq!((answer.id, addresses(&answer)), (0x0101, vec![FAR.0]));
+        assert_eq!((answer.id, addresses(&answer)), (0x0101, vec![IpAddr::V4(FAR.0)]));
     }
 
     #[tokio::test]
@@ -1271,7 +1694,7 @@ mod tests {
         let started = Instant::now();
         let answer = parse(ask_udp(udp, &query(2, "example.com.", RecordType::A), PATIENCE).await);
         assert!(started.elapsed() >= QUICK.forward, "the first one had its time");
-        assert_eq!((answer.id, addresses(&answer)), (2, vec![FAR.0]));
+        assert_eq!((answer.id, addresses(&answer)), (2, vec![IpAddr::V4(FAR.0)]));
         assert_eq!((quiet.seen().len(), answering.seen().len()), (1, 1));
     }
 
@@ -1287,6 +1710,56 @@ mod tests {
         let answer = ask_tcp(&mut stream, &asked).await;
         assert_eq!((answer.id, answer.response_code), (3, ResponseCode::ServFail));
         assert_eq!((one.seen().len(), two.seen().len()), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn a_new_scope_holds_from_the_next_query() {
+        let (first, second) = (Upstream::start(address).await, Upstream::start(address).await);
+        let view = view(vec![first.address]);
+        let (udp, tcp, udp_address, tcp_address) = sockets();
+        // The daemon's way in; it keeps a clone of the view.
+        let _server = DnsServer::spawn(udp, tcp, view.clone()).unwrap();
+        // A connection served from before the changes: each query on it
+        // sees them.
+        let mut stream = TcpStream::connect(tcp_address).await.unwrap();
+        let (web, cache) = (query(1, "web", RecordType::A), query(2, "cache", RecordType::A));
+        let far = vec![IpAddr::V4(FAR.0)];
+        for answer in [parse(ask_udp(udp_address, &web, PATIENCE).await), ask_tcp(&mut stream, &web).await] {
+            assert_eq!((answer.authoritative, answer.recursion_available, addresses(&answer)), (true, true, vec![WEB]));
+        }
+        // `cache` is on `frontend`, which the container isn't on yet.
+        let answer = parse(ask_udp(udp_address, &cache, PATIENCE).await);
+        assert_eq!((answer.authoritative, addresses(&answer)), (false, far.clone()));
+        assert_eq!(first.seen().len(), 1);
+
+        // Connected to `frontend`: its names answer.
+        view.set_scope(Scope { networks: names(&["backend", "frontend"]), upstreams: vec![first.address] });
+        for answer in [parse(ask_udp(udp_address, &cache, PATIENCE).await), ask_tcp(&mut stream, &cache).await] {
+            assert_eq!((answer.id, answer.authoritative, addresses(&answer)), (2, true, vec![CACHE]));
+        }
+        assert_eq!(first.seen().len(), 1);
+
+        // Disconnected from `backend`, with another upstream server: `web`
+        // is no name of the container's networks any more, and goes there.
+        view.set_scope(Scope { networks: names(&["frontend"]), upstreams: vec![second.address] });
+        for answer in [parse(ask_udp(udp_address, &web, PATIENCE).await), ask_tcp(&mut stream, &web).await] {
+            assert_eq!((answer.id, answer.authoritative, addresses(&answer)), (1, false, far.clone()));
+        }
+        assert_eq!((first.seen().len(), second.seen().len()), (1, 2));
+
+        // No upstream servers left: REFUSED, and no RA, on local answers
+        // either.
+        view.set_scope(Scope { networks: names(&["frontend"]), upstreams: Vec::new() });
+        for answer in [parse(ask_udp(udp_address, &web, PATIENCE).await), ask_tcp(&mut stream, &web).await] {
+            assert_eq!(
+                (answer.id, answer.response_code, answer.recursion_available),
+                (1, ResponseCode::Refused, false)
+            );
+            assert!(answer.answers.is_empty());
+        }
+        let answer = ask_tcp(&mut stream, &cache).await;
+        assert_eq!((answer.recursion_available, addresses(&answer)), (false, vec![CACHE]));
+        assert_eq!((first.seen().len(), second.seen().len()), (1, 2));
     }
 
     #[tokio::test]
