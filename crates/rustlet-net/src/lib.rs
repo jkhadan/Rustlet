@@ -22,6 +22,7 @@
 //!
 //! | module | what |
 //! |---|---|
+//! | [`backend`] | the seam the daemon uses: [`backend::Bridge`] now, a rootless one later |
 //! | [`netns`] | pinning network namespaces, running code inside one |
 //! | [`link`] | bridges, veth pairs, addresses and routes (rtnetlink) |
 //! | [`ipam`] | subnets for networks, addresses and MACs for containers |
@@ -34,6 +35,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod backend;
 pub mod dns;
 pub mod error;
 pub mod files;

@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use rustlet_net::backend::{Bridge, NetworkBackend};
 use rustlet_net::dns::{DnsServer, View, Zone};
 use rustlet_net::files::ResolvConf;
 use rustlet_net::firewall::{self, NetworkRules, PortRule, Ruleset};
@@ -53,6 +54,8 @@ use crate::lifecycle::blocking;
 
 /// The networking half of the daemon's state.
 pub struct Networks {
+    /// Everything that touches the host's interfaces or firewall.
+    backend: Arc<dyn NetworkBackend>,
     pool: Subnet,
     default_subnet: Subnet,
     default_bridge: String,
@@ -97,6 +100,7 @@ impl Networks {
         let pool = parse("network_pool", &config.network_pool)?;
         let default_subnet = parse("default_subnet", &config.default_subnet)?;
         Ok(Networks {
+            backend: Arc::new(Bridge),
             pool,
             default_subnet,
             default_bridge: config.default_bridge.clone(),
@@ -179,10 +183,11 @@ impl Networks {
             .values()
             .filter_map(|n| Some((n.bridge.clone(), n.gateway, Subnet::parse(&n.subnet).ok()?.prefix_len())))
             .collect();
+        let backend = self.backend.clone();
         let isolate = blocking(move || -> ApiResult<bool> {
             netns::prepare_dir(&netns_dir).map_err(ApiError::from)?;
             for (bridge, gateway, len) in &bridges {
-                link::ensure_bridge(bridge, *gateway, *len).map_err(ApiError::from)?;
+                backend.ensure_network(bridge, *gateway, *len).map_err(ApiError::from)?;
             }
             // What the record will say: Rustlets turns forwarding on if it
             // is off now and nobody recorded it before.
@@ -272,7 +277,10 @@ impl Networks {
                 isolate_forwarding: self.isolate_forwarding.load(Ordering::Relaxed),
             }
         };
-        blocking(move || rules.apply().map_err(ApiError::from)).await.map_err(|e| e.context("apply the firewall"))
+        let backend = self.backend.clone();
+        blocking(move || backend.apply(&rules).map_err(ApiError::from))
+            .await
+            .map_err(|e| e.context("apply the firewall"))
     }
 
     /// The servers a container's embedded DNS server forwards to: `--dns`,
@@ -491,11 +499,11 @@ impl Daemon {
             labels: req.labels,
         };
         self.db.insert_network(&record)?;
-        let (bridge, len) = (record.bridge.clone(), subnet.prefix_len());
-        if let Err(e) = blocking(move || link::ensure_bridge(&bridge, gateway, len).map_err(ApiError::from)).await {
+        let (bridge, len, backend) = (record.bridge.clone(), subnet.prefix_len(), nets.backend.clone());
+        if let Err(e) = blocking(move || backend.ensure_network(&bridge, gateway, len).map_err(ApiError::from)).await {
             let _ = self.db.remove_network(&record.id);
-            let bridge = record.bridge.clone();
-            let _ = blocking(move || link::delete_link(&bridge).map_err(ApiError::from)).await;
+            let (bridge, backend) = (record.bridge.clone(), nets.backend.clone());
+            let _ = blocking(move || backend.remove_network(&bridge).map_err(ApiError::from)).await;
             return Err(e.context(format!("create network {}", record.name)));
         }
         {
@@ -531,8 +539,8 @@ impl Daemon {
             st.allocators.remove(&n.id);
             st.used.remove(&n.id);
         }
-        let bridge = n.bridge.clone();
-        if let Err(e) = blocking(move || link::delete_link(&bridge).map_err(ApiError::from)).await {
+        let (bridge, backend) = (n.bridge.clone(), self.networks.backend.clone());
+        if let Err(e) = blocking(move || backend.remove_network(&bridge).map_err(ApiError::from)).await {
             tracing::warn!("delete the bridge {}: {e}", n.bridge);
         }
         if let Err(e) = self.networks.apply_firewall().await {
@@ -657,7 +665,7 @@ impl Daemon {
         {
             let (pin, bridge, gateway, internal) =
                 (pin.clone(), network.bridge.clone(), network.gateway, network.internal);
-            let prefix_len = subnet.prefix_len();
+            let (prefix_len, backend) = (subnet.prefix_len(), self.networks.backend.clone());
             blocking(move || {
                 let ns = netns::open(&pin)?;
                 let ep = link::Endpoint {
@@ -668,7 +676,7 @@ impl Daemon {
                     gateway: (!internal).then_some(gateway),
                     mac,
                 };
-                link::attach(ns.as_fd(), &ep)
+                backend.connect(ns.as_fd(), &ep)
             })
             .await
             .map_err(|e: ApiError| e.context(format!("connect it to {}", network.name)))?;
@@ -751,9 +759,10 @@ impl Daemon {
         }
         let veth = run.veth.clone();
         let pin = run.netns.clone().filter(|_| run.joined.is_none());
+        let backend = self.networks.backend.clone();
         let undone = blocking(move || {
             if let Some(v) = &veth {
-                link::delete_link(v)?;
+                backend.disconnect(v)?;
             }
             if let Some(p) = &pin {
                 netns::remove(p)?;
@@ -779,8 +788,9 @@ impl Daemon {
     pub async fn remove_network_leftovers(&self, id: &str) {
         let pin = self.paths.netns_pin(id);
         let veth = format!("rlv{}", rustlet_spec::short_id(id));
+        let backend = self.networks.backend.clone();
         let _ = blocking(move || {
-            link::delete_link(&veth)?;
+            backend.disconnect(&veth)?;
             netns::remove(&pin)
         })
         .await
