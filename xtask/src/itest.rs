@@ -29,9 +29,13 @@ pub(crate) fn run(extra: &[String]) -> anyhow::Result<()> {
     if !dev_dir().join("bundles/alpine-remap/rootfs/bin/busybox").exists() {
         bail!("the user-namespace test rootfs is missing: run `cargo xtask rootfs --remap` first");
     }
-    // The binaries the tests run: the runtime, the shim (and, from Phase 4,
-    // the daemon and CLI tests start them too).
-    run_cmd(cargo().args(["build", "--quiet", "-p", "rustlet-runc", "-p", "rustlet-shim", "-p", "rustletd"]))?;
+    // The binaries the tests run: the runtime, and the shim, daemon and
+    // CLI the Phase 4 tests start.
+    run_cmd(
+        cargo()
+            .args(["build", "--quiet", "-p", "rustlet-runc", "-p", "rustlet-shim", "-p", "rustletd"])
+            .args(["-p", "rustlet-cli"]),
+    )?;
     let binaries = test_binaries()?;
 
     let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();

@@ -94,8 +94,10 @@ pub struct Paths {
     pub shims: PathBuf,
     pub containers: PathBuf,
     pub db: PathBuf,
-    /// Held locked while the daemon runs: one daemon per run root.
-    pub lock: PathBuf,
+    /// Held locked while the daemon runs: one daemon per run root and per
+    /// data root.
+    pub run_lock: PathBuf,
+    pub data_lock: PathBuf,
 }
 
 impl Paths {
@@ -107,7 +109,8 @@ impl Paths {
             shims: config.run_root.join("shims"),
             containers: config.data_root.join("containers"),
             db: config.data_root.join("state.db"),
-            lock: config.run_root.join("rustletd.lock"),
+            run_lock: config.run_root.join("rustletd.lock"),
+            data_lock: config.data_root.join("rustletd.lock"),
         }
     }
 

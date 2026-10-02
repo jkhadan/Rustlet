@@ -2,7 +2,8 @@
 //!
 //! ```text
 //!  rustletd start
-//!   1. one daemon per run root: an OFD lock on <run>/rustletd.lock
+//!   1. one daemon per run root and per data root: OFD locks on their
+//!      rustletd.lock files
 //!   2. directories: <run> 0711, runtime/ and shims/ 0700; the store (data root)
 //!   3. containers/ becomes a private bind mount of itself
 //!   4. the cgroup parent (ours, minus /daemon, as DelegateSubgroup=daemon
@@ -42,7 +43,7 @@ pub struct Daemon {
     pub runtime: PathBuf,
     pub shim: PathBuf,
     /// Held for the daemon's lifetime (step 1).
-    _lock: File,
+    _locks: [File; 2],
 }
 
 impl Daemon {
@@ -50,11 +51,12 @@ impl Daemon {
     pub async fn open(config: Config) -> anyhow::Result<Arc<Daemon>> {
         let paths = Paths::new(&config);
         make_dir(&paths.run_root, 0o711)?;
-        let lock = lock_file(&paths.lock)?;
+        let run_lock = lock_file(&paths.run_lock)?;
         make_dir(&paths.runtime_root, 0o700)?;
         make_dir(&paths.shims, 0o700)?;
         let store =
             Store::open(&paths.data_root).with_context(|| format!("open the store {}", paths.data_root.display()))?;
+        let data_lock = lock_file(&paths.data_lock)?;
         if config.private_containers_mount {
             private_mount(&paths.containers)?;
         }
@@ -106,7 +108,7 @@ impl Daemon {
             cgroup_parent,
             runtime,
             shim,
-            _lock: lock,
+            _locks: [run_lock, data_lock],
         });
         daemon.reconcile().await;
         Ok(daemon)
