@@ -588,7 +588,10 @@ fn exec_process(spec: &Spec, req: &ExecRequest) -> Result<Process, String> {
     }
     p.set_args(Some(req.args.clone()));
     p.set_terminal(Some(req.tty));
-    p.set_console_size(None);
+    let size = req.console_size.filter(|_| req.tty).map(|[rows, cols]| {
+        rustlet_runtime::oci_spec::runtime::BoxBuilder::default().height(u64::from(rows)).width(u64::from(cols)).build()
+    });
+    p.set_console_size(size.transpose().map_err(|e| format!("console size: {e}"))?);
     let mut env = p.env().clone().unwrap_or_default();
     for kv in &req.env {
         let key = kv.split_once('=').map_or(kv.as_str(), |(k, _)| k);

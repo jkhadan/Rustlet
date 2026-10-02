@@ -83,6 +83,8 @@ struct Daemon {
     image_missing: AtomicBool,
     /// Start answers this error.
     start_fails: Mutex<Option<ErrorBody>>,
+    /// Attach answers an error instead of upgrading.
+    attach_fails: AtomicBool,
     started: Notify,
     configs: Mutex<Vec<ContainerConfig>>,
     execs: Mutex<Vec<ExecConfig>>,
@@ -152,6 +154,9 @@ async fn pull(State(d): Shared, Query(q): Query<PullQuery>) -> Response {
 
 async fn attach(State(d): Shared, Query(q): Query<AttachQuery>, ws: WebSocketUpgrade) -> Response {
     d.call(format!("attach stdin={}", q.stdin));
+    if d.attach_fails.load(Ordering::SeqCst) {
+        return error(ErrorKind::Internal, "attach failed");
+    }
     ws.on_upgrade(move |socket| container_session(socket, d, q.stdin))
 }
 
@@ -286,6 +291,11 @@ async fn exec_start(State(d): Shared, ws: WebSocketUpgrade) -> Response {
     })
 }
 
+async fn exec_start_detached(State(d): Shared) -> Json<rustlet_spec::exec::ExecStarted> {
+    d.call("exec start -d");
+    Json(rustlet_spec::exec::ExecStarted { pid: 42 })
+}
+
 async fn info() -> Json<Info> {
     Json(Info { memory: 2 << 30, ..Info::default() })
 }
@@ -342,7 +352,7 @@ fn daemon() -> (Arc<Daemon>, String, tempfile::TempDir) {
         .route(&pattern::container_action("kill"), post(kill))
         .route(&pattern::container_action("logs"), get(logs))
         .route(&pattern::container_action("exec"), post(exec_create))
-        .route(pattern::EXEC_START, get(exec_start))
+        .route(pattern::EXEC_START, get(exec_start).post(exec_start_detached))
         .route(&pattern::container_action("stats"), get(stats))
         .route(pattern::IMAGE_PULL, post(pull))
         .route(pattern::IMAGES, get(images))
@@ -436,6 +446,25 @@ async fn a_start_that_fails_exits_with_its_kinds_code_and_cleans_up() {
     assert_eq!(stderr.text(), "rustlet: error: exec: \"nope\": not found\n");
     // With --rm, a container that never ran is removed right away.
     assert_eq!(d.calls().last().unwrap(), &format!("rm {}", rustlet_spec::short_id(ID)));
+}
+
+#[tokio::test]
+async fn an_attach_that_fails_still_removes_the_rm_container() {
+    let (d, host, _dir) = daemon();
+    d.attach_fails.store(true, Ordering::SeqCst);
+    let (code, _, _) = rustlet(&host, &["run", "--rm", "alpine", "true"], b"").await;
+    assert_eq!(code, 125);
+    assert_eq!(d.calls().last().unwrap(), &format!("rm {}", rustlet_spec::short_id(ID)));
+}
+
+#[tokio::test]
+async fn exec_detached_sends_no_input() {
+    let (d, host, _dir) = daemon();
+    let (code, _, stderr) = rustlet(&host, &["exec", "-d", "-i", "web", "cat"], b"").await;
+    assert_eq!(code, 0, "{}", stderr.text());
+    assert_eq!(d.calls(), ["exec create", "exec start -d"]);
+    // Nothing would ever send it any (nor end it): `cat` would run forever.
+    assert!(!d.execs.lock().unwrap()[0].stdin);
 }
 
 #[tokio::test]

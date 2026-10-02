@@ -156,7 +156,13 @@ pub async fn run(ctx: &mut Ctx, args: RunArgs) -> anyhow::Result<i32> {
         writeln!(ctx.console.stdout, "{id}")?;
         return Ok(0);
     }
-    let mut session = ctx.client.attach(&id, attach_stdin).await?;
+    let mut session = match ctx.client.attach(&id, attach_stdin).await {
+        Ok(session) => session,
+        Err(e) => {
+            remove_unstarted(ctx, &id, config.auto_remove).await;
+            return Err(e.into());
+        }
+    };
     if config.tty {
         send_size(&mut session, &ctx.console).await;
     }
@@ -277,23 +283,27 @@ pub async fn exec(ctx: &mut Ctx, args: ExecArgs) -> anyhow::Result<i32> {
     if !args.detach {
         check_tty(&ctx.console, args.tty, stdin)?;
     }
+    // With a terminal, its size goes with the request: the process's
+    // terminal has it from the start.
+    let console_size = (args.tty && (ctx.console.stdin_tty || ctx.console.stdout_tty))
+        .then(relay::terminal_size)
+        .flatten()
+        .map(|(rows, cols)| [rows, cols]);
     let config = ExecConfig {
         cmd,
         tty: args.tty,
-        stdin: args.interactive,
+        stdin,
         env: resolve_env(&args.env, &from_environment)?,
         user: args.user,
         workdir: args.workdir,
+        console_size,
     };
     let exec = ctx.client.create_exec(&container, &config).await?;
     if args.detach {
         ctx.client.start_exec_detached(&exec.id).await?;
         return Ok(0);
     }
-    let mut session = ctx.client.start_exec(&exec.id).await?;
-    if args.tty {
-        send_size(&mut session, &ctx.console).await;
-    }
+    let session = ctx.client.start_exec(&exec.id).await?;
     // No signal proxy: `kill` is for containers, an exec has no route of
     // its own (nor does Docker proxy them).
     let options = relay::Options { tty: args.tty, stdin, sig_proxy: None };

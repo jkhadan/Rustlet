@@ -143,6 +143,7 @@ impl Daemon {
             user: s.user.clone(),
             tty: s.config.tty,
             stdin: s.config.stdin,
+            console_size: s.config.console_size,
         });
         let socket = self.paths.shim(c.id()).socket();
         let client =
@@ -182,6 +183,8 @@ impl Daemon {
 
     pub async fn start_exec_detached(self: &Arc<Self>, s: Arc<ExecSession>) -> ApiResult<ExecStarted> {
         let (pid, mut stream) = self.open_exec(&s).await?;
+        // Nobody will send it input.
+        let _ = stream.writer().close_stdin().await;
         let d = self.clone();
         tokio::spawn(async move {
             // Nobody reads the output; the exit status still counts.

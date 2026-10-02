@@ -25,6 +25,9 @@ pub struct ExecConfig {
     pub user: Option<String>,
     /// Default: the container's working directory.
     pub workdir: Option<String>,
+    /// With `tty`: the terminal's size, `[rows, columns]`, from the start
+    /// (a resize once it runs would come after its first look).
+    pub console_size: Option<[u16; 2]>,
 }
 
 /// `201` from `POST /v1/containers/{id}/exec`.

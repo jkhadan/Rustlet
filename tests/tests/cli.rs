@@ -176,3 +176,60 @@ fn cl_logs_follow_images_stats() {
     assert!(inspect[0]["names"][0].as_str().unwrap().contains("alpine"), "{inspect}");
     ok(&d, &["rm", "-f", "busy", "counter"]);
 }
+
+/// Input still flowing when the container exits (`yes | rustlet run -i …
+/// head -c1`): the daemon shuts the shim down while it waits to report the
+/// exit, and a write to the gone shim used to end the session there,
+/// without the exit (125, "rustletd closed the session").
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn cl_flowing_input_keeps_the_exit_status() {
+    let d = daemon();
+    for i in 0..10 {
+        let mut child = rustlet(&d, &["run", "--rm", "-i", "alpine", "head", "-c", "1"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let feeder = std::thread::spawn(move || {
+            let chunk = vec![b'y'; 64 << 10];
+            while stdin.write_all(&chunk).is_ok() {}
+        });
+        let o = out(child.wait_with_output().unwrap());
+        feeder.join().unwrap();
+        assert_eq!((o.code, o.stdout.as_str()), (0, "y"), "run {i}: {o:#?}");
+    }
+}
+
+/// A program in a terminal sees the client's terminal size from its first
+/// look: `run -t` sends it before the start, `exec -t` with the request
+/// (a resize once it runs came after `stty size` had printed `0 0`).
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn cl_programs_start_with_the_terminals_size() {
+    let d = daemon();
+    let sized = |args: &str| {
+        let line = format!(
+            "stty rows 30 cols 100; {} --host {} {args}",
+            workspace_binary("rustlet").display(),
+            d.socket.display()
+        );
+        out(Command::new("script")
+            .args(["-qec", &line, "/dev/null"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .wait_with_output()
+            .unwrap())
+    };
+    let o = sized("run --rm -t alpine stty size");
+    assert!(o.stdout.contains("30 100"), "run: {o:#?}");
+    ok(&d, &["run", "-d", "--name", "box", "alpine", "sleep", "300"]);
+    let o = sized("exec -t box stty size");
+    ok(&d, &["rm", "-f", "box"]);
+    assert!(o.stdout.contains("30 100"), "exec: {o:#?}");
+}

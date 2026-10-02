@@ -686,6 +686,28 @@ mod daemon {
         });
     }
 
+    /// A detached exec that asked for input (`exec -d -i … cat`, or any API
+    /// client) kept its stdin open for good: nothing sends it input, and
+    /// nothing ended it. Its input now ends at once.
+    #[test]
+    #[ignore = "needs root: run with `cargo xtask itest`"]
+    fn rr_a_detached_exec_gets_the_end_of_its_input() {
+        let d = daemon();
+        block_on(async {
+            let c = d.client();
+            let id = c.create_container(&sh("while :; do sleep 0.1; done")).await.unwrap().id;
+            c.start(&id).await.unwrap();
+            let config = rustlet_spec::exec::ExecConfig { cmd: vec!["cat".into()], stdin: true, ..Default::default() };
+            let x = c.create_exec(&id, &config).await.unwrap();
+            c.start_exec_detached(&x.id).await.unwrap();
+            eventually("cat to see the end of its input", async || {
+                c.inspect_exec(&x.id).await.unwrap().exit_code == Some(0)
+            })
+            .await;
+            c.remove_container(&id, true).await.unwrap();
+        });
+    }
+
     /// `run --rm` waits for the removal (`wait?condition=removed`). A removal
     /// that failed left the container `dead` and the wait unanswered forever;
     /// it now ends with the removal's error, as in Docker.

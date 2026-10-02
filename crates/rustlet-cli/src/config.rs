@@ -132,8 +132,15 @@ impl CreateFlags {
         if self.rm && restart.name != RestartPolicyName::No {
             bail!("conflicting options: --restart and --rm (a removed container can't be restarted)");
         }
-        let memory =
-            self.memory.as_deref().map(parse_size).transpose().map_err(anyhow::Error::msg).context("--memory")?;
+        // 0 means no limit, as for Docker (and --cpus below).
+        let memory = self
+            .memory
+            .as_deref()
+            .map(parse_size)
+            .transpose()
+            .map_err(anyhow::Error::msg)
+            .context("--memory")?
+            .filter(|&m| m > 0);
         if let Some(c) = self.cpus
             && (!c.is_finite() || c < 0.0)
         {
@@ -358,6 +365,7 @@ mod tests {
             assert!(config(bad).is_err(), "{bad:?}");
         }
         assert_eq!(config(&["--cpus", "0"]).unwrap().cpus, None);
+        assert_eq!(config(&["--memory", "0"]).unwrap().memory, None, "0: no limit, as for Docker");
         assert!(format!("{:#}", config(&["--memory", "lots"]).unwrap_err()).starts_with("--memory: invalid size"));
     }
 }

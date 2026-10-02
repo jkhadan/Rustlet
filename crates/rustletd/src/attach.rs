@@ -164,8 +164,14 @@ pub async fn bridge(
         }
     };
     let from_client = async {
+        // Once the shim takes nothing more (after an exit, the daemon shuts
+        // it down before the exit is reported), the client's input is
+        // dropped: the session ends with the exit, or with the client.
+        let mut shim_open = true;
         while let Some(Ok(msg)) = source.next().await {
-            let ok = match msg {
+            let sent = match msg {
+                Message::Close(_) => break,
+                _ if !shim_open => continue,
                 Message::Binary(b) => match parse_data_message(&b) {
                     Some((STDIN, data)) if stdin => writer.stdin(data).await.is_ok(),
                     _ => true,
@@ -175,12 +181,9 @@ pub async fn bridge(
                     Ok(Control::StdinEof) => writer.close_stdin().await.is_ok(),
                     _ => true,
                 },
-                Message::Close(_) => break,
                 _ => true,
             };
-            if !ok {
-                break;
-            }
+            shim_open &= sent;
         }
     };
     tokio::select! {

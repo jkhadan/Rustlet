@@ -173,6 +173,8 @@ pub struct ExecRequest {
     pub user: Option<ExecUser>,
     pub tty: bool,
     pub stdin: bool,
+    /// With `tty`: the terminal's size from the start, `[rows, columns]`.
+    pub console_size: Option<[u16; 2]>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
