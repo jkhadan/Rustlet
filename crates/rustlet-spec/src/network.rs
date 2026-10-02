@@ -263,8 +263,9 @@ pub fn parse_extra_host(s: &str) -> Result<(String, String), String> {
 /// it": the gateway of its network.
 pub const HOST_GATEWAY: &str = "host-gateway";
 
-/// A DNS-style host name: dot-separated labels of letters, digits and `-`
-/// (not at either end), at most 253 characters.
+/// A DNS-style host name: dot-separated labels of letters, digits, `-` (not
+/// at either end) and `_` (which container names may have), at most 253
+/// characters.
 pub fn valid_hostname(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 253

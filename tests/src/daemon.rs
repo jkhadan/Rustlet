@@ -118,9 +118,17 @@ impl TestDaemon {
     /// Imports the cached Alpine minirootfs as `name` (`alpine` is
     /// `docker.io/library/alpine:latest`), running `sh` by default.
     pub fn import_alpine(&self, name: &str) {
+        self.import_alpine_with(name, |_| {});
+    }
+
+    /// [`TestDaemon::import_alpine`], with the image config changed by `f`
+    /// (its exposed ports, its volumes, …).
+    pub fn import_alpine_with(&self, name: &str, f: impl FnOnce(&mut rustlet_runtime::oci_spec::image::Config)) {
         let store = Store::open(&self.data).unwrap();
         let env = ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"];
-        import(store.content(), name, &[alpine_layer()], config(&["/bin/sh"], &env, None).unwrap()).unwrap();
+        let mut cfg = config(&["/bin/sh"], &env, None).unwrap();
+        f(&mut cfg);
+        import(store.content(), name, &[alpine_layer()], cfg).unwrap();
     }
 
     /// The mounts the daemon made below its data root.
