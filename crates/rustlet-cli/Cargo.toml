@@ -29,3 +29,5 @@ chrono.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The in-process mock daemon of the run-flow tests.
+axum.workspace = true
