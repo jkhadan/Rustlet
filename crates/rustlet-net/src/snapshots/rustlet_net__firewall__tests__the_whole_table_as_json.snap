@@ -139,6 +139,17 @@ expression: sample().to_json()
               }
             },
             {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "!=",
+                "right": "lo"
+              }
+            },
+            {
               "drop": null
             }
           ],
@@ -190,6 +201,17 @@ expression: sample().to_json()
                 },
                 "op": "!=",
                 "right": "rlb0123456789ab"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "!=",
+                "right": "lo"
               }
             },
             {
@@ -247,6 +269,17 @@ expression: sample().to_json()
               }
             },
             {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "!=",
+                "right": "lo"
+              }
+            },
+            {
               "drop": null
             }
           ],
@@ -298,6 +331,17 @@ expression: sample().to_json()
                 },
                 "op": "!=",
                 "right": "rlbfedcba987654"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "!=",
+                "right": "lo"
               }
             },
             {
@@ -1031,6 +1075,43 @@ expression: sample().to_json()
       "add": {
         "rule": {
           "chain": "forward",
+          "comment": "rlb0123456789ab internal: no way out",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "==",
+                "right": "rlb0123456789ab"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "op": "!=",
+                "right": "rlb0123456789ab"
+              }
+            },
+            {
+              "drop": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "forward",
           "comment": "replies to rustlet0",
           "expr": [
             {
@@ -1429,32 +1510,6 @@ expression: sample().to_json()
             },
             {
               "accept": null
-            }
-          ],
-          "family": "inet",
-          "table": "rustlet"
-        }
-      }
-    },
-    {
-      "add": {
-        "rule": {
-          "chain": "forward",
-          "comment": "rlb0123456789ab internal: no way out",
-          "expr": [
-            {
-              "match": {
-                "left": {
-                  "meta": {
-                    "key": "iifname"
-                  }
-                },
-                "op": "==",
-                "right": "rlb0123456789ab"
-              }
-            },
-            {
-              "drop": null
             }
           ],
           "family": "inet",

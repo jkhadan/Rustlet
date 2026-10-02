@@ -98,6 +98,12 @@ fn netlink() -> Result<RtNetlink> {
 /// appear, unless the network has IPv6; then router advertisements arriving
 /// on it are ignored (a container could send one), and its address is
 /// usable at once (no duplicate address detection: the bridge is ours).
+///
+/// Its MAC address is set, derived from the gateway's address as a
+/// container's is from its own (`02:52:` + the address; no container has
+/// the gateway's): a bridge without one set takes the lowest of its ports'
+/// and changes it when that port goes, and containers' neighbour entries
+/// for the gateway then lead nowhere until they expire.
 pub fn ensure_bridge(name: &str, gateway: Ipv4Addr, prefix_len: u8, gateway6: Option<(Ipv6Addr, u8)>) -> Result<i32> {
     let mut nl = netlink()?;
     let link = match nl.link_by_name(name).with_context(|| format!("look up {name}"))? {
@@ -118,6 +124,7 @@ pub fn ensure_bridge(name: &str, gateway: Ipv4Addr, prefix_len: u8, gateway6: Op
             link.kind.as_deref().unwrap_or("no kind")
         )));
     }
+    nl.set_mac(link.index, crate::ipam::mac_for(gateway)).with_context(|| format!("set the MAC address of {name}"))?;
     let addresses = nl.addresses().context("list addresses")?;
     let has = |ip: IpAddr, len: u8| {
         addresses.iter().any(|a| a.index == link.index as u32 && a.address == ip && a.prefix_len == len)

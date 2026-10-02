@@ -122,6 +122,11 @@ fn net_bridge_nat_published_ports_and_guards() {
     host.run(|| rules.apply()).unwrap();
     // Applying it again replaces it rather than adding to it.
     host.run(|| rules.apply()).unwrap();
+    // The guard leaves the host's own traffic to the gateway's address
+    // alone (it arrives on lo).
+    serve(host, addr(GATEWAY, 9001), "gateway");
+    let answer = fetch(host, addr(GATEWAY, 9001), b"").unwrap();
+    assert!(answer.starts_with("gateway "), "{answer}");
 
     // The container's side: eth0 with its address and MAC, a default route.
     let (mac, routes) = c1.run(|| {
@@ -299,4 +304,36 @@ fn net_dns_port_53_is_redirected_to_the_servers_socket() {
     server.send_to(b"answer", from).unwrap();
     let (n, src) = client.recv_from(&mut buf).expect("the answer");
     assert_eq!((&buf[..n], src), (&b"answer"[..], addr(Ipv4Addr::new(127, 0, 0, 11), 53)));
+}
+
+/// A bridge keeps the MAC address it is given (derived from its gateway's
+/// address) whatever ports come and go: left to itself, the kernel gives a
+/// bridge the lowest of its ports' and changes it when that port leaves,
+/// and the other containers' neighbour entries for the gateway then lead
+/// nowhere until they expire.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn net_a_bridge_keeps_its_mac() {
+    let ns = TestNetns::new();
+    let gateway = Ipv4Addr::new(10, 89, 7, 1);
+    ns.run(|| {
+        let mut nl = RtNetlink::open().unwrap();
+        let mut mac = |name: &str| nl.link_by_name(name).unwrap().unwrap().mac;
+        let wanted = ipam::mac_for(gateway).to_vec();
+        link::ensure_bridge("rlbmactest", gateway, 24, None).unwrap();
+        assert_eq!(mac("rlbmactest"), wanted);
+        // A port with a lower MAC than the bridge's, as a veth may have.
+        let mut nl = RtNetlink::open().unwrap();
+        let peer = rustlet_sys::netlink::VethPeer { name: "rlvmactestp", netns: None, mac: Some([0, 0, 0, 0, 0, 1]) };
+        nl.create_veth("rlvmactest", &peer).unwrap();
+        let bridge = nl.link_by_name("rlbmactest").unwrap().unwrap().index;
+        let port = nl.link_by_name("rlvmactestp").unwrap().unwrap().index;
+        nl.set_master(port, bridge).unwrap();
+        assert_eq!(nl.link_by_name("rlbmactest").unwrap().unwrap().mac, wanted, "a port came");
+        nl.delete_link(port).unwrap();
+        assert_eq!(nl.link_by_name("rlbmactest").unwrap().unwrap().mac, wanted, "a port went");
+        // Set again at the next daemon start, the bridge up.
+        link::ensure_bridge("rlbmactest", gateway, 24, None).unwrap();
+        assert_eq!(nl.link_by_name("rlbmactest").unwrap().unwrap().mac, wanted);
+    });
 }

@@ -580,6 +580,14 @@ impl RtNetlink {
         self.request(MsgBuilder::new(RTM_NEWLINK, 0).header(&hdr.to_bytes())).map(drop)
     }
 
+    /// Sets the link's MAC address (`ip link set … address`). A bridge
+    /// given one this way keeps it; otherwise the kernel gives it the lowest
+    /// of its ports' and changes it as they come and go.
+    pub fn set_mac(&mut self, index: i32, mac: [u8; 6]) -> Result<()> {
+        let hdr = IfInfoMsg { index, ..Default::default() };
+        self.request(MsgBuilder::new(RTM_NEWLINK, 0).header(&hdr.to_bytes()).attr(IFLA_ADDRESS, &mac)).map(drop)
+    }
+
     /// Looks up a link by name.
     pub fn link_by_name(&mut self, name: &str) -> Result<Option<LinkInfo>> {
         let msg = MsgBuilder::new(RTM_GETLINK, 0).header(&IfInfoMsg::default().to_bytes()).attr_str(IFLA_IFNAME, name);

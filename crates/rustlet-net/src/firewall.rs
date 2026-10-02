@@ -10,11 +10,11 @@
 //!
 //! | chain | rules |
 //! |---|---|
-//! | `raw_prerouting` | a packet for a container subnet (IPv4 or IPv6) that didn't arrive on that subnet's bridge is dropped before anything else sees it (the LAN can't route to `10.89.0.0/24` through us; containers of another network can't either). As Docker 28 does. |
+//! | `raw_prerouting` | a packet for a container subnet (IPv4 or IPv6) that didn't arrive on that subnet's bridge is dropped before anything else sees it (the LAN can't route to `10.89.0.0/24` through us; containers of another network can't either), unless it arrived on `lo` (the host's own, to the gateway's address). As Docker 28 does. |
 //! | `prerouting` (nat) | published ports: a packet for a local address (or the given host address) and the port is rewritten to the container's address and port, from wherever it came, a container on the same bridge included (hairpin traffic, see `postrouting`); IPv4 to its IPv4 address and, on a network with IPv6, IPv6 to its IPv6 address |
 //! | `output` (nat) | the same for the host's own connections to one of its non-loopback addresses (`127.0.0.1` and `::1` are the proxy's: DNAT to a container would need `route_localnet`) |
 //! | `postrouting` (nat) | traffic from a subnet that leaves through anything but its bridge is masqueraded, IPv6 as well as IPv4 (except internal networks); and so is DNATed traffic that goes back out of the bridge it came from (hairpin: a container reaching a port published on its own network through the host's address), to the bridge's address, so that the server's answer comes back through the host and is un-NATed on the way |
-//! | `forward` (filter) | to a bridge: only replies (`ct state established,related`), published ports (`ct status dnat`) and traffic within the bridge; from a bridge: out (internal networks: nowhere); and for each family whose forwarding Rustlets turned on, nothing else of that family is forwarded at all |
+//! | `forward` (filter) | first, from an internal network's bridge to anywhere else: dropped (a published port of another network included, which DNAT would take it to); to a bridge: only replies (`ct state established,related`), published ports (`ct status dnat`) and traffic within the bridge; from a bridge: out; and for each family whose forwarding Rustlets turned on, nothing else of that family is forwarded at all |
 //!
 //! The whole table is replaced in one `nft -j -f -` transaction: "add" (so
 //! the "delete" can't fail), "delete", then the full definition. Either the
@@ -114,6 +114,8 @@ impl Ruleset {
             std::iter::once(v4).chain(v6)
         };
 
+        // (The host's own traffic to its addresses on a bridge, the
+        // gateway's, arrives on lo.)
         for n in &self.networks {
             for (family, net, text) in subnets(n) {
                 cmds.push(rule(
@@ -122,6 +124,7 @@ impl Ruleset {
                         family.only(),
                         family.addr_match("daddr", "==", net),
                         ifname("iifname", "!=", &n.bridge),
+                        ifname("iifname", "!=", "lo"),
                         verdict("drop"),
                     ],
                     format!("{text} is only reachable through {}", n.bridge),
@@ -189,6 +192,16 @@ impl Ruleset {
             }
         }
 
+        // An internal network's traffic stays on its bridge, first of all:
+        // DNAT could otherwise take it to another bridge's published port,
+        // which the rules below accept.
+        for n in self.networks.iter().filter(|n| n.internal) {
+            cmds.push(rule(
+                "forward",
+                vec![ifname("iifname", "==", &n.bridge), ifname("oifname", "!=", &n.bridge), verdict("drop")],
+                format!("{} internal: no way out", n.bridge),
+            ));
+        }
         // Every rule about what may reach a bridge comes before any that lets
         // traffic leave one: a packet from bridge A to bridge B must meet B's
         // drop before A's accept.
@@ -221,12 +234,11 @@ impl Ruleset {
             ));
             cmds.push(rule("forward", vec![to_bridge(), verdict("drop")], format!("nothing else into {}", n.bridge)));
         }
-        for n in &self.networks {
-            let (v, why) = if n.internal { ("drop", "internal: no way out") } else { ("accept", "out") };
+        for n in self.networks.iter().filter(|n| !n.internal) {
             cmds.push(rule(
                 "forward",
-                vec![ifname("iifname", "==", &n.bridge), verdict(v)],
-                format!("{} {why}", n.bridge),
+                vec![ifname("iifname", "==", &n.bridge), verdict("accept")],
+                format!("{} out", n.bridge),
             ));
         }
         for (family, isolate) in [(Family::V4, self.isolate_forwarding), (Family::V6, self.isolate_forwarding6)] {
@@ -454,6 +466,53 @@ mod tests {
         insta::assert_json_snapshot!(sample().to_json());
     }
 
+    /// The rules of `chain`, in order.
+    fn rules_of(json: &Value, chain: &str) -> Vec<Value> {
+        json["nftables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| {
+                c["add"]["rule"].as_object().filter(|r| r["chain"] == chain).map(|r| Value::from(r.clone()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_internal_network_reaches_no_other_bridge_even_through_dnat() {
+        let forward = rules_of(&sample().to_json(), "forward");
+        let matches =
+            |r: &Value, key: &str, op: &str, v: &str| {
+                r["expr"].as_array().unwrap().iter().any(|e| {
+                    e["match"]["left"]["meta"]["key"] == key && e["match"]["op"] == op && e["match"]["right"] == v
+                })
+            };
+        let drops = |r: &Value| r["expr"].as_array().unwrap().iter().any(|e| e.get("drop").is_some());
+        let internal = "rlb0123456789ab";
+        let stays = forward
+            .iter()
+            .position(|r| matches(r, "iifname", "==", internal) && matches(r, "oifname", "!=", internal) && drops(r))
+            .expect("a drop of what leaves the internal bridge");
+        let first_dnat = forward
+            .iter()
+            .position(|r| r["expr"].as_array().unwrap().iter().any(|e| e["match"]["right"] == "dnat"))
+            .unwrap();
+        assert!(stays < first_dnat, "{forward:#?}");
+    }
+
+    #[test]
+    fn the_guard_spares_the_hosts_own_traffic() {
+        // To the gateway's address, which arrives on lo.
+        for r in rules_of(&sample().to_json(), "raw_prerouting") {
+            assert!(
+                r["expr"].as_array().unwrap().iter().any(|e| e["match"]["left"]["meta"]["key"] == "iifname"
+                    && e["match"]["op"] == "!="
+                    && e["match"]["right"] == "lo"),
+                "{r:#}"
+            );
+        }
+    }
+
     #[test]
     fn replacement_is_one_transaction_that_cant_fail_on_a_missing_table() {
         let json = sample().to_json();
@@ -474,8 +533,9 @@ mod tests {
             .collect();
         let comment = |r: &Value| r["comment"].as_str().unwrap().to_owned();
         let last_drop_in = forward.iter().rposition(|r| comment(r).starts_with("nothing else into")).unwrap();
+        // (An internal network's "no way out" is a drop, and comes first.)
         let first_out =
-            forward.iter().position(|r| comment(r).ends_with(" out") || comment(r).contains("no way out")).unwrap();
+            forward.iter().position(|r| comment(r).ends_with(" out") && !comment(r).contains("no way out")).unwrap();
         assert!(last_drop_in < first_out, "{:?}", forward.iter().map(|r| comment(r)).collect::<Vec<_>>());
         let last: Vec<String> = forward[forward.len() - 2..].iter().map(|r| comment(r)).collect();
         assert_eq!(

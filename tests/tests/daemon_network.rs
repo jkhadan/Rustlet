@@ -590,14 +590,40 @@ fn dn_internal_networks_stay_inside() {
             .unwrap()
             .id;
         c.start(&peer).await.unwrap();
-        let (_, out) =
-            run(&c, &on(sh("ip route; nc -w 2 192.0.2.1 9000 </dev/null; sleep 0.5; nc peer 7 </dev/null"))).await;
+        // A UDP port another network's container publishes, which DNAT
+        // would take a datagram to through the gateway's address (the
+        // host's): one way only, but out. (busybox `nc -lu` prints the
+        // first sender's datagrams.)
+        let mut sink = sh("exec nc -lu -p 53");
+        sink.ports = PortMapping::parse("5353:53/udp").unwrap();
+        let sink = c.create_container(&sink).await.unwrap().id;
+        c.start(&sink).await.unwrap();
+        let script = "ip route; nc -w 2 192.0.2.1 9000 </dev/null; echo leak | nc -u -w 1 10.89.1.1 5353; \
+                      sleep 0.5; nc peer 7 </dev/null";
+        let (_, out) = run(&c, &on(sh(script))).await;
         assert!(!out.contains("default"), "no default route: {out}");
         assert!(!out.contains("lan "), "the LAN is out of reach: {out}");
         assert!(out.trim_end().ends_with("peer"), "{out}");
+        // The sink hears the LAN, and heard nothing from inside.
+        let lan = d.net.lan.run(|| std::net::UdpSocket::bind("192.0.2.1:0")).unwrap();
+        let mut heard = String::new();
+        for _ in 0..50 {
+            lan.send_to(b"from the lan\n", v4(192, 0, 2, 2, 5353)).unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            heard.clear();
+            let mut logs = c.logs(&sink, &LogsQuery::default()).await.unwrap();
+            while let Some(e) = logs.next().await {
+                heard.push_str(&e.unwrap().log);
+            }
+            if !heard.is_empty() {
+                break;
+            }
+        }
+        assert!(heard.starts_with("from the lan"), "an internal network's datagram got out: {heard:?}");
         let ports = ContainerConfig { ports: PortMapping::parse("80").unwrap(), ..on(sh("true")) };
         assert_eq!(c.create_container(&ports).await.unwrap_err().kind(), Some(ErrorKind::Invalid));
         c.remove_container(&peer, true).await.unwrap();
+        c.remove_container(&sink, true).await.unwrap();
     });
 }
 

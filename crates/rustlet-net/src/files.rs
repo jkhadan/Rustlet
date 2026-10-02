@@ -128,6 +128,9 @@ pub enum Resolver {
 /// reach otherwise are left out).
 pub fn container_resolv_conf(path: &Path, dns: &DnsOptions, resolver: Resolver, ipv6: bool) -> String {
     let host = match resolver {
+        // A copy, word for word: what this parser would drop (a link-local
+        // server's `%interface`, `sortlist`) works there as on the host.
+        Resolver::Host if *dns == DnsOptions::default() => return std::fs::read_to_string(path).unwrap_or_default(),
         Resolver::Host => ResolvConf::read(path),
         Resolver::Embedded | Resolver::Direct => ResolvConf::host(path),
     };
@@ -276,11 +279,24 @@ mod tests {
         std::fs::write(&stub, STUB).unwrap();
         let none = DnsOptions::default();
         let host = container_resolv_conf(&stub, &none, Resolver::Host, false);
-        assert!(host.contains("nameserver 127.0.0.53\n"), "{host}");
+        assert_eq!(host, STUB, "a plain copy");
         // In a namespace of its own, never the stub: resolved's list where
         // there is one, else the fallback.
         let direct = container_resolv_conf(&stub, &none, Resolver::Direct, false);
         assert!(!direct.contains("127.0.0.53"), "{direct}");
+    }
+
+    #[test]
+    fn the_hosts_namespace_gets_the_file_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolv.conf");
+        let text = "nameserver fe80::1%eth0\nsortlist 130.155.160.0/255.255.240.0\noptions rotate\n";
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(container_resolv_conf(&path, &DnsOptions::default(), Resolver::Host, true), text);
+        // With --dns, a file of its own.
+        let dns = DnsOptions { servers: vec![Ipv4Addr::new(9, 9, 9, 9).into()], ..DnsOptions::default() };
+        let given = container_resolv_conf(&path, &dns, Resolver::Host, true);
+        assert!(given.contains("nameserver 9.9.9.9\noptions rotate\n") && !given.contains("fe80"), "{given}");
     }
 
     #[test]
