@@ -133,16 +133,15 @@ impl EndpointConfig {
     /// first `--network` (with `--network-alias`, `--ip`, `--ip6`), then
     /// the others; none for `none`, `host` and `container:<x>`.
     pub fn from_config(config: &ContainerConfig) -> Vec<EndpointConfig> {
-        let first = match &config.network {
-            NetworkMode::Bridge => EndpointConfig { network: DEFAULT_NETWORK.into(), ..EndpointConfig::default() },
-            NetworkMode::Network(n) => EndpointConfig {
-                network: n.clone(),
-                aliases: config.network_aliases.clone(),
-                ipv4: config.ip,
-                ipv6: config.ip6,
-            },
+        // (The default network refuses aliases and addresses: they are
+        // carried along so that it can.)
+        let network = match &config.network {
+            NetworkMode::Bridge => DEFAULT_NETWORK.to_owned(),
+            NetworkMode::Network(n) => n.clone(),
             NetworkMode::None | NetworkMode::Host | NetworkMode::Container(_) => return Vec::new(),
         };
+        let first =
+            EndpointConfig { network, aliases: config.network_aliases.clone(), ipv4: config.ip, ipv6: config.ip6 };
         std::iter::once(first)
             .chain(
                 config

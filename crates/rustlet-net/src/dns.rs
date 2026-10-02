@@ -33,23 +33,26 @@
 //! - **`A` and `AAAA` for a name on the container's networks** (a
 //!   container's name, aliases, short id, hostname; registered by the
 //!   daemon with [`Zone::add`], once per address): the networks are
-//!   searched in order, and the first that has the name answers, with
-//!   every address of the asked family it has under that name (several
-//!   containers can share an alias), in random order, TTL [`TTL`],
-//!   authoritative. One network answers both types, so that a client that
-//!   asks for both (most do) gets the addresses of the same containers;
-//!   and the networks come in the order they were connected in, so that
-//!   connecting another one never changes the answer for a name the
-//!   container's networks already had. Names match without regard to
+//!   searched in order, and the first that has the name with an address
+//!   of the asked family answers, with every address of that family it has
+//!   under that name (several containers can share an alias), in random
+//!   order, TTL [`TTL`], authoritative. The search goes on past a network
+//!   that has the name but no address of that family, so that a container
+//!   on an IPv4-only network and an IPv6 one is found over IPv6 too (its
+//!   `A` and `AAAA` answers may then come from different networks, as
+//!   Docker's do); and the networks come in the order they were connected
+//!   in, so that connecting another one never changes the answer for a
+//!   name the container's networks already had. Names match without regard to
 //!   case, with or without a trailing dot, bare (`web`) or qualified by a
 //!   network's name (`web.backend`, which only `backend` has). A network
 //!   the container isn't on is never searched, not even for a name
 //!   qualified by its name: a container learns nothing of the networks it
 //!   isn't on.
 //! - **Any other type for such a name** (`MX`, `TXT`, …), and **a family
-//!   the network has no address of** for it (`AAAA` on a network without
-//!   IPv6): `NOERROR` with no answers. The name is ours, and an empty
-//!   answer stops the client from asking elsewhere about it.
+//!   none of the networks has an address of** for it (`AAAA` of a name only
+//!   on networks without IPv6): `NOERROR` with no answers. The name is
+//!   ours, and an empty answer stops the client from asking elsewhere about
+//!   it.
 //! - **`PTR` for an address on the container's networks**
 //!   (`2.0.89.10.in-addr.arpa`; for an IPv6 address its 32 nibbles, least
 //!   significant first, `2.0.0.0.(…).0.0.d.f.ip6.arpa` for `fd00::2`):
@@ -656,22 +659,30 @@ fn local_records(question: &Query, zone: &Zone, scope: &Scope) -> Option<Vec<Rec
         let target = Name::from_ascii(format!("{target}.")).ok()?;
         return Some(vec![Record::from_rdata(name.clone(), TTL, RData::PTR(PTR(target)))]);
     }
-    // The first network that has the name answers for it, whatever the type
-    // (see the module docs): a client that asks for `A` and `AAAA` gets the
-    // addresses of the same containers, never IPv4 from one network and
-    // IPv6 from another.
+    // The first network that has the name with an address of the asked
+    // family answers (see the module docs); a name the networks have
+    // without one gets no records.
     let asked = name.to_ascii();
-    let addresses =
-        scope.networks.iter().map(|network| zone.lookup(network, &asked)).find(|addresses| !addresses.is_empty())?;
-    let mut records: Vec<Record> = addresses
-        .into_iter()
-        .filter_map(|ip| match (question.query_type, ip) {
-            (RecordType::A, IpAddr::V4(ip)) => Some(RData::A(A(ip))),
-            (RecordType::AAAA, IpAddr::V6(ip)) => Some(RData::AAAA(AAAA(ip))),
-            _ => None,
-        })
-        .map(|data| Record::from_rdata(name.clone(), TTL, data))
-        .collect();
+    let rdata = |ip: IpAddr| match (question.query_type, ip) {
+        (RecordType::A, IpAddr::V4(ip)) => Some(RData::A(A(ip))),
+        (RecordType::AAAA, IpAddr::V6(ip)) => Some(RData::AAAA(AAAA(ip))),
+        _ => None,
+    };
+    let mut known = false;
+    let mut records = Vec::new();
+    for network in &scope.networks {
+        let addresses = zone.lookup(network, &asked);
+        known |= !addresses.is_empty();
+        records = addresses.into_iter().filter_map(rdata).collect();
+        if !records.is_empty() {
+            break;
+        }
+    }
+    if !known {
+        return None;
+    }
+    let mut records: Vec<Record> =
+        records.into_iter().map(|data| Record::from_rdata(name.clone(), TTL, data)).collect();
     records.shuffle(&mut rand::rng());
     Some(records)
 }
@@ -1252,18 +1263,22 @@ mod tests {
         assert_eq!(resolve(&view, "proxy.backend", RecordType::A), [PROXY_BACKEND]);
         assert_eq!(resolve(&view, "proxy.public", RecordType::A), [PROXY]);
 
-        // The other way round, `backend` answers for both names, AAAA too,
-        // though it has no IPv6 address for them.
+        // The other way round, `backend` answers A for both names; it has no
+        // IPv6 address for them, so `public` answers AAAA: a container on
+        // an IPv4-only network and an IPv6 one is found over IPv6 too.
         let view = connected(somewhere(), &["backend", "public"]);
         assert_eq!(resolve(&view, "app", RecordType::A), [WEB, WEB2]);
         assert_eq!(resolve(&view, "proxy", RecordType::A), [PROXY_BACKEND]);
-        for name in ["app", "proxy"] {
-            let answer = local(&query(2, name, RecordType::AAAA), &view);
-            assert_eq!((answer.response_code, answer.authoritative), (ResponseCode::NoError, true), "{name}");
-            assert_eq!(addresses(&answer), NONE, "{name}");
-        }
+        assert_eq!(resolve(&view, "app", RecordType::AAAA), [PROXY6, EDGE6]);
+        assert_eq!(resolve(&view, "proxy", RecordType::AAAA), [PROXY6]);
         assert_eq!(resolve(&view, "app.public", RecordType::AAAA), [PROXY6, EDGE6]);
         assert_eq!(resolve(&view, "proxy.public", RecordType::AAAA), [PROXY6]);
+        // A name with no IPv6 address on any of them: no records, ours.
+        let answer = local(&query(2, "web", RecordType::AAAA), &view);
+        assert_eq!((answer.response_code, answer.authoritative), (ResponseCode::NoError, true));
+        assert_eq!(addresses(&answer), NONE);
+        // Qualified by the IPv4-only network: only that one, so nothing.
+        assert_eq!(addresses(&local(&query(3, "proxy.backend", RecordType::AAAA), &view)), NONE);
     }
 
     #[test]
