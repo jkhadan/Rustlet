@@ -295,8 +295,9 @@ impl Networks {
         servers.into_iter().map(|ip| SocketAddr::new(ip, 53)).collect()
     }
 
-    pub fn host_resolv(&self) -> ResolvConf {
-        ResolvConf::host(&self.resolv_conf)
+    /// The host's resolver configuration (`resolv_conf` in daemon.toml).
+    pub fn resolv_conf_path(&self) -> &std::path::Path {
+        &self.resolv_conf
     }
 
     /// The API's view of a network, with the runs on it.

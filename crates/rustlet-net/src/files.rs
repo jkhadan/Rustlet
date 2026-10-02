@@ -55,11 +55,16 @@ impl ResolvConf {
         r
     }
 
-    /// The host's configuration as containers should see it: `path`
-    /// (`/etc/resolv.conf`), or, if that names only loopback servers and
-    /// systemd-resolved's list exists, that list.
+    /// `path` as it is (nothing, if it can't be read).
+    pub fn read(path: &Path) -> ResolvConf {
+        std::fs::read_to_string(path).map(|t| ResolvConf::parse(&t)).unwrap_or_default()
+    }
+
+    /// The host's configuration as containers in namespaces of their own
+    /// should see it: `path` (`/etc/resolv.conf`), or, if that names only
+    /// loopback servers and systemd-resolved's list exists, that list.
     pub fn host(path: &Path) -> ResolvConf {
-        let conf = std::fs::read_to_string(path).map(|t| ResolvConf::parse(&t)).unwrap_or_default();
+        let conf = ResolvConf::read(path);
         let only_loopback = !conf.nameservers.is_empty() && conf.nameservers.iter().all(IpAddr::is_loopback);
         if only_loopback && let Ok(text) = std::fs::read_to_string(RESOLVED_UPSTREAMS) {
             return ResolvConf::parse(&text);
@@ -108,7 +113,20 @@ pub enum Resolver {
     Host,
 }
 
-/// The container's `resolv.conf`.
+/// The container's `resolv.conf`, from the host's at `path`: as it is for a
+/// container in the host's namespace (its loopback is the host's: a stub
+/// at `127.0.0.53` answers there), otherwise as [`ResolvConf::host`] has
+/// it.
+pub fn container_resolv_conf(path: &Path, dns: &DnsOptions, resolver: Resolver) -> String {
+    let host = match resolver {
+        Resolver::Host => ResolvConf::read(path),
+        Resolver::Embedded | Resolver::Direct => ResolvConf::host(path),
+    };
+    resolv_conf(&host, dns, resolver)
+}
+
+/// The container's `resolv.conf`, from the host's configuration as
+/// [`container_resolv_conf`] picks it.
 pub fn resolv_conf(host: &ResolvConf, dns: &DnsOptions, resolver: Resolver) -> String {
     let pick = |given: &[String], host: &[String]| if given.is_empty() { host.to_vec() } else { given.to_vec() };
     let conf = match resolver {
@@ -232,6 +250,20 @@ mod tests {
         let stub = ResolvConf::parse(STUB);
         assert!(resolv_conf(&stub, &none, Resolver::Host).contains("nameserver 127.0.0.53"));
         assert!(resolv_conf(&stub, &none, Resolver::Direct).contains("nameserver 8.8.8.8\nnameserver 8.8.4.4\n"));
+    }
+
+    #[test]
+    fn the_hosts_namespace_keeps_the_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("resolv.conf");
+        std::fs::write(&stub, STUB).unwrap();
+        let none = DnsOptions::default();
+        let host = container_resolv_conf(&stub, &none, Resolver::Host);
+        assert!(host.contains("nameserver 127.0.0.53\n"), "{host}");
+        // In a namespace of its own, never the stub: resolved's list where
+        // there is one, else the fallback.
+        let direct = container_resolv_conf(&stub, &none, Resolver::Direct);
+        assert!(!direct.contains("127.0.0.53"), "{direct}");
     }
 
     #[test]

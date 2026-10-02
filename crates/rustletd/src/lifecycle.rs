@@ -288,7 +288,7 @@ impl Daemon {
             search: r.config.dns_search.clone(),
             options: r.config.dns_options.clone(),
         };
-        let resolv = rustlet_net::files::resolv_conf(&self.networks.host_resolv(), &dns, resolver);
+        let resolv = rustlet_net::files::container_resolv_conf(self.networks.resolv_conf_path(), &dns, resolver);
         let dir = self.paths.container_dir(&r.id);
         let contents = [hosts, format!("{}\n", plan.hostname), resolv];
         // Container root (host uid 1000000 under --userns=remap) may edit
