@@ -46,7 +46,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::lifecycle::blocking;
 
 /// Mount points that are the runtime's own.
-const RESERVED_TARGETS: [&str; 4] = ["/proc", "/sys", "/dev", "/dev/pts"];
+const RESERVED_TARGETS: [&str; 6] = ["/proc", "/sys", "/sys/fs/cgroup", "/dev", "/dev/pts", "/dev/mqueue"];
 
 impl Daemon {
     /// `<data>/volumes/<name>/_data`.
@@ -193,11 +193,15 @@ impl Daemon {
         let remap = config.userns == UsernsMode::Remap;
         let mut out: Vec<MountSpec> = Vec::new();
         for m in &config.mounts {
-            check_mount(m, remap)?;
+            // `/data/` and `/data` are the same mount point (as for Docker).
+            let mut m = m.clone();
+            if let Some(clean) = clean_target(&m.target) {
+                m.target = clean;
+            }
+            check_mount(&m, remap)?;
             if out.iter().any(|o| o.target == m.target) {
                 return Err(ApiError::invalid(format!("duplicate mount point: {}", m.target)));
             }
-            let mut m = m.clone();
             match m.kind {
                 MountType::Volume => {
                     let (v, created) = self.create_volume(m.source.clone(), Default::default())?;
@@ -230,16 +234,31 @@ impl Daemon {
             }
             out.push(m);
         }
-        let mut wanted: Vec<String> = image_volumes.iter().filter_map(|v| clean_target(v)).collect();
+        let mut wanted: Vec<String> = image_volumes
+            .iter()
+            .filter_map(|v| {
+                let target = clean_target(v);
+                if target.is_none() {
+                    tracing::warn!("the image's VOLUME {v:?} is not an absolute path: left out");
+                }
+                target
+            })
+            .collect();
         wanted.sort();
         wanted.dedup();
         for target in wanted {
             if out.iter().any(|o| o.target == target) {
                 continue;
             }
+            let mut m = MountSpec { kind: MountType::Volume, target, ..MountSpec::default() };
+            // The image is untrusted: its VOLUME / or /proc gets the same
+            // answer as a -v would, now rather than as a runtime error at
+            // every start.
+            check_mount(&m, remap).map_err(|e| e.context(format!("the image's VOLUME {}", m.target)))?;
             let (v, _) = self.create_volume(None, Default::default())?;
             made.push(v.name.clone());
-            out.push(MountSpec { kind: MountType::Volume, source: Some(v.name), target, ..MountSpec::default() });
+            m.source = Some(v.name);
+            out.push(m);
         }
         Ok(out)
     }

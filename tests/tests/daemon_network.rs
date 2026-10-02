@@ -359,6 +359,19 @@ fn vol_anonymous_bind_and_tmpfs_mounts() {
         c.wait(&id, WaitCondition::Removed).await.unwrap();
         assert!(!d.data.join("volumes").join(&name).exists(), "--rm took its anonymous volume");
     });
+    // An image's VOLUME on the runtime's own paths is refused at create,
+    // and leaves no volume behind.
+    d.import_alpine_with("badvolume", |cfg| {
+        cfg.set_volumes(Some(vec!["/data".into(), "/proc".into()]));
+    });
+    block_on(async {
+        let c = d.client();
+        let before = c.list_volumes().await.unwrap().len();
+        let e = c.create_container(&ContainerConfig { image: "badvolume".into(), ..sh("true") }).await.unwrap_err();
+        assert_eq!(e.kind(), Some(ErrorKind::Invalid), "{e}");
+        assert!(e.to_string().contains("VOLUME /proc"), "{e}");
+        assert_eq!(c.list_volumes().await.unwrap().len(), before, "the /data volume made for it is gone again");
+    });
 }
 
 /// Under `--userns=remap` a volume is idmapped: container root's files are
