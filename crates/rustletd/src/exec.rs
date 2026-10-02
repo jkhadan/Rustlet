@@ -202,12 +202,12 @@ impl Daemon {
         match self.open_exec(&s).await {
             Ok((_, stream)) => {
                 let (sink, source) = ws.split();
-                let exit = crate::attach::bridge(sink, source, stream, s.config.stdin).await;
-                // A client that detached leaves the process running: its
-                // exit isn't known here.
-                if exit.is_some() || !s.state.lock().unwrap_or_else(|e| e.into_inner()).running {
-                    self.exec_died(&s, exit.map(|e| e.code));
-                }
+                // Recorded before the client hears of it, so an inspect
+                // right after sees the exit code.
+                let recorded = async |exit: &rustlet_shim::protocol::ExitStatus| self.exec_died(&s, Some(exit.code));
+                // A client that detaches leaves the process running; its
+                // exit isn't seen here then.
+                crate::attach::bridge(sink, source, stream, s.config.stdin, recorded).await;
             }
             Err(e) => {
                 let (mut sink, _) = ws.split();

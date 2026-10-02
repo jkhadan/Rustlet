@@ -30,6 +30,10 @@ type Source = SplitStream<WebSocket>;
 /// `GET /v1/containers/{id}/attach`, once upgraded.
 pub async fn attach(daemon: Arc<Daemon>, c: Arc<Container>, ws: WebSocket, stdin: bool) {
     let (mut sink, mut source) = ws.split();
+    // The run this session ends with is the one after `exits` (the current
+    // one, or the next start's).
+    let mut state = c.subscribe();
+    let exits = state.borrow().exits;
     let stream = if c.status().is_live() {
         let socket = daemon.paths.shim(c.id()).socket();
         let opened = async { ShimClient::connect(&socket).await?.open_stream(&Request::Attach { stdin }).await }.await;
@@ -55,7 +59,13 @@ pub async fn attach(daemon: Arc<Daemon>, c: Arc<Container>, ws: WebSocket, stdin
             None => return,
         }
     };
-    bridge(sink, source, stream, stdin).await;
+    // The client hears of the exit once the daemon has handled it: a `rm`
+    // or `inspect` right after must see the container exited.
+    let handled = async move |_: &ExitStatus| {
+        let done = state.wait_for(|s| s.exits > exits || s.removed);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), done).await;
+    };
+    bridge(sink, source, stream, stdin, handled).await;
 }
 
 /// Registers the client with the container and waits for `start` to hand
@@ -122,7 +132,13 @@ async fn wait_for_start(
 /// Copies between the client and the shim until the process exits (the
 /// exit is the last thing sent) or the client goes away (detaching: the
 /// process goes on).
-pub async fn bridge(mut sink: Sink, mut source: Source, stream: ShimStream, stdin: bool) -> Option<ExitStatus> {
+pub async fn bridge(
+    mut sink: Sink,
+    mut source: Source,
+    stream: ShimStream,
+    stdin: bool,
+    before_exit: impl AsyncFnOnce(&ExitStatus),
+) -> Option<ExitStatus> {
     let (mut reader, mut writer) = stream.split();
     let to_client = async {
         loop {
@@ -130,6 +146,7 @@ pub async fn bridge(mut sink: Sink, mut source: Source, stream: ShimStream, stdi
                 Ok(Some(StreamEvent::Stdout(b))) => Message::Binary(data_message(STDOUT, &b).into()),
                 Ok(Some(StreamEvent::Stderr(b))) => Message::Binary(data_message(STDERR, &b).into()),
                 Ok(Some(StreamEvent::Exited(exit))) => {
+                    before_exit(&exit).await;
                     let control = Control::Exit { code: exit.code, oom_killed: exit.oom_killed };
                     let _ = sink.send(text(&control)).await;
                     let _ = sink.close().await;

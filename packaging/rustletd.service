@@ -1,10 +1,12 @@
 [Unit]
 Description=Rustlets container daemon
 Documentation=file:///usr/share/doc/rustlets/architecture.md
-After=network-online.target nftables.service
+After=network-online.target nftables.service local-fs.target
 Wants=network-online.target
 
 [Service]
+# READY=1 comes once the API socket accepts connections and every container
+# the last daemon left has been taken over again.
 Type=notify
 NotifyAccess=main
 ExecStart=/usr/local/bin/rustletd
@@ -12,14 +14,16 @@ Restart=on-failure
 RestartSec=2
 
 # cgroups: systemd delegates the whole rustletd.service subtree to us.
-# The daemon itself runs in the `daemon` leaf; containers get leaves under
-# `containers/<id>` (a process may not sit in an inner node that has
-# controllers enabled, the "no internal processes" rule).
+# The daemon itself runs in the `daemon` leaf; shims in `shims`, image
+# workers in `workers/<n>`, containers in `containers/<id>` (a process may
+# not sit in an inner node that has controllers enabled, the "no internal
+# processes" rule). rustletd finds its cgroup parent from its own cgroup.
 Delegate=yes
 DelegateSubgroup=daemon
 
 # Shims and containers must survive `systemctl restart rustletd`:
-# only the main process is signalled on stop.
+# only the main process is signalled on stop. The new daemon takes the
+# shims over through their sockets in /run/rustlet/shims.
 KillMode=process
 
 # The default TasksMax (15% of pid_max) would count every shim and every
@@ -31,6 +35,9 @@ OOMScoreAdjust=-500
 # Deliberately NO PrivateTmp / ProtectSystem / ProtectHome / PrivateMounts:
 # overlay mounts and netns pins must land in the *host* mount namespace,
 # where the host and scripts/cleanup.sh can see (and remove) them.
+# And never DevicePolicy= / DeviceAllow=: systemd's device program on this
+# cgroup would also apply to every container below it (docs/architecture.md
+# §2.2.2).
 
 [Install]
 WantedBy=multi-user.target

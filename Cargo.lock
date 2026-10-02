@@ -1866,6 +1866,7 @@ name = "rustlet-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "bytes",
  "chrono",
  "clap",
@@ -1937,7 +1938,9 @@ name = "rustlet-itests"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "futures",
  "nix",
+ "rustlet-client",
  "rustlet-image",
  "rustlet-runtime",
  "rustlet-shim",

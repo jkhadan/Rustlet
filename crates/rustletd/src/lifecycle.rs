@@ -599,7 +599,27 @@ impl Daemon {
         self.containers.write().unwrap_or_else(|e| e.into_inner()).remove(c.id());
         c.mark_removed();
         self.emit(c, "destroy", &[]);
+        self.collect_orphaned_image(&c.record.image_id).await;
         Ok(())
+    }
+
+    /// An image whose names were all removed while containers used it
+    /// (`rmi --force`) has nothing to keep it once the last of them is
+    /// gone: collect it then (there is no `image prune` yet).
+    async fn collect_orphaned_image(&self, image_id: &str) {
+        let users = self.image_users();
+        if users.contains_key(image_id) || self.images.is_named(image_id).unwrap_or(true) {
+            return;
+        }
+        let in_use = users.keys().cloned().collect();
+        match self.images.collect_garbage(&in_use).await {
+            Ok(deleted) => {
+                for gone in deleted {
+                    self.events.emit(EventKind::Image, "delete", &gone, Default::default());
+                }
+            }
+            Err(e) => tracing::warn!("collect image {image_id}: {e}"),
+        }
     }
 
     pub async fn wait(&self, c: &Container, condition: WaitCondition) -> WaitResponse {

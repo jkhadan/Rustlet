@@ -31,7 +31,7 @@ pub(crate) fn run(extra: &[String]) -> anyhow::Result<()> {
     }
     // The binaries the tests run: the runtime, the shim (and, from Phase 4,
     // the daemon and CLI tests start them too).
-    run_cmd(cargo().args(["build", "--quiet", "-p", "rustlet-runc", "-p", "rustlet-shim"]))?;
+    run_cmd(cargo().args(["build", "--quiet", "-p", "rustlet-runc", "-p", "rustlet-shim", "-p", "rustletd"]))?;
     let binaries = test_binaries()?;
 
     let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();

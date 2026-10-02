@@ -12,6 +12,7 @@
 //! | `devices`     | build a device filter (defaults, or a bundle's) and show its eBPF program |
 //! | `image-run`   | pull an image and run it: registry → snapshots → overlay → rustlet-runc (`--userns`) |
 //! | `images`      | list the image store, inspect an image, `ls` inside snapshots and container layers |
+//! | `daemon`      | install rustletd as a systemd service (`install`, `uninstall`, `status`) |
 //! | `gen-ts`      | Phase 6                                                        |
 //!
 //! Nothing here runs `sudo cargo`: builds always run as your user, and only
@@ -19,6 +20,7 @@
 #![forbid(unsafe_code)]
 
 mod checkhost;
+mod daemon;
 mod demo;
 mod devices;
 mod devstorage;
@@ -138,6 +140,12 @@ enum Task {
     /// The root half of `images`.
     #[command(hide = true)]
     ImagesRoot(images::ImagesArgs),
+    /// Install rustletd as a systemd service, or remove it.
+    #[command(subcommand)]
+    Daemon(daemon::DaemonTask),
+    /// The root half of `daemon`.
+    #[command(subcommand, hide = true)]
+    DaemonRoot(daemon::DaemonTask),
     /// Generate TypeScript types for the desktop app (Phase 6).
     GenTs,
 }
@@ -158,6 +166,8 @@ fn main() -> anyhow::Result<()> {
         Task::ImageRunRoot(args) => imagerun::run_as_root(&args),
         Task::Images(args) => images::run(&args),
         Task::ImagesRoot(args) => images::run_as_root(&args),
+        Task::Daemon(task) => daemon::run(&task),
+        Task::DaemonRoot(task) => daemon::run_as_root(&task),
         Task::GenTs => bail!("`gen-ts` arrives in Phase 6 (desktop app)"),
     }
 }

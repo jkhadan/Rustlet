@@ -23,7 +23,9 @@ rustlet-image.workspace = true
 rustlet-sys.workspace = true
 rustlet-shim.workspace = true
 rustlet-spec.workspace = true
+rustlet-client.workspace = true
 tokio.workspace = true
+futures.workspace = true
 # Building image layers in the image tests.
 tar.workspace = true
 flate2.workspace = true

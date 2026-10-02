@@ -80,6 +80,16 @@ impl Images {
         Err(ApiError::no_such_image(name))
     }
 
+    /// Does any name point at the manifest `id`?
+    pub fn is_named(&self, id: &str) -> ApiResult<bool> {
+        for r in self.store.content().refs()? {
+            if r.manifest_digest()?.to_string() == id {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Every named image, one entry per manifest.
     pub fn list(&self) -> ApiResult<Vec<ImageSummary>> {
         let mut by_digest: BTreeMap<Digest, Vec<String>> = BTreeMap::new();

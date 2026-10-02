@@ -11,6 +11,7 @@
 //! nothing a container mounts may ever show up on the host.
 #![forbid(unsafe_code)]
 
+pub mod daemon;
 pub mod e2e;
 pub mod images;
 pub mod shim;
