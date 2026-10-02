@@ -310,9 +310,14 @@ section tells why it no longer is.
 So the daemon also listens on the published port itself and relays what
 arrives there, as Docker's `docker-proxy` does
 ([`proxy.rs`](../../crates/rustlet-net/src/proxy.rs)). The daemon binds the sockets
-([`bound_socket`](../../crates/rustletd/src/network.rs)): `SO_REUSEADDR`, and for IPv6 `IPV6_V6ONLY`,
+([`bound_socket`](../../crates/rustletd/src/network.rs)): for IPv6 with `IPV6_V6ONLY`,
 so that `[::]:8080` doesn't also try to take the IPv4 port `0.0.0.0:8080`
-already has:
+already has, and for TCP with `SO_REUSEADDR`, so that a port whose last
+connections are still in `TIME_WAIT` can be bound again. **Not** for UDP:
+there, two sockets that both set `SO_REUSEADDR` may bind the same port,
+and a second container publishing `5353/udp` would have bound it beside
+the first instead of failing (the independent review found it; the
+daemon's `a_udp_port_is_taken_too` test checks it):
 
 ```text
 $ ss -tlnp 'sport = :8080'

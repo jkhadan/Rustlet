@@ -888,3 +888,65 @@ fn dn_several_networks_survive_a_daemon_restart() {
         c.remove_container(&id, true).await.unwrap();
     });
 }
+
+/// Networks created at once each get a subnet of their own.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dn_networks_created_at_once_get_subnets_of_their_own() {
+    let d = TestDaemon::start();
+    block_on(async {
+        let c = d.client();
+        let reqs: Vec<NetworkCreate> =
+            (0..6).map(|i| NetworkCreate { name: format!("at-once-{i}"), ..Default::default() }).collect();
+        for created in futures::future::join_all(reqs.iter().map(|r| c.create_network(r))).await {
+            created.unwrap();
+        }
+        let mut subnets = Vec::new();
+        for r in &reqs {
+            subnets.push(c.inspect_network(&r.name).await.unwrap().subnet);
+        }
+        let distinct: std::collections::BTreeSet<&String> = subnets.iter().collect();
+        assert_eq!(distinct.len(), reqs.len(), "{subnets:?}");
+    });
+}
+
+/// `network connect` and `disconnect` racing the container's own exit:
+/// whatever the order, the exited container holds nothing afterwards (no
+/// namespace in its row, no address on the network, which can go).
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dn_connect_and_disconnect_racing_an_exit() {
+    let d = daemon();
+    block_on(async {
+        let c = d.client();
+        for round in 0..10 {
+            let net = format!("race{round}");
+            network(&c, &net, false).await;
+            let id = c.create_container(&sh("sleep 0.4")).await.unwrap().id;
+            c.start(&id).await.unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            let mut connected = false;
+            loop {
+                let state = c.inspect_container(&id).await.unwrap().state;
+                if !state.status.is_live() {
+                    break;
+                }
+                assert!(tokio::time::Instant::now() < deadline, "round {round}: still {state:?}");
+                let done = if connected {
+                    c.disconnect_network(&net, &NetworkDisconnect { container: id.clone(), force: false }).await
+                } else {
+                    c.connect_network(&net, &NetworkConnect { container: id.clone(), ..Default::default() }).await
+                };
+                if done.is_ok() {
+                    connected = !connected;
+                }
+            }
+            c.wait(&id, WaitCondition::NotRunning).await.unwrap();
+            let i = c.inspect_container(&id).await.unwrap();
+            assert!(!i.state.status.is_live(), "round {round}: {:?}", i.state.status);
+            assert_eq!(i.network.sandbox, None, "round {round}: the exited container's row has a run");
+            c.remove_container(&id, true).await.unwrap();
+            c.remove_network(&net).await.unwrap_or_else(|e| panic!("round {round}: {e}"));
+        }
+    });
+}

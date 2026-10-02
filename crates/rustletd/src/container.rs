@@ -11,7 +11,9 @@
 //! exits) doesn't take `op`: the exit monitor cleans up, publishes the exit,
 //! and only then hands the restart policy to a task that takes `op` like
 //! any operation, so a `stop` waiting for the exit it caused can't deadlock
-//! with it.
+//! with it. The exit's cleanup of the run's network does take `net`, which
+//! `network connect` and `disconnect` hold (after `op`) while they change a
+//! running container's network; nothing holding `net` waits for an exit.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -48,7 +50,14 @@ pub struct PendingAttach {
 pub struct Container {
     pub record: Record,
     pub op: tokio::sync::Mutex<()>,
+    /// Taken by whatever changes the run's network, the exit monitor's
+    /// cleanup (which doesn't take `op`) included: a `network connect` or
+    /// `disconnect` and the run's end take turns.
+    pub net: tokio::sync::Mutex<()>,
     shared: watch::Sender<Shared>,
+    /// One change of the persisted state at a time (read, changed, saved,
+    /// published), so that two at once can't lose one.
+    changes: Mutex<()>,
     pub pending_attach: Mutex<Vec<PendingAttach>>,
     /// The restart policy's timer, while the container is `restarting`.
     pub restart_timer: Mutex<Option<tokio::task::AbortHandle>>,
@@ -60,7 +69,9 @@ impl Container {
         Container {
             record,
             op: tokio::sync::Mutex::new(()),
+            net: tokio::sync::Mutex::new(()),
             shared: watch::Sender::new(Shared { persisted, exits: 0, removed: false }),
+            changes: Mutex::new(()),
             pending_attach: Mutex::new(Vec::new()),
             restart_timer: Mutex::new(None),
             backoff: Mutex::new(Backoff::default()),
@@ -91,6 +102,7 @@ impl Container {
 
     /// Changes the persisted state: written to the database, then published.
     pub fn update(&self, db: &Db, f: impl FnOnce(&mut Persisted)) -> ApiResult<()> {
+        let _turn = self.changes.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = self.persisted();
         f(&mut next);
         let saved = db.save_state(self.id(), &next);
@@ -100,6 +112,7 @@ impl Container {
 
     /// The end of a run: the state, and one more exit for those waiting.
     pub fn finish_run(&self, db: &Db, f: impl FnOnce(&mut Persisted)) {
+        let _turn = self.changes.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = self.persisted();
         f(&mut next);
         if let Err(e) = db.save_state(self.id(), &next) {
@@ -354,5 +367,31 @@ mod tests {
         };
         assert_eq!(ran_for(&s), Some(Duration::from_millis(12_500)));
         assert_eq!(ran_for(&ContainerState::default()), None);
+    }
+
+    #[test]
+    fn changes_made_at_once_are_all_kept() {
+        // The exit monitor changes a container's state without its op lock,
+        // while `network connect` may be changing it under the lock.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("state.db")).unwrap();
+        let record = Record { id: "c1".into(), name: "c1".into(), ..Record::default() };
+        db.insert(&record, &Persisted::default()).unwrap();
+        let c = Container::new(record, Persisted::default());
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for _ in 0..100 {
+                    c.update(&db, |p| p.state.restart_count += 1).unwrap();
+                }
+            });
+            s.spawn(|| {
+                for _ in 0..100 {
+                    c.finish_run(&db, |p| p.state.exit_code = Some(p.state.exit_code.unwrap_or(0) + 1));
+                }
+            });
+        });
+        let p = c.persisted();
+        assert_eq!((p.state.restart_count, p.state.exit_code), (100, Some(100)));
+        assert_eq!(db.all().unwrap()[0].1, p, "the row says the same");
     }
 }

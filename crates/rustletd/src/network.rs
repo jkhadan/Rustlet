@@ -82,6 +82,10 @@ pub struct Networks {
     /// One `ufw` command at a time: it rewrites its rule files whole.
     ufw_turn: Arc<Mutex<()>>,
     state: Mutex<State>,
+    /// One network created or removed at a time: a new network's subnet is
+    /// chosen from the others, which a create going on at the same time
+    /// would not be among yet.
+    changes: tokio::sync::Mutex<()>,
     /// Taken while a ruleset is computed and applied, so that two changes
     /// can't apply their rulesets in the wrong order.
     firewall: tokio::sync::Mutex<()>,
@@ -157,6 +161,7 @@ impl Networks {
             ufw: config.manage_ufw && ufw::manages_host(),
             ufw_turn: Arc::new(Mutex::new(())),
             state: Mutex::new(State::default()),
+            changes: tokio::sync::Mutex::new(()),
             firewall: tokio::sync::Mutex::new(()),
             zone: Zone::new(),
             isolate_forwarding: AtomicBool::new(false),
@@ -694,6 +699,7 @@ impl Daemon {
         if req.ipv6 && !sysctl::ipv6_available() {
             return Err(ApiError::invalid("the host's kernel has IPv6 turned off (ipv6.disable=1)"));
         }
+        let _turn = self.networks.changes.lock().await;
         let routes = blocking(|| link::routed_blocks().map_err(ApiError::from)).await?;
         let nets = &self.networks;
         let existing = nets.records();
@@ -851,12 +857,15 @@ impl Daemon {
         if n.name == DEFAULT_NETWORK {
             return Err(ApiError::conflict("the default network can't be removed"));
         }
-        if self.networks.in_use(&n.id) {
-            return Err(ApiError::conflict(format!("network {} has running containers: stop them first", n.name)));
-        }
-        self.db.remove_network(&n.id)?;
+        let _turn = self.networks.changes.lock().await;
         {
+            // Checked and removed at once: a start can't take an address
+            // in between.
             let mut st = self.networks.state();
+            if st.used.get(&n.id).is_some_and(|m| !m.is_empty()) {
+                return Err(ApiError::conflict(format!("network {} has running containers: stop them first", n.name)));
+            }
+            self.db.remove_network(&n.id)?;
             st.networks.remove(&n.id);
             st.allocators.remove(&n.id);
             st.used.remove(&n.id);
@@ -896,6 +905,8 @@ impl Daemon {
         let network = self.networks.find(key)?;
         let c = self.find(&req.container)?;
         let _op = c.op.lock().await;
+        // The run can't end (and be undone) while it is changed.
+        let _net = c.net.lock().await;
         check_connectable(&c)?;
         let mut configs = c.endpoint_configs();
         if configs.iter().any(|e| e.network == network.name) {
@@ -935,6 +946,7 @@ impl Daemon {
         };
         let name = network.as_ref().map_or(key, |n| n.name.as_str()).to_owned();
         let _op = c.op.lock().await;
+        let _net = c.net.lock().await;
         let mut configs = c.endpoint_configs();
         let Some(index) = configs.iter().position(|e| e.network == name) else {
             return Err(ApiError::conflict(format!("container {} is not connected to network {name}", c.record.name)));
@@ -1631,9 +1643,12 @@ fn proxy_on(
     Ok((port, PortProxy { proxy, backend, v6: addr.is_ipv6(), container_port }))
 }
 
-/// A socket bound to `addr` (listening, for TCP), with `SO_REUSEADDR`, and
-/// `IPV6_V6ONLY` for IPv6 so that `[::]` doesn't also claim the IPv4
-/// port (`0.0.0.0` has it).
+/// A socket bound to `addr` (listening, for TCP), and `IPV6_V6ONLY` for
+/// IPv6 so that `[::]` doesn't also claim the IPv4 port (`0.0.0.0` has
+/// it). TCP sockets get `SO_REUSEADDR`, so a port whose last connections
+/// are in `TIME_WAIT` can be bound again; UDP ones must not: two UDP
+/// sockets that both set it may bind the same port, and the port would not
+/// be reserved.
 fn bound_socket(addr: SocketAddr, protocol: Protocol) -> std::io::Result<std::os::fd::OwnedFd> {
     use nix::sys::socket::{
         AddressFamily, Backlog, SockFlag, SockType, SockaddrStorage, bind, listen, setsockopt, socket, sockopt,
@@ -1644,7 +1659,9 @@ fn bound_socket(addr: SocketAddr, protocol: Protocol) -> std::io::Result<std::os
         Protocol::Udp => SockType::Datagram,
     };
     let fd = socket(family, ty, SockFlag::SOCK_CLOEXEC, None)?;
-    setsockopt(&fd, sockopt::ReuseAddr, &true)?;
+    if protocol == Protocol::Tcp {
+        setsockopt(&fd, sockopt::ReuseAddr, &true)?;
+    }
     if addr.is_ipv6() {
         setsockopt(&fd, sockopt::Ipv6V6Only, &true)?;
     }
@@ -1689,6 +1706,24 @@ mod tests {
             assert!(published[0].host_port > 0);
             assert_eq!(proxies[0].backend.get(), Some("10.89.0.2:80".parse().unwrap()));
             // The port is ours now: binding it again fails as a conflict.
+            let again = PortMapping { host_port: Some(published[0].host_port), ..m };
+            let e = publish(&[again], &eps).unwrap_err();
+            assert_eq!(e.kind, rustlet_spec::ErrorKind::Conflict, "{e}");
+        });
+    }
+
+    #[test]
+    fn a_udp_port_is_taken_too() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let m = PortMapping {
+                host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                host_port: None,
+                container_port: 53,
+                protocol: Protocol::Udp,
+            };
+            let eps = [endpoint("bridge", [10, 89, 0, 2], None, false)];
+            let (published, _proxies) = publish(&[m], &eps).unwrap();
             let again = PortMapping { host_port: Some(published[0].host_port), ..m };
             let e = publish(&[again], &eps).unwrap_err();
             assert_eq!(e.kind, rustlet_spec::ErrorKind::Conflict, "{e}");

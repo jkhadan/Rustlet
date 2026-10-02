@@ -487,6 +487,9 @@ impl Daemon {
         let _ = shim::call(&socket, &Request::Shutdown).await;
         let _ = std::fs::remove_dir_all(self.paths.shim(&id).dir());
         let unmounted = self.unmount(&self.paths.container_dir(&id)).await;
+        // A connect or disconnect going on finishes first: its change is in
+        // the run's record, and goes with the rest of it.
+        let net_turn = c.net.lock().await;
         if let Some(net) = c.persisted().network {
             self.detach_network(c, &net).await;
         }
@@ -502,6 +505,7 @@ impl Daemon {
                 Some(if exit.finished_at.is_empty() { rustlet_shim::logfile::now() } else { exit.finished_at.clone() });
             s.state.error = error;
         });
+        drop(net_turn);
         if exit.oom_killed {
             self.emit(c, "oom", &[]);
         }
