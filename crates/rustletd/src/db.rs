@@ -90,6 +90,9 @@ pub struct Record {
     /// Its mounts, with anonymous volumes named and the image's `VOLUME`s
     /// added (as anonymous volumes).
     pub mounts: Vec<MountSpec>,
+    /// The anonymous volumes made for it (`-v /path`, the image's
+    /// `VOLUME`s): what `rm -v` and `--rm` remove with it.
+    pub anonymous_volumes: Vec<String>,
 }
 
 /// What changes as the container runs.

@@ -8,7 +8,8 @@
 //!
 //! **At create** a container's mounts are resolved once and recorded: a
 //! `-v /path` (no name) and each `VOLUME` of the image that no mount covers
-//! become new *anonymous* volumes (64 hex digits for a name, as Docker's);
+//! become new *anonymous* volumes (64 hex digits for a name, as Docker's),
+//! the container's own (`Record::anonymous_volumes`);
 //! a named volume that doesn't exist yet is created; a bind mount's host
 //! directory is created if `-v` asked for it, and must exist otherwise.
 //!
@@ -17,8 +18,9 @@
 //! `nocopy`, before the container exists; one copy at a time per volume.
 //!
 //! **In use** means named in any container's record, running or not, as in
-//! Docker: such a volume can't be removed. Anonymous volumes go with their
-//! container when it is removed with `--rm` or `rm -v`.
+//! Docker: such a volume can't be removed. A container's own anonymous
+//! volumes go with it when it is removed with `--rm` or `rm -v`; a volume
+//! it was given by name stays, whatever kind it is.
 //!
 //! **User namespaces.** A container with `--userns=remap` gets its volumes
 //! as *idmapped* mounts, so files the volume holds as owned by uid 0 are
@@ -76,11 +78,19 @@ impl Daemon {
             Some(n) => n,
             None => crate::names::new_id(|_| false),
         };
+        let _turn = self.volume_creates.lock().unwrap_or_else(|e| e.into_inner());
         if let Ok(v) = self.find_volume(&name) {
             return Ok((v, false));
         }
         let record = VolumeRecord { name: name.clone(), created: rustlet_shim::logfile::now(), labels, anonymous };
         let dir = self.paths.volumes.join(&name);
+        // A directory without a row is what a create cut short left (creates
+        // take turns, and a row is added last and removed first).
+        if std::fs::symlink_metadata(&dir).is_ok() {
+            tracing::info!("volume {name}: removing what an unfinished create left");
+            rustlet_sys::tree::safe_remove_tree(&dir)
+                .map_err(|e| ApiError::internal(format!("remove {}: {e}", dir.display())))?;
+        }
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&dir)
@@ -91,10 +101,6 @@ impl Daemon {
             .and_then(|()| self.db.insert_volume(&record));
         if let Err(e) = inserted {
             let _ = std::fs::remove_dir_all(&dir);
-            // Created by someone else meanwhile: theirs it is.
-            if let Ok(v) = self.find_volume(&name) {
-                return Ok((v, false));
-            }
             return Err(e);
         }
         self.events.emit(EventKind::Volume, "create", &name, Default::default());
@@ -129,6 +135,7 @@ impl Daemon {
 
     /// Removes a volume no container uses. `force`: a missing one is fine.
     pub async fn remove_volume(&self, name: &str, force: bool) -> ApiResult<u64> {
+        let _turn = self.volume_users_turn.write().await;
         let v = match self.find_volume(name) {
             Ok(v) => v,
             Err(_) if force => return Ok(0),
@@ -137,7 +144,14 @@ impl Daemon {
         if let Some(users) = self.volume_users().get(&v.name) {
             return Err(ApiError::conflict(format!("volume {} is in use by {}", v.name, users.join(", "))));
         }
-        let dir = self.paths.volumes.join(&v.name);
+        self.delete_volume(&v.name).await
+    }
+
+    /// Deletes the volume `name` (its row first, then its directory),
+    /// whoever names it: for what the caller knows no container uses.
+    async fn delete_volume(&self, name: &str) -> ApiResult<u64> {
+        self.db.remove_volume(name)?;
+        let dir = self.paths.volumes.join(name);
         let size = {
             let data = dir.join("_data");
             blocking(move || Ok::<_, ApiError>(tree_size(&data))).await?
@@ -147,48 +161,60 @@ impl Daemon {
                 .map_err(|e| ApiError::internal(format!("remove {}: {e}", dir.display())))
         })
         .await?;
-        self.db.remove_volume(&v.name)?;
-        self.events.emit(EventKind::Volume, "destroy", &v.name, Default::default());
+        self.events.emit(EventKind::Volume, "destroy", name, Default::default());
         Ok(size)
     }
 
     /// Removes the volumes no container uses: anonymous ones, or all with
     /// `all`.
     pub async fn prune_volumes(&self, all: bool) -> ApiResult<PruneResponse> {
+        let _turn = self.volume_users_turn.write().await;
         let users = self.volume_users();
         let mut r = PruneResponse::default();
         for v in self.db.volumes()? {
             if users.contains_key(&v.name) || !(all || v.anonymous) {
                 continue;
             }
-            r.space_reclaimed += self.remove_volume(&v.name, true).await?;
+            r.space_reclaimed += self.delete_volume(&v.name).await?;
             r.deleted.push(v.name);
         }
         Ok(r)
     }
 
-    /// A container's mounts as `create` records them (see the module docs).
-    /// On failure, the anonymous volumes made for it are removed again.
+    /// A container's mounts as `create` records them (see the module docs),
+    /// and the anonymous volumes made for it. On failure, those are deleted
+    /// again. The caller holds `volume_users_turn` (read) until the
+    /// container is listed.
     pub async fn resolve_mounts(
         &self,
         config: &ContainerConfig,
         image_volumes: &[String],
-    ) -> ApiResult<Vec<MountSpec>> {
-        let mut made = Vec::new();
-        let result = self.resolve_mounts_into(config, image_volumes, &mut made);
+    ) -> ApiResult<(Vec<MountSpec>, Vec<String>)> {
+        let mut anonymous = Vec::new();
+        let result = self.resolve_mounts_into(config, image_volumes, &mut anonymous);
         if result.is_err() {
-            for name in made {
-                let _ = self.remove_volume(&name, true).await;
-            }
+            self.delete_own_volumes(&anonymous).await;
         }
-        result
+        result.map(|mounts| (mounts, anonymous))
     }
 
+    /// Deletes the anonymous volumes a create made, which it failed: no one
+    /// else knows their names.
+    pub async fn delete_own_volumes(&self, names: &[String]) {
+        for name in names {
+            if let Err(e) = self.delete_volume(name).await {
+                tracing::warn!("remove the volume {name}: {e}");
+            }
+        }
+    }
+
+    /// See [`Daemon::resolve_mounts`]; `anonymous`: the anonymous volumes
+    /// made, so far. (A named volume made for it stays, whatever happens.)
     fn resolve_mounts_into(
         &self,
         config: &ContainerConfig,
         image_volumes: &[String],
-        made: &mut Vec<String>,
+        anonymous: &mut Vec<String>,
     ) -> ApiResult<Vec<MountSpec>> {
         let remap = config.userns == UsernsMode::Remap;
         let mut out: Vec<MountSpec> = Vec::new();
@@ -205,8 +231,8 @@ impl Daemon {
             match m.kind {
                 MountType::Volume => {
                     let (v, created) = self.create_volume(m.source.clone(), Default::default())?;
-                    if created {
-                        made.push(v.name.clone());
+                    if created && m.source.is_none() {
+                        anonymous.push(v.name.clone());
                     }
                     m.source = Some(v.name);
                 }
@@ -256,7 +282,7 @@ impl Daemon {
             // every start.
             check_mount(&m, remap).map_err(|e| e.context(format!("the image's VOLUME {}", m.target)))?;
             let (v, _) = self.create_volume(None, Default::default())?;
-            made.push(v.name.clone());
+            anonymous.push(v.name.clone());
             m.source = Some(v.name);
             out.push(m);
         }
@@ -272,17 +298,11 @@ impl Daemon {
             let lock = self.volume_lock(&name);
             let _turn = lock.lock().await;
             let (data, rootfs, target) = (self.volume_data(&name), rootfs.to_owned(), m.target.clone());
-            let copied = blocking(move || {
-                let r = copy_into_volume(&rootfs, &target, &data, remap);
-                if r.is_err() {
-                    // Half a copy would count as content: empty the volume,
-                    // so the next start copies again.
-                    let _ = empty_dir(&data);
-                }
-                r
-            })
-            .await
-            .map_err(|e| e.context(format!("copy the image's {} into the volume {name}", m.target)))?;
+            // (A copy that fails takes back what it made, so the next start
+            // copies again.)
+            let copied = blocking(move || copy_into_volume(&rootfs, &target, &data, remap))
+                .await
+                .map_err(|e| e.context(format!("copy the image's {} into the volume {name}", m.target)))?;
             if let Some(r) = copied
                 && !r.skipped.is_empty()
             {
@@ -297,14 +317,13 @@ impl Daemon {
         locks.entry(name.to_owned()).or_default().clone()
     }
 
-    /// The anonymous volumes of a removed container, removed too (`rm -v`,
-    /// `--rm`), unless another container uses them as well.
+    /// The anonymous volumes made for a removed container, removed too (`rm
+    /// -v`, `--rm`), unless another container uses them as well. Not one it
+    /// was given by name, even an anonymous one (Docker keeps "named
+    /// mountpoints" too).
     pub async fn remove_anonymous_volumes(&self, c: &Container) {
-        for m in c.record.mounts.iter().filter(|m| m.kind == MountType::Volume) {
-            let Some(name) = &m.source else { continue };
-            if self.find_volume(name).is_ok_and(|v| v.anonymous)
-                && let Err(e) = self.remove_volume(name, true).await
-            {
+        for name in &c.record.anonymous_volumes {
+            if let Err(e) = self.remove_volume(name, true).await {
                 tracing::warn!(id = %c.id(), "remove its volume {name}: {e}");
             }
         }
@@ -342,6 +361,13 @@ fn check_mount(m: &MountSpec, remap: bool) -> ApiResult<()> {
     }
     if m.target == "/" || RESERVED_TARGETS.contains(&m.target.as_str()) {
         return bad("that path is the runtime's own".into());
+    }
+    // What the runtime refuses at every start (`rustlet_runtime::mounts`):
+    // anything below /sys, and below /proc all but bind mounts of the files
+    // lxcfs replaces (which it checks).
+    let below = |dir: &str| m.target.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'));
+    if below("/sys") || (below("/proc") && m.kind != MountType::Bind) {
+        return bad("the runtime mounts nothing of yours below /proc or /sys".into());
     }
     match m.kind {
         MountType::Volume => {
@@ -413,23 +439,6 @@ fn copy_into_volume(
     Ok(Some(rustlet_image::copyup::copy_up(root.as_fd(), Path::new(target), dest.as_fd(), &map)?))
 }
 
-/// Removes everything in `dir`, which stays (on its filesystem only, not
-/// following symlinks: `rustlet_sys::tree`).
-fn empty_dir(dir: &Path) -> ApiResult<()> {
-    let fd = nix::fcntl::open(
-        dir,
-        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
-        Mode::empty(),
-    )
-    .map_err(|e| ApiError::internal(format!("open {}: {e}", dir.display())))?;
-    for entry in std::fs::read_dir(dir).map_err(|e| ApiError::internal(format!("read {}: {e}", dir.display())))? {
-        let entry = entry.map_err(|e| ApiError::internal(e.to_string()))?;
-        rustlet_sys::tree::remove_tree_at(fd.as_fd(), &entry.file_name())
-            .map_err(|e| ApiError::internal(format!("remove {}: {e}", entry.path().display())))?;
-    }
-    Ok(())
-}
-
 /// The bytes the files below `dir` hold (not following symlinks, staying
 /// on its filesystem).
 fn tree_size(dir: &Path) -> u64 {
@@ -483,14 +492,22 @@ mod tests {
     }
 
     #[test]
-    fn emptied_directories_stay() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
-        std::fs::write(dir.path().join("a/b/f"), "x").unwrap();
-        std::os::unix::fs::symlink("/etc", dir.path().join("link")).unwrap();
-        empty_dir(dir.path()).unwrap();
-        assert!(dir.path().is_dir() && std::fs::read_dir(dir.path()).unwrap().next().is_none());
-        assert!(Path::new("/etc/passwd").exists(), "a symlink is removed, not followed");
+    fn nothing_is_mounted_below_proc_or_sys() {
+        let vol = |t: &str| MountSpec { kind: MountType::Volume, target: t.into(), ..MountSpec::default() };
+        for bad in ["/proc/sys", "/proc/self", "/sys/kernel", "/sys/fs"] {
+            assert!(check_mount(&vol(bad), false).is_err(), "{bad}: the runtime refuses it at every start");
+        }
+        assert!(check_mount(&vol("/dev/data"), false).is_ok());
+        assert!(check_mount(&vol("/process"), false).is_ok(), "a text prefix is not a parent");
+        assert!(check_mount(&vol("/system"), false).is_ok());
+        // lxcfs's binds are the runtime's to judge.
+        let bind = MountSpec {
+            kind: MountType::Bind,
+            source: Some("/var/lib/lxcfs/proc/meminfo".into()),
+            target: "/proc/meminfo".into(),
+            ..MountSpec::default()
+        };
+        assert!(check_mount(&bind, false).is_ok());
     }
 
     #[test]

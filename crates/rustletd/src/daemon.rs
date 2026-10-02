@@ -46,6 +46,12 @@ pub struct Daemon {
     pub containers: RwLock<BTreeMap<String, Arc<Container>>>,
     /// One copy-up at a time per volume.
     pub volume_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// One volume created at a time.
+    pub volume_creates: Mutex<()>,
+    /// Held (read) by a container create from choosing its mounts until the
+    /// container is listed, and (write) by what removes volumes no
+    /// container uses, which would otherwise not see its.
+    pub volume_users_turn: tokio::sync::RwLock<()>,
     pub execs: Mutex<BTreeMap<String, Arc<ExecSession>>>,
     pub cgroup_parent: String,
     pub runtime: PathBuf,
@@ -122,6 +128,8 @@ impl Daemon {
             networks,
             containers: RwLock::new(containers),
             volume_locks: Mutex::new(BTreeMap::new()),
+            volume_creates: Mutex::new(()),
+            volume_users_turn: tokio::sync::RwLock::new(()),
             execs: Mutex::new(BTreeMap::new()),
             cgroup_parent,
             runtime,

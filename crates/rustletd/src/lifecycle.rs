@@ -98,7 +98,10 @@ impl Daemon {
             .or(network.hostname)
             .unwrap_or_else(|| rustlet_spec::short_id(&id).to_owned());
         let image_volumes = image_config.and_then(|c| c.volumes().clone()).unwrap_or_default();
-        let mounts = self.resolve_mounts(&config, &image_volumes).await?;
+        // Until the container is listed, nothing may remove the volumes it
+        // is given as unused.
+        let _volumes = self.volume_users_turn.read().await;
+        let (mounts, anonymous_volumes) = self.resolve_mounts(&config, &image_volumes).await?;
         let record = Record {
             id: id.clone(),
             name: name.clone(),
@@ -112,6 +115,7 @@ impl Daemon {
             network_container: network.container,
             ports: network.ports,
             mounts,
+            anonymous_volumes,
         };
         let dir = self.paths.container_dir(&id);
         let persisted = Persisted { networks: Some(network.endpoints), ..Persisted::default() };
@@ -125,9 +129,7 @@ impl Daemon {
                 rustlet_sys::tree::safe_remove_tree(&dir).map_err(|e| ApiError::internal(e.to_string()))
             })
             .await;
-            // The anonymous volumes made for it.
-            let c = Container::new(record, persisted);
-            self.remove_anonymous_volumes(&c).await;
+            self.delete_own_volumes(&record.anonymous_volumes).await;
             return Err(e);
         }
         let c = Arc::new(Container::new(record, persisted));

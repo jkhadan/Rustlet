@@ -596,7 +596,11 @@ those become **anonymous** volumes with 64-hex-digit names. All of this is
 decided once, at `create`, and recorded with the container (its
 `Record.mounts`), so every start mounts the same volumes. A volume named in
 any container's record, running or not, is in use and can't be removed;
-`rm -v` and `--rm` take a container's anonymous volumes with it:
+`rm -v` and `--rm` take the anonymous volumes made for a container with
+it (the record lists them), never a volume it was given by name, even an
+anonymous one (`volume create` without a name makes one), as Docker keeps
+"named mountpoints" (`vol_rm_keeps_a_volume_given_by_name`; the
+independent review found the first version deleting those too):
 
 ```text
 $ rustlet run -d --name anon -v /scratch alpine sleep 60; rustlet inspect anon | grep -B2 -A6 '"mounts"'; rustlet volume ls; rustlet rm -f -v anon; rustlet volume ls
@@ -688,9 +692,15 @@ unpacking is ([`copyup.rs`](../../crates/rustlet-image/src/copyup.rs)):
   (Docker's `copyOwnership`), and the walk uses a stack of its own, at
   most 4096 levels deep, not the daemon's.
 
-One copy runs at a time per volume. A copy that fails halfway empties the
-volume again: half a copy would count as content, and no later start would
-try again. A volume that isn't empty is never touched, so a second
+One copy runs at a time per volume. A copy that fails halfway takes back
+what it made at the top of the volume, and only that: half a copy would
+count as content, and no later start would try again; but a container
+already running with the volume may have written there meanwhile (which
+is what usually makes the copy fail, an entry that is already there), and
+its files stay. (The first version emptied the whole volume, those files
+too; the independent review found it.) A daemon killed during a copy
+leaves the half copy, as Docker does. A volume that isn't empty is never
+touched, so a second
 container mounting it elsewhere sees the first one's data:
 `vol_named_volumes_copy_up_once_and_persist` writes a marker through one
 container and reads it through another, with no second copy.

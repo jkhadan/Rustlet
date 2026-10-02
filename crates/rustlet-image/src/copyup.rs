@@ -128,7 +128,10 @@ pub struct CopyUp {
 /// `map_owner` turns owners as seen through `root` into those to write
 /// (the identity, except under `--userns=remap`, whose idmapped root
 /// filesystem shows the image's owners shifted by 1000000 while volumes
-/// hold them unshifted). An error leaves what was copied until then.
+/// hold them unshifted). An error takes back what the copy made at the
+/// top of `dest`, and only that: another container sharing the volume may
+/// have written there meanwhile (an entry it made first is the usual
+/// error), and its files stay.
 pub fn copy_up(
     root: BorrowedFd<'_>,
     path: &Path,
@@ -151,27 +154,48 @@ pub fn copy_up(
     let st = nix::sys::stat::fstat(&src).with_context(|| format!("stat {path:?}"))?;
     let dst = nix::fcntl::openat(dest, ".", OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC, Mode::empty())
         .context("open the volume's directory")?;
-    let mut copier =
-        Copier { path, map_owner, report: CopyUp { copied: true, ..CopyUp::default() }, links: HashMap::new() };
-    let mut stack = vec![copier.frame(src, dst, PathBuf::new(), st)?];
-    while let Some(dir) = stack.last_mut() {
-        let Some(name) = dir.names.next() else {
-            let done = stack.pop().expect("the loop just looked at it");
-            if stack.is_empty() {
-                copier.volume(&done)?
-            } else {
-                copier.finish(&done)?
+    let mut copier = Copier {
+        path,
+        map_owner,
+        report: CopyUp { copied: true, ..CopyUp::default() },
+        links: HashMap::new(),
+        made: Vec::new(),
+    };
+    let copied = copier.tree(src, dst, st);
+    if copied.is_err() {
+        for name in &copier.made {
+            if let Err(e) = rustlet_sys::tree::remove_tree_at(dest, name) {
+                tracing::warn!("copy-up into a volume failed, and its {name:?} could not be removed: {e}");
             }
-            continue;
-        };
-        if let Some(sub) = copier.entry(dir, &name)? {
-            if stack.len() > MAX_DEPTH {
-                return Err(Error::unsupported(format!("{path:?}: more than {MAX_DEPTH} levels deep")));
-            }
-            stack.push(sub);
         }
     }
-    Ok(copier.report)
+    copied.map(|()| copier.report)
+}
+
+impl Copier<'_> {
+    /// The walk: `src` copied into `dst`, then `dst` given `st`'s owner and
+    /// mode.
+    fn tree(&mut self, src: OwnedFd, dst: OwnedFd, st: FileStat) -> Result<()> {
+        let mut stack = vec![self.frame(src, dst, PathBuf::new(), st)?];
+        while let Some(dir) = stack.last_mut() {
+            let Some(name) = dir.names.next() else {
+                let done = stack.pop().expect("the loop just looked at it");
+                if stack.is_empty() {
+                    self.volume(&done)?
+                } else {
+                    self.finish(&done)?
+                }
+                continue;
+            };
+            if let Some(sub) = self.entry(dir, &name)? {
+                if stack.len() > MAX_DEPTH {
+                    return Err(Error::unsupported(format!("{:?}: more than {MAX_DEPTH} levels deep", self.path)));
+                }
+                stack.push(sub);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Has the directory `dir` no entries (other than `.` and `..`)?
@@ -216,9 +240,20 @@ struct Copier<'a> {
     report: CopyUp,
     /// Inodes with more than one name, by the source's `(st_dev, st_ino)`.
     links: HashMap<(u64, u64), Linked>,
+    /// The entries made at the top of the volume, which a failed copy
+    /// removes.
+    made: Vec<OsString>,
 }
 
 impl Copier<'_> {
+    /// `name` was just made in `dir`: if that is the volume's own directory,
+    /// it is the copy's to take back.
+    fn made(&mut self, dir: &Frame, name: &OsStr) {
+        if dir.rel.as_os_str().is_empty() {
+            self.made.push(name.to_owned());
+        }
+    }
+
     /// An entry as messages name it: its path in the container.
     fn shown(&self, rel: &Path) -> String {
         // (`join("")` would add a trailing slash.)
@@ -284,7 +319,9 @@ impl Copier<'_> {
         link_fd(linked.copy.as_fd(), dir.dst.as_fd(), name)
             .with_context(|| format!("{shown}: link it to {:?}", self.path.join(&linked.rel)))?;
         linked.remaining -= 1;
-        if linked.remaining == 0 {
+        let done = linked.remaining == 0;
+        self.made(dir, name);
+        if done {
             self.links.remove(&key);
         }
         self.report.entries += 1;
@@ -296,6 +333,7 @@ impl Copier<'_> {
         let src = open_source(parent.src.as_fd(), name, &st, shown)?;
         nix::sys::stat::mkdirat(&parent.dst, name, Mode::from_bits_truncate(0o700))
             .with_context(|| format!("{shown}: create the copy"))?;
+        self.made(parent, name);
         self.report.entries += 1;
         let dst = nix::fcntl::openat(
             &parent.dst,
@@ -318,6 +356,7 @@ impl Copier<'_> {
             Mode::from_bits_truncate(0o600),
         )
         .with_context(|| format!("{shown}: create the copy"))?;
+        self.made(dir, name);
         let mut to = File::from(fd);
         self.report.bytes += io::copy(&mut from, &mut to).with_context(|| format!("{shown}: copy the contents"))?;
         self.apply(&Attrs::Fd(from.as_fd()), to.as_fd(), st, shown)?;
@@ -330,6 +369,7 @@ impl Copier<'_> {
         let target = nix::fcntl::readlinkat(&dir.src, name).with_context(|| format!("{shown}: read the link"))?;
         nix::unistd::symlinkat(target.as_os_str(), &dir.dst, name)
             .with_context(|| format!("{shown}: create the copy"))?;
+        self.made(dir, name);
         let (uid, gid) = (self.map_owner)(st.st_uid, st.st_gid);
         let (uid, gid) = (Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)));
         nix::unistd::fchownat(&dir.dst, name, uid, gid, AtFlags::AT_SYMLINK_NOFOLLOW)
@@ -345,6 +385,7 @@ impl Copier<'_> {
     fn fifo(&mut self, dir: &Frame, name: &OsStr, st: &FileStat, shown: &str) -> Result<OwnedFd> {
         nix::unistd::mkfifoat(&dir.dst, name, Mode::from_bits_truncate(0o600))
             .with_context(|| format!("{shown}: create the copy"))?;
+        self.made(dir, name);
         // Opening a FIFO for reading with O_NONBLOCK returns at once. What
         // it opens must be a FIFO: nothing else may get the source's owner
         // and mode (a setuid bit means nothing to a FIFO).
@@ -1032,6 +1073,27 @@ mod tests {
         std::fs::create_dir(vol.join("c")).unwrap();
         let err = f.copy_into("/data", &vol, &identity).unwrap_err().to_string();
         assert!(err.contains("\"/data/c\"") && err.contains("EEXIST"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_copy_takes_back_only_what_it_made() {
+        let f = Fixture::new();
+        f.dir("data", 0o755);
+        f.file("data/a", "new", 0o644);
+        std::fs::hard_link(f.root("data/a"), f.root("data/a-link")).unwrap();
+        f.dir("data/a-dir", 0o755);
+        f.file("data/a-dir/x", "new", 0o644);
+        f.symlink("a", "data/a-sym");
+        f.file("data/b", "new", 0o644);
+        // Written by a container sharing the volume after the emptiness
+        // check, which is what makes the copy fail.
+        std::fs::write(f.vol("b"), "theirs").unwrap();
+        std::fs::create_dir(f.vol("c")).unwrap();
+        assert!(f.copy("/data").is_err());
+        let mut names: Vec<_> = std::fs::read_dir(f.vol("")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        names.sort();
+        assert_eq!(names, ["b", "c"], "the copy's own entries go, nothing else");
+        assert_eq!(std::fs::read_to_string(f.vol("b")).unwrap(), "theirs");
     }
 
     #[test]

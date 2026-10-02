@@ -976,3 +976,48 @@ fn dn_connect_and_disconnect_racing_an_exit() {
         }
     });
 }
+
+/// `--rm` and `rm -v` remove the anonymous volumes made for the container,
+/// never one it was given by name, even an anonymous one (`volume create`
+/// without a name makes one).
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn vol_rm_keeps_a_volume_given_by_name() {
+    let d = daemon();
+    block_on(async {
+        let c = d.client();
+        let given = c.create_volume(&rustlet_spec::volume::VolumeCreate::default()).await.unwrap();
+        assert!(given.anonymous);
+        let mounts = vec![
+            MountSpec::parse_volume(&format!("{}:/data", given.name)).unwrap(),
+            MountSpec::parse_volume("/scratch").unwrap(),
+        ];
+        let cfg = ContainerConfig { auto_remove: true, mounts, ..sh("echo kept > /data/f") };
+        let id = c.create_container(&cfg).await.unwrap().id;
+        let own = c.inspect_container(&id).await.unwrap().mounts;
+        let own = own.iter().find(|m| m.destination == "/scratch").unwrap().name.clone().unwrap();
+        c.start(&id).await.unwrap();
+        let _ = c.wait(&id, WaitCondition::Removed).await;
+        until("--rm", || !d.data.join("volumes").join(&own).exists()).await;
+        let data = d.data.join("volumes").join(&given.name).join("_data/f");
+        assert_eq!(std::fs::read_to_string(data).unwrap(), "kept\n", "given by name: kept, as by Docker");
+        assert!(c.inspect_volume(&given.name).await.is_ok());
+    });
+}
+
+/// A volume's directory without its row (a create cut short by a crash)
+/// doesn't keep the name from being used.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn vol_a_create_cut_short_leaves_the_name_usable() {
+    let d = TestDaemon::start();
+    let left = d.data.join("volumes/leftover/_data");
+    std::fs::create_dir_all(&left).unwrap();
+    std::fs::write(left.join("half"), "x").unwrap();
+    block_on(async {
+        let c = d.client();
+        let req = rustlet_spec::volume::VolumeCreate { name: Some("leftover".into()), ..Default::default() };
+        assert_eq!(c.create_volume(&req).await.unwrap().name, "leftover");
+    });
+    assert!(left.is_dir() && !left.join("half").exists(), "a new, empty volume");
+}
