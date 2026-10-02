@@ -135,7 +135,10 @@ table inet rustlet {
 ```
 
 (The last rule is there because a network with IPv6 had existed on this
-host, and Rustlets turned IPv6 forwarding on for it: §6 and §7.) The
+host, and Rustlets turned IPv6 forwarding on for it: §6 and §7. This
+listing was recorded before the independent review, whose fixes add
+`iifname != "lo"` to the guard and, for an internal network, a first
+`forward` rule: §5.) The
 sections below go through the table chain by chain. Two things about how
 it gets there first.
 
@@ -477,11 +480,13 @@ Two things do, in two different chains.
 conntrack or NAT):
 
 ```text
-ip daddr 10.89.0.0/24 iifname != "rustlet0" drop
+ip daddr 10.89.0.0/24 iifname != "rustlet0" iifname != "lo" drop
 ```
 
 A packet for the subnet that didn't arrive on the subnet's own bridge is
-dropped. At this point a packet for a published port still has the host's
+dropped, unless it came in on `lo`: the host's own traffic to one of its
+addresses there, the gateway's, which the first version dropped too
+(`--network host` with `--add-host h:host-gateway` couldn't reach `h`). At this point a packet for a published port still has the host's
 address as its destination (DNAT comes later), and so does a reply to a
 masqueraded flow (conntrack hasn't undone the NAT yet), so neither is
 affected. Docker 28 added rules to its `raw` table for the same reason,
@@ -505,8 +510,15 @@ meta nfproto ipv6 drop                                    # (the same for IPv6)
 
 Into a bridge go only replies, published ports and traffic within the
 bridge (which normally doesn't pass the IP layer at all; it does when the
-`br_netfilter` module is loaded). Out of a bridge goes anything, or
-nothing on an internal network. **Every rule into a bridge comes before
+`br_netfilter` module is loaded). Out of a bridge goes anything; an
+internal network's chain starts with `iifname "rlb…" oifname != "rlb…"
+drop`, before every rule above. The first version had that drop after
+them, as "nothing out of an internal network": but a container there
+could send to its gateway's address (the host's) on a port another
+network's container publishes, DNAT took it to that container, and
+"published ports on rustlet0" accepted it first. TCP's replies met the
+raw guard, but a UDP datagram got out (`dn_internal_networks_stay_inside`
+sends one to a UDP sink; the independent review found it). **Every rule into a bridge comes before
 any rule out of one**, for all networks: a packet from bridge A to bridge
 B matches both "out of A" and "into B", and the first match wins. With the
 rules grouped per network, A's `accept` could come first and bypass B's

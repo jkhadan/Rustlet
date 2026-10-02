@@ -307,6 +307,15 @@ pub struct NlMsg {
     pub payload: Vec<u8>,
 }
 
+/// The end of a dump: `NLMSG_DONE` carries the dump's error, if it failed
+/// part of the way (what came before it is then not the whole).
+fn done(payload: &[u8]) -> Result<()> {
+    match payload.get(..4).map(|b| i32::from_ne_bytes(b.try_into().unwrap())) {
+        Some(code) if code < 0 => Err(Errno::from_raw(-code)),
+        _ => Ok(()),
+    }
+}
+
 /// Splits a receive buffer into messages.
 pub fn parse_messages(mut buf: &[u8]) -> Vec<NlMsg> {
     let mut out = Vec::new();
@@ -552,7 +561,7 @@ impl RtNetlink {
                         let code = i32::from_ne_bytes(m.payload.get(..4).ok_or(Errno::EIO)?.try_into().unwrap());
                         return if code == 0 { Ok(replies) } else { Err(Errno::from_raw(-code)) };
                     }
-                    NLMSG_DONE => return Ok(replies),
+                    NLMSG_DONE => return done(&m.payload).map(|()| replies),
                     NLMSG_NOOP => {}
                     _ => replies.push(m),
                 }
@@ -799,6 +808,13 @@ mod tests {
         assert_eq!(top[1].0, IFLA_LINKINFO);
         let kinds: Vec<_> = attrs(top[1].1).map(|a| a.0).collect();
         assert_eq!(kinds, vec![IFLA_INFO_KIND, IFLA_INFO_DATA]);
+    }
+
+    #[test]
+    fn a_dump_that_failed_part_of_the_way_is_an_error() {
+        assert_eq!(done(&(-libc::EMSGSIZE).to_ne_bytes()), Err(Errno::EMSGSIZE));
+        assert_eq!(done(&0i32.to_ne_bytes()), Ok(()));
+        assert_eq!(done(&[]), Ok(()), "an old kernel's empty NLMSG_DONE");
     }
 
     #[test]

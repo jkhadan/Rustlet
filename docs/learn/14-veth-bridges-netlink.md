@@ -510,6 +510,18 @@ the frame floods across the bridge, the bridge's own interface answers,
 and from then on the bridge knows which port each MAC is behind (`bridge
 fdb show br rustlet0`).
 
+**The bridge's own MAC is set too**, to `02:52:` and its gateway's address
+(`02:52:0a:59:00:01`; no container has the gateway's address, so no
+container has that MAC). A bridge created without one gets a random MAC,
+and then, at each port added or removed, takes the lowest of its ports'
+MACs (the kernel's `br_stp_recalculate_bridge_id`), unless its MAC was set
+explicitly: the host ends of veths have random MACs, so one container
+starting or stopping could change the gateway's MAC under all the others,
+whose ARP and neighbour entries for 10.89.0.1 then led to a MAC nothing
+answers to, for the 15 to 50 s until those entries expired. Docker sets
+its bridges' MACs for the same reason. The independent review found it
+(`net_a_bridge_keeps_its_mac`).
+
 ## 7. Which address: IPAM
 
 Every network is an IPv4 subnet ([`ipam.rs`](../../crates/rustlet-net/src/ipam.rs)). The default
