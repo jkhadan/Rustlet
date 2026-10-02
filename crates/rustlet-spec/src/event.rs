@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 /// `unpause`, `restart` (by the restart policy), `destroy`, `exec_create`,
 /// `exec_start`, `exec_die` (`exec_id`, `exit_code`). Image actions: `pull`,
 /// `untag`, `delete`. Every container event carries `name` and `image`.
+/// Network actions: `create`, `destroy`, `connect` and `disconnect`
+/// (attribute `container`); volume actions: `create`, `destroy`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Event {
@@ -16,7 +18,7 @@ pub struct Event {
     pub time: String,
     pub kind: EventKind,
     pub action: String,
-    /// The container's id, or the image's name.
+    /// The container's or network's id, or the image's or volume's name.
     pub id: String,
     pub attributes: BTreeMap<String, String>,
 }
@@ -27,6 +29,8 @@ pub enum EventKind {
     #[default]
     Container,
     Image,
+    Network,
+    Volume,
 }
 
 /// Query of `GET /v1/events`.

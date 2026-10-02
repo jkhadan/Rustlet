@@ -22,6 +22,8 @@ pub struct Info {
     pub paused: usize,
     pub stopped: usize,
     pub images: usize,
+    pub networks: usize,
+    pub volumes: usize,
     /// `/var/lib/rustlet`.
     pub data_root: String,
     /// `/run/rustlet`.

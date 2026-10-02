@@ -98,6 +98,8 @@ pub fn event_line(e: &Event) -> String {
     let kind = match e.kind {
         EventKind::Container => "container",
         EventKind::Image => "image",
+        EventKind::Network => "network",
+        EventKind::Volume => "volume",
     };
     let mut line = format!("{} {kind} {} {}", e.time, e.action, e.id);
     if !e.attributes.is_empty() {

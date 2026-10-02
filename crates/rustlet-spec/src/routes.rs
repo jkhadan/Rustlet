@@ -69,6 +69,30 @@ pub fn image_inspect() -> String {
     v1("/images/inspect")
 }
 
+/// `GET` (list) and `POST` (create).
+pub fn networks() -> String {
+    v1("/networks")
+}
+/// `GET` (inspect) and `DELETE`.
+pub fn network(id: &str) -> String {
+    v1(&format!("/networks/{id}"))
+}
+pub fn network_prune() -> String {
+    v1("/networks/prune")
+}
+
+/// `GET` (list) and `POST` (create).
+pub fn volumes() -> String {
+    v1("/volumes")
+}
+/// `GET` (inspect) and `DELETE`.
+pub fn volume(name: &str) -> String {
+    v1(&format!("/volumes/{name}"))
+}
+pub fn volume_prune() -> String {
+    v1("/volumes/prune")
+}
+
 /// The same routes in axum's syntax, for the server.
 pub mod pattern {
     pub const PING: &str = "/v1/_ping";
@@ -86,6 +110,12 @@ pub mod pattern {
     pub const IMAGES: &str = "/v1/images";
     pub const IMAGE_PULL: &str = "/v1/images/pull";
     pub const IMAGE_INSPECT: &str = "/v1/images/inspect";
+    pub const NETWORKS: &str = "/v1/networks";
+    pub const NETWORK: &str = "/v1/networks/{id}";
+    pub const NETWORK_PRUNE: &str = "/v1/networks/prune";
+    pub const VOLUMES: &str = "/v1/volumes";
+    pub const VOLUME: &str = "/v1/volumes/{name}";
+    pub const VOLUME_PRUNE: &str = "/v1/volumes/prune";
 }
 
 #[cfg(test)]
@@ -102,5 +132,12 @@ mod tests {
         assert_eq!(exec_start("e1"), pattern::EXEC_START.replace("{id}", "e1"));
         assert_eq!(image_pull(), pattern::IMAGE_PULL);
         assert_eq!(ping(), pattern::PING);
+        assert_eq!(network("n1"), pattern::NETWORK.replace("{id}", "n1"));
+        assert_eq!(network_prune(), pattern::NETWORK_PRUNE);
+        assert_eq!(volume("v"), pattern::VOLUME.replace("{name}", "v"));
+        assert_eq!(
+            (networks(), volumes(), volume_prune()),
+            (pattern::NETWORKS.into(), pattern::VOLUMES.into(), pattern::VOLUME_PRUNE.into())
+        );
     }
 }

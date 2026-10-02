@@ -178,6 +178,7 @@ impl CreateFlags {
             privileged: self.privileged,
             security_opt: self.security_opt.clone(),
             devices: self.device.clone(),
+            ..ContainerConfig::default()
         })
     }
 }
@@ -319,6 +320,7 @@ mod tests {
             privileged: false,
             security_opt: vec!["no-new-privileges".into()],
             devices: vec!["/dev/fuse".into()],
+            ..ContainerConfig::default()
         };
         assert_eq!(c, expected);
     }

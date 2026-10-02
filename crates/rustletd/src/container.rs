@@ -137,6 +137,7 @@ impl Container {
             created: r.created.clone(),
             state: self.persisted().state,
             labels: r.config.labels.clone(),
+            ports: Vec::new(),
         }
     }
 
@@ -166,6 +167,8 @@ impl Container {
             cgroup,
             uid_map: (r.config.userns == rustlet_spec::container::UsernsMode::Remap)
                 .then(|| format!("0 {} {}", rustlet_runtime::spec::REMAP_HOST_ID, rustlet_runtime::spec::REMAP_SIZE)),
+            network: Default::default(),
+            mounts: Vec::new(),
         }
     }
 }

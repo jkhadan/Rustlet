@@ -4,6 +4,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::network::{NetworkMode, NetworkSettings, PortMapping, PublishedPort};
+use crate::volume::{MountPoint, MountSpec};
+
 /// `POST /v1/containers`: everything `rustlet run`/`create` can say about a
 /// container. Fields left out take the image's value (command, environment,
 /// user, working directory) or Rustlets' default.
@@ -65,6 +68,27 @@ pub struct ContainerConfig {
     pub security_opt: Vec<String>,
     /// `--device HOST[:CONTAINER[:rwm]]`: a host device node, with access.
     pub devices: Vec<String>,
+    /// `--network`: the default network unless given.
+    pub network: NetworkMode,
+    /// `--network-alias`: more names the embedded DNS server answers for
+    /// it, on a user-defined network.
+    pub network_aliases: Vec<String>,
+    /// `-p`: container ports to publish on the host.
+    pub ports: Vec<PortMapping>,
+    /// `-P`: publish every port the image exposes, each on a free host
+    /// port.
+    pub publish_all: bool,
+    /// `--dns`: name servers for the container's `resolv.conf` (or for the
+    /// embedded DNS server to forward to), instead of the host's.
+    pub dns: Vec<String>,
+    /// `--dns-search`, `--dns-option`: the rest of `resolv.conf`.
+    pub dns_search: Vec<String>,
+    pub dns_options: Vec<String>,
+    /// `--add-host NAME:IP` lines for its `/etc/hosts` (the IP may be
+    /// `host-gateway`, [`crate::network::HOST_GATEWAY`]).
+    pub extra_hosts: Vec<String>,
+    /// `-v`, `--mount`, `--tmpfs`.
+    pub mounts: Vec<MountSpec>,
 }
 
 /// `--userns`.
@@ -242,6 +266,8 @@ pub struct ContainerSummary {
     pub created: String,
     pub state: ContainerState,
     pub labels: BTreeMap<String, String>,
+    /// While it runs: its published ports.
+    pub ports: Vec<PublishedPort>,
 }
 
 /// `GET /v1/containers/{id}`.
@@ -268,6 +294,9 @@ pub struct ContainerInspect {
     pub cgroup: String,
     /// `uid_map` of its user namespace (`0 1000000 65536`), if it has one.
     pub uid_map: Option<String>,
+    pub network: NetworkSettings,
+    /// Its volumes, bind mounts and tmpfs mounts.
+    pub mounts: Vec<MountPoint>,
 }
 
 /// `POST /v1/containers/{id}/wait?condition=`.
@@ -310,6 +339,8 @@ pub struct ListQuery {
 pub struct RemoveQuery {
     /// Kill it first if it is live.
     pub force: bool,
+    /// Remove its anonymous volumes too (`rm -v`).
+    pub volumes: bool,
 }
 
 /// Query of `stop` and `restart`.

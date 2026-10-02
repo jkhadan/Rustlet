@@ -23,7 +23,7 @@
 //! | GET | `/containers?all=` | → `[`[`container::ContainerSummary`]`]` (running only, unless `all=true`) |
 //! | POST | `/containers` | [`container::ContainerConfig`] → 201 [`container::CreateResponse`] |
 //! | GET | `/containers/{id}` | → [`container::ContainerInspect`] |
-//! | DELETE | `/containers/{id}?force=` | → 204 |
+//! | DELETE | `/containers/{id}?force=&volumes=` | → 204 (`volumes`: its anonymous volumes too) |
 //! | POST | `/containers/{id}/start` | → 204 |
 //! | POST | `/containers/{id}/stop?timeout=` | → 204 (seconds; default: the container's `stop_timeout`, else 10) |
 //! | POST | `/containers/{id}/kill?signal=` | → 204 (`TERM`, `SIGTERM` or `15`; default `KILL`) |
@@ -42,6 +42,16 @@
 //! | POST | `/images/pull?reference=&policy=` | → NDJSON [`image::PullEvent`] |
 //! | GET | `/images/inspect?name=` | → [`image::ImageInspect`] |
 //! | DELETE | `/images?name=&force=` | → [`image::ImageDeleteResponse`] |
+//! | GET | `/networks` | → `[`[`network::Network`]`]` |
+//! | POST | `/networks` | [`network::NetworkCreate`] → 201 [`network::NetworkCreateResponse`] |
+//! | GET | `/networks/{id}` | → [`network::Network`] (id, unique id prefix, or name) |
+//! | DELETE | `/networks/{id}` | → 204 |
+//! | POST | `/networks/prune` | → [`network::PruneResponse`] (the user-defined networks no container uses) |
+//! | GET | `/volumes` | → `[`[`volume::Volume`]`]` |
+//! | POST | `/volumes` | [`volume::VolumeCreate`] → 201 [`volume::Volume`] |
+//! | GET | `/volumes/{name}` | → [`volume::Volume`] |
+//! | DELETE | `/volumes/{name}?force=` | → 204 ([`volume::VolumeRemoveQuery`]) |
+//! | POST | `/volumes/prune?all=` | → [`network::PruneResponse`] ([`volume::VolumePruneQuery`]) |
 //!
 //! Image names travel as query parameters, not path segments: a name such as
 //! `docker.io/library/alpine:latest` has slashes in it.
@@ -73,10 +83,12 @@ pub mod event;
 pub mod exec;
 pub mod image;
 pub mod logs;
+pub mod network;
 pub mod routes;
 pub mod stats;
 pub mod stream;
 pub mod system;
+pub mod volume;
 
 use serde::{Deserialize, Serialize};
 
@@ -125,6 +137,10 @@ pub enum ErrorKind {
     NoSuchImage,
     /// 404.
     NoSuchExec,
+    /// 404.
+    NoSuchNetwork,
+    /// 404.
+    NoSuchVolume,
     /// 409: a name is taken, or the container is in the wrong state.
     Conflict,
     /// 500 from `start` or an exec: the program wasn't found in the
@@ -143,7 +159,11 @@ impl ErrorKind {
     pub fn status(self) -> u16 {
         match self {
             ErrorKind::Invalid => 400,
-            ErrorKind::NoSuchContainer | ErrorKind::NoSuchImage | ErrorKind::NoSuchExec => 404,
+            ErrorKind::NoSuchContainer
+            | ErrorKind::NoSuchImage
+            | ErrorKind::NoSuchExec
+            | ErrorKind::NoSuchNetwork
+            | ErrorKind::NoSuchVolume => 404,
             ErrorKind::Conflict => 409,
             ErrorKind::CommandNotFound | ErrorKind::CommandNotExecutable | ErrorKind::Internal => 500,
         }

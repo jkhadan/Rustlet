@@ -1,5 +1,6 @@
 [package]
 name = "rustlet-net"
+description = "Host-side networking for Rustlets: pinned network namespaces, bridges and veth pairs over rtnetlink, IPAM, nftables, the embedded DNS server, the userland port proxy."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,3 +11,17 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+rustlet-sys.workspace = true
+nix.workspace = true
+libc.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hickory-proto.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+insta.workspace = true

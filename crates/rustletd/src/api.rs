@@ -108,6 +108,8 @@ async fn info(State(d): D) -> ApiResult<Json<Info>> {
         paused,
         stopped,
         images,
+        networks: 0,
+        volumes: 0,
         data_root: d.paths.data_root.display().to_string(),
         run_root: d.paths.run_root.display().to_string(),
         cgroup_parent: d.cgroup_parent.clone(),

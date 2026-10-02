@@ -33,6 +33,7 @@
 
 pub mod config;
 pub mod content;
+pub mod copyup;
 pub mod digest;
 pub mod error;
 pub mod image;

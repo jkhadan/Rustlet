@@ -180,7 +180,11 @@ impl Client {
 
     /// With `force`, a live container is killed first.
     pub async fn remove_container(&self, id: &str, force: bool) -> Result<()> {
-        self.call(Method::DELETE, with_query(routes::container(&segment(id)), &RemoveQuery { force })?).await
+        self.call(
+            Method::DELETE,
+            with_query(routes::container(&segment(id)), &RemoveQuery { force, ..RemoveQuery::default() })?,
+        )
+        .await
     }
 
     /// Starts a created or exited container. A program that can't run fails
