@@ -212,3 +212,30 @@ fn rr_a_failed_auto_removal_ends_the_wait() {
         c.remove_container(&id, true).await.unwrap();
     });
 }
+
+/// A daemon that was killed (`KillMode=process` leaves its children) could
+/// leave an image worker writing to the store; the next daemon neither
+/// knew of it nor stopped it, and its garbage collection could delete
+/// blobs that worker had just stored. A daemon now stops the workers its
+/// predecessor left.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn rr_a_new_daemon_stops_the_workers_the_last_one_left() {
+    let mut d = daemon();
+    d.crash();
+    let leftover = format!("/sys/fs/cgroup{}/workers/1-0", d.cgroup_parent);
+    std::fs::create_dir(&leftover).unwrap();
+    let mut worker = std::process::Command::new("sleep").arg("300").spawn().unwrap();
+    std::fs::write(format!("{leftover}/cgroup.procs"), worker.id().to_string()).unwrap();
+    d.restart();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = worker.try_wait().unwrap() {
+            break status;
+        }
+        assert!(std::time::Instant::now() < deadline, "the leftover worker still runs:\n{}", d.log());
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(!status.success());
+    assert!(!std::path::Path::new(&leftover).exists(), "its cgroup is still there");
+}
