@@ -373,13 +373,28 @@ docker-proxy does the same; the proxy's author found the problem on this
 host, which has two global IPv6 addresses and temporary addresses
 turned on.
 
+**Datagrams from ourselves.** A datagram whose source is the published
+address itself, or one of the host's addresses arriving from outside (the
+host's own datagrams to itself come in on `lo`), is forged: relayed, its
+answers would go back to the proxy and come in again, for ever, the Loop
+DoS of §16's DNS server, here between the proxy and any container that
+answers what it gets. IPv4 drops such packets itself (a local source
+arriving from outside is a martian); IPv6 has no such check, and the LAN
+could start the loop with one spoofed datagram to an IPv4-only container's
+port, which only the proxy serves over IPv6. The proxy drops them (the
+interface comes with the destination, in the same control message); the
+independent review found it relaying one such datagram 5,625 times in 300
+ms (`udp_drops_datagrams_from_its_own_address`).
+
 **Stopping.** A `Proxy` is one tokio task owning its socket and the tasks
 of its connections or clients; dropping it aborts them all. An aborted
 task ends when the runtime next polls it, so the socket isn't closed yet
 when `drop` returns, and a container restarted on the same port could find
-it still taken. `Proxy::close` aborts *and* waits for the task, and the
-daemon closes a run's proxies that way before it undoes the rest of its
-network.
+it still taken. `Proxy::close` aborts *and* waits for the task, and for the
+clients' answer tasks, which hold the UDP socket too, and the daemon
+closes a run's proxies that way before it undoes the rest of its network
+(`udp_close_frees_the_port_before_it_returns`: since UDP ports are bound
+without `SO_REUSEADDR`, a socket still open makes the next bind fail).
 
 **The cost.** The container sees the proxy's connection, from the bridge's
 gateway (10.89.0.1), instead of the client's. And because the proxy is tasks of the

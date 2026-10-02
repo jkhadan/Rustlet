@@ -364,17 +364,20 @@ A name the network doesn't have is passed on to the upstream servers
   case) or the upstream answered is lost or changed.
 - **A socket of its own per forward**: for UDP, bound to a port the kernel
   picks and *connected* to the upstream, so the kernel delivers only that
-  address's datagrams, and only an answer with the forward's ID is
-  accepted. A forger off the path has to guess a 16-bit ID and a port at
-  once. The answer is relayed as it is, truncated or not: a truncated
+  address's datagrams, and only an answer with the forward's ID and the
+  query's question (the name in any case, its type and class; RFC 5452
+  §9.1) is accepted. A forger off the path has to guess a 16-bit ID and a
+  port at once. The answer is relayed as it is, truncated or not: a truncated
   upstream answer reaches the client with `TC` set, and the client's retry
   over TCP is forwarded over TCP.
 - **From the host's namespace.** The forwarding sockets are created by the
   daemon's tokio tasks, which run in the daemon's namespace, so upstream
   traffic goes out like the host's own. (Docker's resolver forwards from
   the container's namespace instead.)
-- **Bounded**: `FORWARD_TIMEOUT` (2 s) per upstream, then the next; when
-  none answers, `SERVFAIL`. At most `MAX_FORWARDS` (100) forwards in flight
+- **Bounded**: `FORWARD_TIMEOUT` (2 s) per upstream, then the next; an
+  upstream that answers `SERVFAIL` or `REFUSED` is passed over for the next
+  too, as Docker's resolver does (the container has no other server to
+  try), its answer kept as the last resort; when none answers, `SERVFAIL`. At most `MAX_FORWARDS` (100) forwards in flight
   per server, UDP and TCP together; a query beyond that gets `SERVFAIL` at
   once rather than a task of its own. TCP connections are at most
   `MAX_TCP_CONNECTIONS` (64) per server, each closed after `TCP_IDLE`
@@ -383,7 +386,8 @@ A name the network doesn't have is passed on to the upstream servers
 The unit tests run the server end to end on `127.0.0.1` against fake
 upstreams of their own: the ID restored, only the matching answer relayed,
 a truncated answer relayed with `TC` and the whole answer over TCP, a
-silent first upstream passed over for a second one, all silent giving
+silent first upstream passed over for a second one, and one answering
+`SERVFAIL`, an answer to another question passed over, all silent giving
 `SERVFAIL`, the forward limit, an idle TCP connection closed, and a dropped
 server answering nothing more. The daemon test runs a fake upstream on the
 test's LAN machine (192.0.2.1), which knows only names under `example.`;

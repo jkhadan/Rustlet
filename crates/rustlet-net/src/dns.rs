@@ -521,8 +521,12 @@ async fn write_message(stream: &mut (impl AsyncWrite + Unpin), message: &[u8]) -
 impl Shared {
     /// The answer to `query` from the first of `scope`'s upstream servers
     /// that gives one in time, with the client's ID back in it; `SERVFAIL`
-    /// if none does.
+    /// if none does. A server that can't answer (`SERVFAIL`) or won't
+    /// (`REFUSED`) is passed over for the next, as Docker's resolver does
+    /// (a container has no other server to try): its answer is the last
+    /// resort.
     async fn forward(&self, transport: Transport, query: &[u8], scope: &Scope) -> Vec<u8> {
+        let mut failed = None;
         for &upstream in &scope.upstreams {
             let exchange = async {
                 match transport {
@@ -533,13 +537,19 @@ impl Shared {
             match tokio::time::timeout(self.timeouts.forward, exchange).await {
                 Ok(Ok(mut answer)) => {
                     answer[..2].copy_from_slice(&query[..2]);
+                    let rcode = answer[3] & 0x0f;
+                    if rcode == ResponseCode::ServFail.low() || rcode == ResponseCode::Refused.low() {
+                        tracing::debug!("dns: {upstream} answered with RCODE {rcode}: trying the next");
+                        failed.get_or_insert(answer);
+                        continue;
+                    }
                     return answer;
                 }
                 Ok(Err(e)) => tracing::debug!("dns: forward to {upstream} over {transport:?}: {e}"),
                 Err(_) => tracing::debug!("dns: forward to {upstream} over {transport:?}: no answer in time"),
             }
         }
-        failure(query, ResponseCode::ServFail, scope)
+        failed.unwrap_or_else(|| failure(query, ResponseCode::ServFail, scope))
     }
 }
 
@@ -563,7 +573,7 @@ async fn exchange_udp(query: &[u8], upstream: SocketAddr) -> io::Result<Vec<u8>>
         match socket.try_recv(&mut buf) {
             // Anything else (a late answer to an earlier user of the port,
             // a forgery) is passed over.
-            Ok(len) if is_answer_to(&buf[..len], id) => return Ok(buf[..len].to_vec()),
+            Ok(len) if is_answer_to(&buf[..len], id, &query) => return Ok(buf[..len].to_vec()),
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
             Err(e) => return Err(e),
@@ -578,7 +588,7 @@ async fn exchange_tcp(query: &[u8], upstream: SocketAddr) -> io::Result<Vec<u8>>
     write_message(&mut stream, &query).await?;
     loop {
         match read_message(&mut stream).await? {
-            Some(answer) if is_answer_to(&answer, id) => return Ok(answer),
+            Some(answer) if is_answer_to(&answer, id, &query) => return Ok(answer),
             Some(_) => {}
             None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed without an answer")),
         }
@@ -593,9 +603,46 @@ fn with_fresh_id(query: &[u8]) -> (Vec<u8>, [u8; 2]) {
     (ours, id)
 }
 
-/// Whether `message` is a response (a header's worth, at least) with ID `id`.
-fn is_answer_to(message: &[u8], id: [u8; 2]) -> bool {
-    message.len() >= HEADER_LEN && message[..2] == id && message[2] & QR != 0
+/// Whether `message` is a response (a header's worth, at least) with ID
+/// `id`, to `query`'s question (RFC 5452 §9.1: the name in any case, the
+/// type and class). An answer without a question (some servers' `FORMERR`)
+/// is taken on its ID.
+fn is_answer_to(message: &[u8], id: [u8; 2], query: &[u8]) -> bool {
+    if message.len() < HEADER_LEN || message[..2] != id || message[2] & QR == 0 {
+        return false;
+    }
+    if message[4..6] == [0, 0] {
+        return true;
+    }
+    match (question(message), question(query)) {
+        (Some((name, rest)), Some((asked, asked_rest))) => name.eq_ignore_ascii_case(asked) && rest == asked_rest,
+        // A question we can't read is no answer to ours; ours is always
+        // readable (it was parsed before it was forwarded).
+        _ => false,
+    }
+}
+
+/// The one question of `message`, as its name (the labels as sent, which a
+/// question's never points elsewhere) and its type and class; `None` if it
+/// hasn't exactly one or it doesn't read so.
+fn question(message: &[u8]) -> Option<(&[u8], &[u8])> {
+    if message.len() < HEADER_LEN || message[4..6] != [0, 1] {
+        return None;
+    }
+    let mut end = HEADER_LEN;
+    loop {
+        let len = usize::from(*message.get(end)?);
+        end += 1;
+        if len == 0 {
+            break;
+        }
+        // A compression pointer, or a label type that isn't one.
+        if len > 63 {
+            return None;
+        }
+        end += len;
+    }
+    Some((message.get(HEADER_LEN..end)?, message.get(end..end + 4)?))
 }
 
 /// The answer to `query` (a whole DNS message) if `view`'s server can give
@@ -783,7 +830,8 @@ fn fit_udp(query: &[u8], answer: Vec<u8>) -> Vec<u8> {
         // hickory's own truncation: the records past the limit are left
         // out (whole), and the header counts what is left and sets TC.
         encoder.set_max_size(limit);
-        message.emit(&mut encoder)
+        // (A record that didn't fit leaves its bytes behind the offset.)
+        message.emit(&mut encoder).map(|()| encoder.trim())
     };
     match emitted {
         Ok(()) => cut,
@@ -1407,7 +1455,9 @@ mod tests {
 
         let cut = fit_udp(&plain, whole.clone());
         assert!(cut.len() <= 512, "{} bytes", cut.len());
+        let bytes = cut.len();
         let cut = Message::from_vec(&cut).unwrap();
+        assert_eq!(cut.to_vec().unwrap().len(), bytes, "nothing after its last record");
         assert!(cut.truncation);
         assert_eq!((cut.id, cut.response_code, cut.queries.len()), (1, ResponseCode::NoError, 1));
         assert!((20..usize::from(CROWD)).contains(&cut.answers.len()), "{} records", cut.answers.len());
@@ -1648,6 +1698,69 @@ mod tests {
         let mut bytes = message.to_vec().unwrap();
         bytes.push(TRAILER);
         bytes
+    }
+
+    /// `SERVFAIL`, as a flaky server says.
+    fn servfail(query: &Message, _: Transport) -> Vec<Message> {
+        let mut answer = answer_with(query, WRONG);
+        answer.answers.clear();
+        answer.metadata.response_code = ResponseCode::ServFail;
+        vec![answer]
+    }
+
+    /// An answer to another question first, then the answer.
+    fn misdirected(query: &Message, _: Transport) -> Vec<Message> {
+        let mut other = query.clone();
+        other.queries[0] = Query::query(Name::from_ascii("elsewhere.example.").unwrap(), RecordType::A);
+        vec![answer_with(&other, WRONG), answer_with(query, FAR)]
+    }
+
+    #[tokio::test]
+    async fn an_upstream_that_fails_is_passed_over() {
+        let (first, second) = (Upstream::start(servfail).await, Upstream::start(address).await);
+        let (_server, udp, tcp) = serve(view(vec![first.address, second.address]), QUICK);
+        let asked = query(2, "example.com.", RecordType::A);
+        let answer = parse(ask_udp(udp, &asked, PATIENCE).await);
+        assert_eq!((answer.response_code, addresses(&answer)), (ResponseCode::NoError, vec![IpAddr::V4(FAR.0)]));
+        let mut stream = TcpStream::connect(tcp).await.unwrap();
+        let answer = ask_tcp(&mut stream, &asked).await;
+        assert_eq!((answer.response_code, addresses(&answer)), (ResponseCode::NoError, vec![IpAddr::V4(FAR.0)]));
+        // With no better one, the failure is the answer.
+        let (_server, udp, _) = serve(view(vec![first.address]), QUICK);
+        assert_eq!(parse(ask_udp(udp, &asked, PATIENCE).await).response_code, ResponseCode::ServFail);
+    }
+
+    #[tokio::test]
+    async fn an_answer_to_another_question_is_passed_over() {
+        let upstream = Upstream::start(misdirected).await;
+        let (_server, udp, tcp) = serve(view(vec![upstream.address]), QUICK);
+        let asked = query(0x0303, "Example.com.", RecordType::A);
+        let over_udp = parse(ask_udp(udp, &asked, PATIENCE).await);
+        let mut stream = TcpStream::connect(tcp).await.unwrap();
+        let over_tcp = ask_tcp(&mut stream, &asked).await;
+        for answer in [over_udp, over_tcp] {
+            assert_eq!(addresses(&answer), vec![IpAddr::V4(FAR.0)]);
+        }
+    }
+
+    #[test]
+    fn questions_match_in_any_case_but_not_in_type() {
+        let asked = query(1, "Example.COM.", RecordType::A);
+        let mut answer = asked.clone();
+        answer[2] |= QR;
+        let id = [asked[0], asked[1]];
+        assert!(is_answer_to(&answer, id, &asked));
+        let lower = query(1, "example.com.", RecordType::A);
+        let mut lower_answer = lower.clone();
+        lower_answer[2] |= QR;
+        assert!(is_answer_to(&lower_answer, id, &asked), "0x20: any case");
+        let mut https = query(1, "example.com.", RecordType::HTTPS);
+        https[2] |= QR;
+        assert!(!is_answer_to(&https, id, &asked));
+        // No question at all: on the ID alone.
+        let mut bare = answer[..HEADER_LEN].to_vec();
+        bare[4..6].copy_from_slice(&[0, 0]);
+        assert!(is_answer_to(&bare, id, &asked));
     }
 
     #[tokio::test]

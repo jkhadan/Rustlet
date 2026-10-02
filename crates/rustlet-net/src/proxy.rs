@@ -131,6 +131,9 @@ impl Backend {
 #[derive(Debug)]
 pub struct Proxy {
     task: JoinHandle<()>,
+    /// A UDP proxy's published socket, which its clients' answer tasks hold
+    /// too: `close` waits for it to be gone.
+    published: Option<std::sync::Weak<UdpSocket>>,
 }
 
 impl Proxy {
@@ -146,7 +149,7 @@ impl Proxy {
     fn tcp_with(listener: std::net::TcpListener, backend: Backend, connect_timeout: Duration) -> io::Result<Proxy> {
         listener.set_nonblocking(true)?;
         let listener = TcpListener::from_std(listener)?;
-        Ok(Proxy { task: tokio::spawn(serve_tcp(listener, backend, connect_timeout)) })
+        Ok(Proxy { task: tokio::spawn(serve_tcp(listener, backend, connect_timeout)), published: None })
     }
 
     /// Relays the datagrams arriving on `socket` (bound already; made
@@ -167,8 +170,10 @@ impl Proxy {
     ) -> io::Result<Proxy> {
         socket.set_nonblocking(true)?;
         want_destinations(&socket)?;
+        let published = Arc::new(UdpSocket::from_std(socket)?);
+        let weak = Arc::downgrade(&published);
         let relay = UdpRelay {
-            published: Arc::new(UdpSocket::from_std(socket)?),
+            published,
             backend,
             idle,
             max_clients,
@@ -176,17 +181,24 @@ impl Proxy {
             turned_away: false,
             stranded: false,
         };
-        Ok(Proxy { task: tokio::spawn(relay.serve()) })
+        Ok(Proxy { task: tokio::spawn(relay.serve()), published: Some(weak) })
     }
 }
 
 impl Proxy {
     /// Stops the proxy and waits until its task is gone, and with it the
     /// published socket: the port can be bound again as soon as this
-    /// returns (a container restarted on the same port).
+    /// returns (a container restarted on the same port). A UDP proxy's
+    /// clients' answer tasks, aborted with it, hold the socket too, until
+    /// the runtime gets to them.
     pub async fn close(mut self) {
         self.task.abort();
         let _ = (&mut self.task).await;
+        if let Some(published) = &self.published {
+            while published.strong_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
     }
 }
 
@@ -310,6 +322,7 @@ impl UdpRelay {
     /// Relays until the proxy is dropped; the clients go with it.
     async fn serve(mut self) {
         let published = self.published.clone();
+        let own_port = published.local_addr().map_or(0, |a| a.port());
         let mut datagram = vec![0u8; MAX_DATAGRAM];
         // Room for either kind of pktinfo (the IPv6 one is the larger).
         let mut cmsg = nix::cmsg_space!(libc::in6_pktinfo);
@@ -322,8 +335,12 @@ impl UdpRelay {
         loop {
             tokio::select! {
                 received = recv_datagram(&published, &mut datagram, &mut cmsg) => match received {
-                    Ok((len, from, local)) => {
+                    Ok((len, from, local, arrived_on)) => {
                         backoff.reset();
+                        if forged(from, local, own_port, arrived_on) {
+                            tracing::debug!(%from, "a datagram from our own address: dropped");
+                            continue;
+                        }
                         self.forward(&datagram[..len], from, local).await;
                     }
                     Err(e) => {
@@ -493,13 +510,29 @@ fn want_destinations(socket: &std::net::UdpSocket) -> io::Result<()> {
     Ok(())
 }
 
+/// The loopback interface's index, in every network namespace.
+const LOOPBACK_IFINDEX: u32 = 1;
+
+/// Does a datagram from `from` to our address `local` (on the published
+/// socket's port `own_port`), arriving on the interface `arrived_on`, claim
+/// to come from us? Relayed, its answers would go to us, and come in again,
+/// for ever (the Loop DoS of DNS's CVE-2024-2169, between two published
+/// ports too): one from the very address and port it was sent to, and one
+/// from that address that came from outside (the host's own datagrams to
+/// itself come in on `lo`). IPv4 stops the second kind itself (a local
+/// source is a martian), IPv6 doesn't.
+fn forged(from: SocketAddr, local: Option<IpAddr>, own_port: u16, arrived_on: Option<u32>) -> bool {
+    local == Some(from.ip()) && (from.port() == own_port || arrived_on.is_some_and(|i| i != LOOPBACK_IFINDEX))
+}
+
 /// Receives a datagram on the published socket: its length, its sender,
-/// and the address of ours it was sent to (see [`want_destinations`]).
+/// the address of ours it was sent to (see [`want_destinations`]), and the
+/// index of the interface it came in on.
 async fn recv_datagram(
     socket: &UdpSocket,
     buf: &mut [u8],
     cmsg: &mut [u8],
-) -> io::Result<(usize, SocketAddr, Option<IpAddr>)> {
+) -> io::Result<(usize, SocketAddr, Option<IpAddr>, Option<u32>)> {
     socket
         .async_io(Interest::READABLE, || {
             let mut iov = [IoSliceMut::new(buf)];
@@ -509,17 +542,21 @@ async fn recv_datagram(
                 .as_ref()
                 .and_then(socket_addr)
                 .ok_or_else(|| io::Error::other("a datagram without a sender address"))?;
-            let local = msg.cmsgs().into_iter().flatten().find_map(|c| match c {
+            let info = msg.cmsgs().into_iter().flatten().find_map(|c| match c {
                 // `ipi_spec_dst` rather than the header's `ipi_addr`: the
                 // same for a datagram sent to one of our addresses, and our
                 // own address (not the broadcast one) for a broadcast.
-                ControlMessageOwned::Ipv4PacketInfo(info) => {
-                    Some(IpAddr::from(Ipv4Addr::from(u32::from_be(info.ipi_spec_dst.s_addr))))
+                ControlMessageOwned::Ipv4PacketInfo(info) => Some((
+                    IpAddr::from(Ipv4Addr::from(u32::from_be(info.ipi_spec_dst.s_addr))),
+                    info.ipi_ifindex as u32,
+                )),
+                ControlMessageOwned::Ipv6PacketInfo(info) => {
+                    Some((IpAddr::from(Ipv6Addr::from(info.ipi6_addr.s6_addr)), info.ipi6_ifindex))
                 }
-                ControlMessageOwned::Ipv6PacketInfo(info) => Some(IpAddr::from(Ipv6Addr::from(info.ipi6_addr.s6_addr))),
                 _ => None,
             });
-            Ok((msg.bytes, from, local.filter(|ip| !ip.is_unspecified())))
+            let local = info.map(|(ip, _)| ip).filter(|ip| !ip.is_unspecified());
+            Ok((msg.bytes, from, local, info.map(|(_, index)| index)))
         })
         .await
 }
@@ -855,6 +892,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn udp_close_frees_the_port_before_it_returns() {
+        // Polled between every two tasks: the aborted answer tasks haven't
+        // run when the relay's own task is gone.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().event_interval(1).build().unwrap();
+        rt.block_on(async {
+            let (backend, _) = udp_echo().await;
+            let (proxy, published) = udp_proxy(Backend::new(Some(backend)));
+            let client = udp_client("127.0.0.1:0", published).await;
+            assert_eq!(exchange(&client, b"ping").await, b"ping");
+            proxy.close().await;
+            std::net::UdpSocket::bind(published).expect("free once close returns");
+        });
+    }
+
+    #[tokio::test]
+    async fn udp_drops_datagrams_from_its_own_address() {
+        let (backend, mut heard) = udp_echo().await;
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let published = socket.local_addr().unwrap();
+        // The published socket itself, as a forged source claims to be.
+        let forger = socket.try_clone().unwrap();
+        let _proxy = Proxy::udp(socket, Backend::new(Some(backend))).unwrap();
+        forger.send_to(b"loop?", published).unwrap();
+        tokio::time::sleep(QUIET).await;
+        let mut relayed = 0;
+        while heard.try_recv().is_ok() {
+            relayed += 1;
+        }
+        assert_eq!(relayed, 0, "relayed {relayed} times: a loop");
+    }
+
+    #[test]
+    fn datagrams_claiming_to_be_ours() {
+        let ours: IpAddr = "2001:db8::2".parse().unwrap();
+        let from = |port| SocketAddr::new(ours, port);
+        // From outside (eth0 is 2), from our address: forged.
+        assert!(forged(from(5353), Some(ours), 8053, Some(2)));
+        // From our own socket, wherever it came in.
+        assert!(forged(from(8053), Some(ours), 8053, Some(LOOPBACK_IFINDEX)));
+        // The host's own client, on lo; anyone else's address, from outside.
+        assert!(!forged(from(40000), Some(ours), 8053, Some(LOOPBACK_IFINDEX)));
+        assert!(!forged("[2001:db8::1]:8053".parse().unwrap(), Some(ours), 8053, Some(2)));
+    }
+
     #[tokio::test]
     async fn udp_relays_requests_and_answers() {
         let (backend, _) = udp_echo().await;
@@ -920,8 +1002,9 @@ mod tests {
         client.send_to(b"hello", (Ipv4Addr::LOCALHOST, port)).await.unwrap();
         let mut buf = [0u8; 32];
         let mut cmsg = nix::cmsg_space!(libc::in6_pktinfo);
-        let (n, from, local) = within(recv_datagram(&published, &mut buf, &mut cmsg)).await.unwrap();
+        let (n, from, local, arrived_on) = within(recv_datagram(&published, &mut buf, &mut cmsg)).await.unwrap();
         assert_eq!((&buf[..n], from, local), (&b"hello"[..], client_addr, Some(IpAddr::from(Ipv4Addr::LOCALHOST))));
+        assert_eq!(arrived_on, Some(LOOPBACK_IFINDEX), "and the interface it came in on");
 
         // ...and an answer leaves from the address it is given, which is
         // all that a client connected to 127.0.0.2 accepts.
