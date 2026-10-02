@@ -227,6 +227,24 @@ impl ContentStore {
         Ok(out)
     }
 
+    /// The manifest (or index) digest of every descriptor in `index.json`,
+    /// named or not: what garbage collection starts from.
+    pub fn index_digests(&self) -> Result<Vec<Digest>> {
+        self.read_index()?.manifests().iter().map(|d| Digest::from_oci(d.digest())).collect()
+    }
+
+    /// Deletes what ingests left in `ingest/` (a killed process can't clean
+    /// up after itself). Only while no ingest runs: the caller makes sure.
+    pub fn remove_partials(&self) -> Result<Vec<PathBuf>> {
+        let mut removed = Vec::new();
+        for entry in std::fs::read_dir(&self.ingest).with_context(|| format!("list {}", self.ingest.display()))? {
+            let path = entry.with_context(|| format!("list {}", self.ingest.display()))?.path();
+            std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+            removed.push(path);
+        }
+        Ok(removed)
+    }
+
     /// The entry for `name` (a normalized reference), if the store has it.
     pub fn resolve(&self, name: &str) -> Result<Option<RefEntry>> {
         Ok(self.refs()?.into_iter().find(|r| r.name == name))

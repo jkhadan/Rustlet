@@ -141,6 +141,24 @@ impl Snapshotter {
         Ok(out)
     }
 
+    /// Deletes the directories of unpacks a killed process left behind
+    /// (`.tmp-*`, `.broken-*`). Only while no unpack runs: the caller makes
+    /// sure.
+    pub fn remove_leftovers(&self) -> Result<Vec<PathBuf>> {
+        let mut removed = Vec::new();
+        for entry in std::fs::read_dir(&self.dir).with_context(|| format!("list {}", self.dir.display()))? {
+            let entry = entry.with_context(|| format!("list {}", self.dir.display()))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".tmp-") || name.starts_with(".broken-") {
+                let path = entry.path();
+                rustlet_sys::tree::safe_remove_tree(&path).with_context(|| format!("remove {}", path.display()))?;
+                removed.push(path);
+            }
+        }
+        Ok(removed)
+    }
+
     /// Unpacks every layer of `image` that has no snapshot yet (bottom
     /// first, each verified against its blob digest and diff ID) and returns
     /// all of the image's snapshots, bottom first. Needs root: unpacking

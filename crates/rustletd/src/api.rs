@@ -363,7 +363,7 @@ async fn image_remove(
     Query(q): Query<ImageDeleteQuery>,
 ) -> ApiResult<Json<rustlet_spec::image::ImageDeleteResponse>> {
     let images = d.clone();
-    let r = to_the_end(async move { images.images.remove(&q.name, q.force, &images.image_users()).await }).await?;
+    let r = to_the_end(async move { images.images.remove(&q.name, q.force, || images.image_users()).await }).await?;
     for name in &r.untagged {
         d.events.emit(EventKind::Image, "untag", name, Default::default());
     }

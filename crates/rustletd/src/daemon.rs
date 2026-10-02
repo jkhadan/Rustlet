@@ -72,6 +72,7 @@ impl Daemon {
                 Err(e) => bail!("create cgroup {dir}: {e} (is {cgroup_parent} delegated to us?)"),
             }
         }
+        remove_leftover_workers(&format!("{cgroup_parent}/workers"));
         let exe = std::env::current_exe().context("locate rustletd")?;
         let beside = |name: &str| exe.with_file_name(name);
         let runtime = config.runtime.clone().unwrap_or_else(|| beside("rustlet-runc"));
@@ -229,6 +230,26 @@ fn private_mount(dir: &Path) -> anyhow::Result<()> {
     mount(None::<&str>, &dir, None::<&str>, MsFlags::MS_PRIVATE, None::<&str>)
         .with_context(|| format!("make {} private", dir.display()))?;
     Ok(())
+}
+
+/// Workers of a daemon that was killed (as `KillMode=process` leaves them):
+/// stopped and their cgroups removed, so that nothing writes to the store
+/// that this daemon doesn't know of.
+fn remove_leftover_workers(workers: &str) {
+    let Ok(entries) = std::fs::read_dir(format!("/sys/fs/cgroup{workers}")) else { return };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let path = format!("{workers}/{}", entry.file_name().to_string_lossy());
+        let removed = rustlet_runtime::cgroups::CgroupPath::parse(&path)
+            .and_then(|p| rustlet_runtime::cgroups::Cgroup::open(&p))
+            .and_then(|cg| cg.remove_tree(std::time::Duration::from_secs(10)));
+        match removed {
+            Ok(()) => tracing::info!("stopped a worker the last daemon left: {path}"),
+            Err(e) => tracing::warn!("remove the leftover worker cgroup {path}: {e}"),
+        }
+    }
 }
 
 /// Under systemd with `DelegateSubgroup=daemon`, we run in

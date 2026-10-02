@@ -551,9 +551,10 @@ fn dm_images_and_garbage_collection() {
         c.start(&id).await.unwrap();
         assert_eq!(c.wait(&id, WaitCondition::NextExit).await.unwrap().status_code, 0);
         c.remove_container(&id, false).await.unwrap();
-        // Its last container gone, the unnamed image is collected with it.
+        // Its last container gone, the unnamed image is collected with it
+        // (in the background: `rm` doesn't wait for a pull to finish).
         let store = rustlet_image::Store::open(&d.data).unwrap();
-        assert!(store.snapshots().list().unwrap().is_empty(), "{:?}", store.snapshots().list().unwrap());
+        until("the image's collection", async || store.snapshots().list().unwrap().is_empty()).await;
         let e = c.remove_image("alpine", false).await.unwrap_err();
         assert_eq!(e.kind(), Some(ErrorKind::NoSuchImage));
         assert!(c.list_images().await.unwrap().is_empty());

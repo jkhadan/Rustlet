@@ -2,33 +2,38 @@
 //! holds, pulls and unpacks through worker children ([`crate::worker`]),
 //! and `rmi` with garbage collection.
 //!
-//! **What is in use** is the daemon's to know, not the store's: the image
-//! names in `index.json`, plus the image (manifest digest) of every
-//! container. A container keeps its image's blobs and snapshots even after
-//! the name is removed or points elsewhere. (mountinfo can't answer this:
-//! for a `--userns` container it names the staged `lower/<n>` paths, long
-//! gone.) Garbage collection deletes the blobs and snapshots nothing in
-//! use reaches, and never while a pull or unpack runs: a pull stores its
-//! blobs before the name that makes them reachable.
+//! **What is in use** is the daemon's to know, not the store's: whatever
+//! `index.json` lists (named or not), plus the image (manifest digest) of
+//! every container. A container keeps its image's blobs and snapshots even
+//! after the name is removed or points elsewhere. (mountinfo can't answer
+//! this: for a `--userns` container it names the staged `lower/<n>` paths,
+//! long gone.) Garbage collection deletes the blobs and snapshots nothing
+//! in use reaches, and never while a pull, an unpack or a create runs: a
+//! pull stores its blobs before the name that makes them reachable, and a
+//! create has looked up its image before its container is recorded. What
+//! it can't read is kept, with whatever it may refer to.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
+use rustlet_image::content::ContentStore;
 use rustlet_image::snapshot::Snapshot;
 use rustlet_image::{Digest, Image, ImageRef, Store};
 use rustlet_runtime::cgroups::{Cgroup, CgroupPath, Setting, SystemdDelegated};
 use rustlet_spec::image::{ImageDeleteResponse, ImageInspect, ImageSummary, PullEvent, PullPolicy};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, RwLockReadGuard, mpsc};
 
 use crate::error::{ApiError, ApiResult};
 
 pub struct Images {
     store: Store,
     worker: WorkerConfig,
-    /// Pulls and unpacks share it; garbage collection takes it alone.
+    /// Pulls, unpacks and creates share it; garbage collection takes it
+    /// alone, and never waits for it in line (see `collect_garbage`).
     gc: RwLock<()>,
 }
 
@@ -47,6 +52,12 @@ pub struct WorkerConfig {
 impl Images {
     pub fn new(store: Store, worker: WorkerConfig) -> Images {
         Images { store, worker, gc: RwLock::new(()) }
+    }
+
+    /// Keeps garbage collection away while held: a create holds it from
+    /// looking up its image until its container is recorded.
+    pub async fn pin(&self) -> RwLockReadGuard<'_, ()> {
+        self.gc.read().await
     }
 
     /// The image `name` means: a name (normalized as `ImageRef` does), a
@@ -221,6 +232,14 @@ impl Images {
         let mut cmd = tokio::process::Command::new(&self.worker.exe);
         cmd.arg("worker").args(&args).args(["--cgroup", &cg.as_path().display().to_string()]);
         cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        // A worker whose daemon gave up on it (shutting down) goes too:
+        // nothing would remove its cgroup, and the next daemon's garbage
+        // collection wouldn't know it still writes to the store.
+        cmd.kill_on_drop(true);
+        // The final event (`ready` or `error`) is sent once the worker is
+        // done and the store free again: a client that stops reading holds
+        // up neither. Progress it doesn't keep up with is dropped.
+        let mut last = None;
         let result = async {
             let mut child = cmd.spawn().map_err(|e| ApiError::internal(format!("start a worker: {e}")))?;
             let stdout = child.stdout.take().expect("piped");
@@ -235,10 +254,13 @@ impl Images {
                 match &event {
                     PullEvent::Ready { manifest, .. } => ready = Some(manifest.clone()),
                     PullEvent::Error { message } => failed = Some(message.clone()),
-                    _ => {}
+                    _ => {
+                        // A client that went away doesn't stop the work.
+                        let _ = events.try_send(event);
+                        continue;
+                    }
                 }
-                // A client that went away doesn't stop the work.
-                let _ = events.send(event).await;
+                last = Some(event);
             }
             let status = child.wait().await?;
             match (ready, failed) {
@@ -254,29 +276,34 @@ impl Images {
                     } else {
                         format!("the worker failed ({status})")
                     };
-                    let _ = events.send(PullEvent::Error { message: message.clone() }).await;
+                    last = Some(PullEvent::Error { message: message.clone() });
                     Err(ApiError::internal(message))
                 }
             }
         }
         .await;
         let _ = tokio::task::spawn_blocking(move || {
-            if let Err(e) = cgroup.remove_tree(std::time::Duration::from_secs(10)) {
+            if let Err(e) = cgroup.remove_tree(Duration::from_secs(10)) {
                 tracing::warn!("remove a worker cgroup: {e}");
             }
         })
         .await;
+        drop(_turn);
+        if let Some(event) = last {
+            let _ = events.send(event).await;
+        }
         result
     }
 
     /// `rmi`: removes the name (or, for an id, every name of the image),
-    /// then deletes what nothing uses any more. `in_use`: image ids (manifest
-    /// digests) of containers, and the containers' names per image id.
+    /// then deletes what nothing uses any more. `containers`: the names of
+    /// the containers per image id (manifest digest), asked again for the
+    /// collection.
     pub async fn remove(
         &self,
         name: &str,
         force: bool,
-        containers: &BTreeMap<String, Vec<String>>,
+        containers: impl Fn() -> BTreeMap<String, Vec<String>>,
     ) -> ApiResult<ImageDeleteResponse> {
         let image = self.resolve(name)?;
         let id = image.manifest_digest.to_string();
@@ -302,7 +329,7 @@ impl Images {
         let last_name = untag.len() == names.len();
         if last_name
             && !force
-            && let Some(users) = containers.get(&id)
+            && let Some(users) = containers().get(&id)
         {
             return Err(ApiError::conflict(format!(
                 "image {name} is used by container{} {}: remove {}, or use --force (the containers keep working)",
@@ -317,65 +344,154 @@ impl Images {
                 response.untagged.push(n);
             }
         }
-        let in_use: BTreeSet<String> = containers.keys().cloned().collect();
-        response.deleted = self.collect_garbage(&in_use).await?;
+        response.deleted = self.collect_garbage(|| containers().into_keys().collect()).await?;
         Ok(response)
     }
 
-    /// Deletes blobs and snapshots that no name and no container reaches.
-    pub async fn collect_garbage(&self, container_images: &BTreeSet<String>) -> ApiResult<Vec<String>> {
-        let _alone = self.gc.write().await;
-        let content = self.store.content();
-        let mut manifests: BTreeSet<Digest> = BTreeSet::new();
-        for r in content.refs()? {
-            manifests.insert(r.manifest_digest()?);
-        }
-        for id in container_images {
-            if let Ok(d) = Digest::parse(id) {
-                manifests.insert(d);
+    /// Deletes blobs and snapshots that nothing in `index.json` and no
+    /// container reaches, and what killed workers left behind. `in_use`: the
+    /// containers' image ids, asked once nothing else can change them.
+    pub async fn collect_garbage(&self, in_use: impl FnOnce() -> BTreeSet<String>) -> ApiResult<Vec<String>> {
+        // Once no pull, unpack or create runs. Polling rather than waiting
+        // in line: tokio's lock is fair, and a collection queued behind a
+        // long pull would make every later pull, unpack and create queue
+        // behind it.
+        let _alone = loop {
+            match self.gc.try_write() {
+                Ok(guard) => break guard,
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
             }
+        };
+        let content = self.store.content();
+        let mut roots = content.index_digests()?;
+        roots.extend(in_use().iter().filter_map(|id| Digest::parse(id).ok()));
+        let mut keep = Reachable::default();
+        for root in &roots {
+            keep.add(content, root, 0);
         }
-        let mut blobs = BTreeSet::new();
-        let mut chains = BTreeSet::new();
-        for m in &manifests {
-            // A manifest that can't be loaded keeps only itself: deleting
-            // what it may name would be a guess.
-            blobs.insert(m.clone());
-            if let Ok(image) = Image::from_manifest(content, m, None, None) {
-                blobs.insert(image.config_digest.clone());
-                for l in &image.layers {
-                    blobs.insert(l.blob.clone());
-                    chains.insert(l.chain_id.clone());
+        let mut deleted = Vec::new();
+        if keep.every_blob {
+            tracing::warn!("garbage collection keeps every blob: a manifest it must keep can't be read");
+        } else {
+            let blob_dir = content.dir().join("blobs/sha256");
+            let entries = std::fs::read_dir(&blob_dir)
+                .map_err(|e| ApiError::internal(format!("list {}: {e}", blob_dir.display())))?;
+            for entry in entries {
+                let entry = entry?;
+                let Some(hex) = entry.file_name().to_str().map(str::to_owned) else { continue };
+                let Ok(d) = Digest::from_hex(&hex) else { continue };
+                if !keep.blobs.contains(&d) {
+                    std::fs::remove_file(entry.path())?;
+                    deleted.push(d.to_string());
                 }
             }
         }
-        let mut deleted = Vec::new();
-        let blob_dir = content.dir().join("blobs/sha256");
-        for entry in
-            std::fs::read_dir(&blob_dir).map_err(|e| ApiError::internal(format!("list {}: {e}", blob_dir.display())))?
-        {
-            let entry = entry?;
-            let Some(hex) = entry.file_name().to_str().map(str::to_owned) else { continue };
-            let Ok(d) = Digest::from_hex(&hex) else { continue };
-            if !blobs.contains(&d) {
-                std::fs::remove_file(entry.path())?;
-                deleted.push(d.to_string());
+        let snapshots = self.store.snapshots();
+        if keep.every_snapshot {
+            tracing::warn!("garbage collection keeps every snapshot: an image it must keep can't be read");
+        } else {
+            let entries = std::fs::read_dir(snapshots.dir())
+                .map_err(|e| ApiError::internal(format!("list {}: {e}", snapshots.dir().display())))?;
+            for entry in entries {
+                let entry = entry?;
+                // By name: a snapshot whose snapshot.json is damaged is
+                // garbage all the same, unless something reaches it (and
+                // the next unpack replaces it then).
+                let Some(chain_id) = entry.file_name().to_str().and_then(|n| Digest::from_hex(n).ok()) else {
+                    continue;
+                };
+                if keep.chains.contains(&chain_id) {
+                    continue;
+                }
+                let dir = entry.path();
+                let shown = dir.display().to_string();
+                tokio::task::spawn_blocking(move || rustlet_sys::tree::safe_remove_tree(&dir))
+                    .await
+                    .map_err(|e| ApiError::internal(e.to_string()))?
+                    .map_err(|e| ApiError::internal(format!("remove snapshot {shown}: {e}")))?;
+                let _ = std::fs::remove_file(snapshots.dir().join(".locks").join(chain_id.hex()));
+                deleted.push(format!("snapshot {chain_id}"));
             }
         }
-        for s in self.store.snapshots().list()? {
-            if chains.contains(&s.info.chain_id) {
-                continue;
-            }
-            let dir = s.dir.clone();
-            tokio::task::spawn_blocking(move || rustlet_sys::tree::safe_remove_tree(&dir))
-                .await
-                .map_err(|e| ApiError::internal(e.to_string()))?
-                .map_err(|e| ApiError::internal(format!("remove snapshot {}: {e}", s.dir.display())))?;
-            let _ = std::fs::remove_file(self.store.snapshots().dir().join(".locks").join(s.info.chain_id.hex()));
-            deleted.push(format!("snapshot {}", s.info.chain_id));
+        // No worker runs: whatever is half-written was left by a killed one.
+        for left in content.remove_partials()?.into_iter().chain(snapshots.remove_leftovers()?) {
+            tracing::info!("removed {}, left by an unpack or pull that was killed", left.display());
         }
         Ok(deleted)
     }
+}
+
+/// What garbage collection keeps.
+#[derive(Debug, Default)]
+struct Reachable {
+    blobs: BTreeSet<Digest>,
+    chains: BTreeSet<Digest>,
+    /// Something to keep couldn't be read: no blob is deleted.
+    every_blob: bool,
+    /// An image to keep has layers that can't be told: no snapshot is
+    /// deleted.
+    every_snapshot: bool,
+}
+
+impl Reachable {
+    /// `digest` and everything it refers to. An image (as `Image` loads it)
+    /// keeps its config, layers and snapshots; anything else (an index, an
+    /// artifact, an image whose config can't be read now) keeps whatever
+    /// its JSON names, and every snapshot unless its config says which.
+    fn add(&mut self, content: &ContentStore, digest: &Digest, depth: u32) {
+        if !self.blobs.insert(digest.clone()) {
+            return;
+        }
+        if let Ok(image) = Image::from_manifest(content, digest, None, None) {
+            self.blobs.insert(image.config_digest.clone());
+            for l in &image.layers {
+                self.blobs.insert(l.blob.clone());
+                self.chains.insert(l.chain_id.clone());
+            }
+            return;
+        }
+        let Some(json) = read_json(content, digest, rustlet_image::manifest::MAX_MANIFEST_BYTES) else {
+            self.every_blob = true;
+            self.every_snapshot = true;
+            return;
+        };
+        let digests = |key: &str| -> Vec<Digest> {
+            json[key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|d| Digest::parse(d["digest"].as_str()?).ok())
+                .collect()
+        };
+        self.blobs.extend(digests("layers"));
+        if let Some(config) = json["config"]["digest"].as_str().and_then(|d| Digest::parse(d).ok()) {
+            self.blobs.insert(config.clone());
+            match read_json(content, &config, rustlet_image::config::MAX_CONFIG_BYTES) {
+                // An artifact's config has no diff IDs, and no snapshots
+                // either.
+                Some(c) => match c["rootfs"]["diff_ids"].as_array() {
+                    None => {}
+                    Some(ids) => {
+                        match ids.iter().map(|d| Digest::parse(d.as_str()?).ok()).collect::<Option<Vec<_>>>() {
+                            Some(ids) => self.chains.extend(rustlet_image::digest::chain_ids(&ids)),
+                            None => self.every_snapshot = true,
+                        }
+                    }
+                },
+                None => self.every_snapshot = true,
+            }
+        }
+        // An index: its manifests (not nested deeper than any real one).
+        if depth < 4 {
+            for m in digests("manifests") {
+                self.add(content, &m, depth + 1);
+            }
+        }
+    }
+}
+
+fn read_json(content: &ContentStore, digest: &Digest, max: u64) -> Option<serde_json::Value> {
+    serde_json::from_slice(&content.read_blob(digest, max).ok()?).ok()
 }
 
 fn worker_error(message: String) -> ApiError {
@@ -395,5 +511,159 @@ fn summary(image: &Image, names: Vec<String>, repo_digest: Option<String>) -> Im
         size: image.compressed_size() + image.manifest.config().size(),
         layers: image.layers.len(),
         platform: image.config.platform(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustlet_image::content::{REF_NAME, RefEntry, manifest_descriptor};
+    use rustlet_image::import::{config, import};
+
+    fn images(dir: &std::path::Path) -> Images {
+        let root = dir.join("store");
+        let worker = WorkerConfig {
+            exe: "/nonexistent".into(),
+            data_root: root.clone(),
+            cgroup_dir: "/nonexistent".into(),
+            memory_max: 0,
+            pids_max: 0,
+            insecure_registries: Vec::new(),
+        };
+        Images::new(Store::open(&root).unwrap(), worker)
+    }
+
+    fn block_on<F: Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
+    }
+
+    fn gc(im: &Images, in_use: &[&Digest]) -> Vec<String> {
+        let mut deleted = block_on(im.collect_garbage(|| in_use.iter().map(|d| d.to_string()).collect())).unwrap();
+        deleted.sort();
+        deleted
+    }
+
+    /// An imported image with one empty layer (unpacks without root).
+    fn image(im: &Images, name: &str, cmd: &[&str]) -> Image {
+        let c = im.store.content();
+        let i = import(c, name, &[vec![0u8; 1024]], config(cmd, &[], None).unwrap()).unwrap();
+        im.store.snapshots().ensure(c, &i, &mut |_| {}).unwrap();
+        i
+    }
+
+    #[test]
+    fn only_what_nothing_reaches_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let im = images(dir.path());
+        let c = im.store.content();
+        // Two images sharing their one layer.
+        let a = image(&im, "local/a:1", &["true"]);
+        let b = image(&im, "local/b:1", &["false"]);
+        let lone = c.write_blob(b"left by a failed pull").unwrap();
+        assert!(c.remove_ref("docker.io/local/a:1").unwrap());
+        let mut expected = vec![a.manifest_digest.to_string(), a.config_digest.to_string(), lone.to_string()];
+        expected.sort();
+        assert_eq!(gc(&im, &[]), expected);
+        assert!(c.blob_size(&b.layers[0].blob).unwrap().is_some(), "b's layer is a's too");
+        // A container's image stays without a name.
+        assert!(c.remove_ref("docker.io/local/b:1").unwrap());
+        assert!(gc(&im, &[&b.manifest_digest]).is_empty());
+        let gone = gc(&im, &[]);
+        assert!(gone.contains(&format!("snapshot {}", b.layers[0].chain_id)), "{gone:?}");
+        assert!(c.blob_size(&b.layers[0].blob).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_used_image_whose_config_cant_be_read_keeps_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let im = images(dir.path());
+        let img = image(&im, "local/a:1", &["true"]);
+        let c = im.store.content();
+        assert!(c.remove_ref("docker.io/local/a:1").unwrap());
+        // Not an image config any more: its layers can't be told.
+        std::fs::write(c.blob_path(&img.config_digest), b"{}").unwrap();
+        assert_eq!(gc(&im, &[&img.manifest_digest]), Vec::<String>::new(), "deleted what a container uses");
+        assert!(im.store.snapshots().get(&img.layers[0].chain_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn what_a_named_artifact_refers_to_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let im = images(dir.path());
+        let c = im.store.content();
+        let cfg = c.write_blob(b"{}").unwrap();
+        let data = c.write_blob(b"chart").unwrap();
+        let m = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2, "mediaType": rustlet_image::media::OCI_MANIFEST,
+            "config": {"mediaType": "application/vnd.oci.empty.v1+json", "digest": cfg.to_string(), "size": 2},
+            "layers": [{"mediaType": "application/vnd.example.chart.v1", "digest": data.to_string(), "size": 5}],
+        }))
+        .unwrap();
+        let d = c.write_blob(&m).unwrap();
+        let target = manifest_descriptor(rustlet_image::media::OCI_MANIFEST, &d, m.len() as u64);
+        c.set_ref(&RefEntry { name: "docker.io/local/chart:1".into(), target, repo_digest: None }).unwrap();
+        assert_eq!(gc(&im, &[]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn unnamed_index_entries_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let im = images(dir.path());
+        image(&im, "local/a:1", &["true"]);
+        // Another tool's entry: no name.
+        let p = im.store.content().dir().join("index.json");
+        let mut index: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        index["manifests"][0]["annotations"].as_object_mut().unwrap().remove(REF_NAME);
+        std::fs::write(&p, serde_json::to_vec(&index).unwrap()).unwrap();
+        assert_eq!(gc(&im, &[]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn damaged_snapshots_and_killed_workers_leftovers_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let im = images(dir.path());
+        let snapshots = im.store.snapshots().dir().to_owned();
+        let damaged = snapshots.join(Digest::of(b"x").hex());
+        std::fs::create_dir_all(damaged.join("fs")).unwrap();
+        std::fs::write(damaged.join("snapshot.json"), b"{\"chain_id\": \"sha").unwrap();
+        std::fs::create_dir_all(snapshots.join(".tmp-abc-1-0/fs")).unwrap();
+        std::fs::create_dir_all(snapshots.join(".broken-abc-1-0/fs")).unwrap();
+        let ingest = dir.path().join("store/ingest");
+        std::fs::write(ingest.join("abc-1-0.partial"), b"half a blob").unwrap();
+        assert_eq!(gc(&im, &[]), [format!("snapshot {}", Digest::of(b"x"))]);
+        let left: Vec<_> = std::fs::read_dir(&snapshots)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != ".locks")
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        assert_eq!(std::fs::read_dir(&ingest).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn collection_waits_for_pins_without_holding_them_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let im = images(dir.path());
+        let a = image(&im, "local/a:1", &["true"]);
+        assert!(im.store.content().remove_ref("docker.io/local/a:1").unwrap());
+        block_on(async {
+            let pin = im.pin().await;
+            let asked = std::sync::atomic::AtomicBool::new(false);
+            let collect = im.collect_garbage(|| {
+                asked.store(true, Ordering::SeqCst);
+                // The container recorded meanwhile.
+                [a.manifest_digest.to_string()].into()
+            });
+            tokio::pin!(collect);
+            // Pinned: it waits...
+            assert!(tokio::time::timeout(Duration::from_millis(300), &mut collect).await.is_err());
+            assert!(!asked.load(Ordering::SeqCst), "what is in use is asked only once it may collect");
+            // ...without making another pin wait behind it.
+            let second = tokio::time::timeout(Duration::from_millis(300), im.pin()).await;
+            assert!(second.is_ok(), "a waiting collection held up a pin");
+            drop(second);
+            drop(pin);
+            assert_eq!(collect.await.unwrap(), Vec::<String>::new());
+        });
     }
 }
