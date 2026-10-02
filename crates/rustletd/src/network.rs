@@ -252,7 +252,13 @@ impl Networks {
             for (bridge, gateway, len, v6) in &bridges {
                 backend.ensure_network(bridge, *gateway, *len, *v6).map_err(ApiError::from)?;
             }
-            let isolate6 = ipv6 && will_isolate(&record, sysctl::IP6_FORWARD)?;
+            // IPv6 forwarding, once Rustlets turned it on, stays on (as
+            // `ip_forward` does) whether a network still has IPv6 or not; so
+            // must the drop that keeps it to Rustlets' bridges.
+            let isolate6 = match sysctl::recorded(&record, sysctl::IP6_FORWARD) {
+                Some(was) => was == "0",
+                None => ipv6 && will_isolate(&record, sysctl::IP6_FORWARD)?,
+            };
             Ok((will_isolate(&record, sysctl::IP_FORWARD)?, isolate6))
         })
         .await

@@ -775,7 +775,7 @@ fn dn_several_networks_and_static_addresses() {
 #[test]
 #[ignore = "needs root: run with `cargo xtask itest`"]
 fn dn_ipv6_networks() {
-    let d = daemon();
+    let mut d = daemon();
     let v6 = |ip: &str, port| SocketAddr::new(IpAddr::V6(ip.parse().unwrap()), port);
     serve(&d.net.lan, v6("2001:db8::1", 9000), "lan6");
     block_on(async {
@@ -836,7 +836,16 @@ fn dn_ipv6_networks() {
             run(&c, &sh("ip -6 addr show dev eth0 | wc -l; cat /proc/sys/net/ipv6/conf/eth0/disable_ipv6")).await;
         assert_eq!(out, "0\n1\n");
         c.remove_container(&web, true).await.unwrap();
+        c.remove_network("six").await.unwrap();
     });
+    // IPv6 forwarding stays on without an IPv6 network, as ip_forward does,
+    // and a new daemon keeps it to Rustlets' bridges all the same.
+    d.restart();
+    assert_eq!(d.net.host.read_sysctl("net.ipv6.conf.all.forwarding"), "1");
+    let mut nft = std::process::Command::new("nft");
+    nft.args(["list", "table", "inet", "rustlet"]).stdout(std::process::Stdio::piped());
+    let table = String::from_utf8(d.net.host.spawn(&mut nft).wait_with_output().unwrap().stdout).unwrap();
+    assert!(table.contains("meta nfproto ipv6 drop"), "{table}");
 }
 
 /// A container on two networks, one with IPv6, through a daemon crash:
