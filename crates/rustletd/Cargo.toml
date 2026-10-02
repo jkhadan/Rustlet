@@ -15,6 +15,7 @@ rustlet-spec.workspace = true
 rustlet-shim.workspace = true
 rustlet-runtime.workspace = true
 rustlet-image.workspace = true
+rustlet-net.workspace = true
 rustlet-sys.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

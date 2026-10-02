@@ -24,6 +24,8 @@
 //! | `attach`, `exec` | WebSocket sessions bridged to shim streams |
 //! | `logs`, `stats`, `events` | the streams |
 //! | `images`, `worker` | pulls and unpacks in memory-limited children, rmi + GC |
+//! | `network` | networks, a run's namespace, address, DNS names and published ports, the firewall |
+//! | `volumes` | volumes, mounts, copy-up |
 //! | `spec` | image + options → config.json |
 //! | `api` | the HTTP routes |
 #![forbid(unsafe_code)]
@@ -41,9 +43,11 @@ mod images;
 mod lifecycle;
 mod logs;
 mod names;
+mod network;
 mod notify;
 mod spec;
 mod stats;
+mod volumes;
 mod worker;
 
 use std::os::unix::fs::PermissionsExt;

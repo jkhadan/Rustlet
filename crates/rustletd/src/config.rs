@@ -11,6 +11,11 @@
 //! log_max_size = 10485760         # per container log file
 //! log_max_files = 3
 //! worker_memory_max = 1073741824  # pulls and unpacks run in a child limited to this
+//! default_subnet = "10.89.0.0/24" # the `bridge` network, on default_bridge
+//! network_pool = "10.89.0.0/16"   # user-defined networks get /24s from here
+//! default_bridge = "rustlet0"
+//! nft_table = "rustlet"           # inet rustlet
+//! resolv_conf = "/etc/resolv.conf" # the host's (systemd-resolved's real list replaces its stub)
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -46,6 +51,16 @@ pub struct Config {
     /// containers' overlay mounts don't propagate into other mount
     /// namespaces.
     pub private_containers_mount: bool,
+    /// The default network's subnet; its first address is the bridge's.
+    pub default_subnet: String,
+    /// Where user-defined networks get a subnet when not given one.
+    pub network_pool: String,
+    /// The default network's bridge.
+    pub default_bridge: String,
+    /// The nftables table (`inet <name>`).
+    pub nft_table: String,
+    /// The host's resolver configuration, for containers' `resolv.conf`.
+    pub resolv_conf: PathBuf,
 }
 
 impl Default for Config {
@@ -64,6 +79,11 @@ impl Default for Config {
             worker_pids_max: 256,
             insecure_registries: Vec::new(),
             private_containers_mount: true,
+            default_subnet: "10.89.0.0/24".into(),
+            network_pool: "10.89.0.0/16".into(),
+            default_bridge: "rustlet0".into(),
+            nft_table: rustlet_net::firewall::TABLE.into(),
+            resolv_conf: "/etc/resolv.conf".into(),
         }
     }
 }
@@ -98,6 +118,13 @@ pub struct Paths {
     /// data root.
     pub run_lock: PathBuf,
     pub data_lock: PathBuf,
+    /// Network namespace pins (`<run>/netns/<id>`).
+    pub netns: PathBuf,
+    /// `<data>/volumes/<name>/_data`.
+    pub volumes: PathBuf,
+    /// The host sysctls' values from before Rustlets changed them, for
+    /// `scripts/cleanup.sh`.
+    pub sysctl_record: PathBuf,
 }
 
 impl Paths {
@@ -111,7 +138,15 @@ impl Paths {
             db: config.data_root.join("state.db"),
             run_lock: config.run_root.join("rustletd.lock"),
             data_lock: config.data_root.join("rustletd.lock"),
+            netns: config.run_root.join("netns"),
+            volumes: config.data_root.join("volumes"),
+            sysctl_record: config.run_root.join("host-sysctl.orig"),
         }
+    }
+
+    /// The pin of a container's network namespace.
+    pub fn netns_pin(&self, id: &str) -> PathBuf {
+        self.netns.join(id)
     }
 
     /// `containers/<id>`: rootfs, upper, work, config.json, logs.
@@ -144,6 +179,9 @@ mod tests {
         let p = Paths::new(&c);
         assert_eq!(p.runtime_root, Path::new("/run/rustlet/runtime"));
         assert_eq!(p.container_log("abc"), Path::new("/var/lib/rustlet/containers/abc/container.log"));
+        assert_eq!(p.netns_pin("abc"), Path::new("/run/rustlet/netns/abc"));
+        assert_eq!(p.sysctl_record, Path::new("/run/rustlet/host-sysctl.orig"), "where cleanup.sh reads it");
+        assert_eq!(c.default_bridge, "rustlet0");
     }
 
     #[test]

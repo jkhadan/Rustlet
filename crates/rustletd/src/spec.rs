@@ -13,20 +13,27 @@
 //! | `--security-opt no-new-privileges[=bool]` | `process.noNewPrivileges` (Rustlets defaults to true) |
 //! | `--device HOST[:CONTAINER[:rwm]]` | a node and an allow rule (`rustlet_runtime::spec::add_host_device`) |
 //! | `--privileged` | `rustlet_runtime::spec::privileged` |
+//! | `--network` | the `network` namespace: the run's pin or the shared container's (`path`), or none at all (`host`) |
+//! | `-v`, `--mount`, `--tmpfs` | binds of volumes' `_data` (idmapped under `--userns=remap`) and host paths, tmpfs mounts |
+//! | (always) | binds of the generated `/etc/hosts`, `/etc/hostname`, `/etc/resolv.conf`, unless a mount covers them |
 //!
 //! Every container gets `linux.cgroupsPath`, so every container has a device
-//! filter (and `CAP_MKNOD` is allowed by the runtime).
+//! filter (and `CAP_MKNOD` is allowed by the runtime). Mounts are sorted by
+//! depth, so `/data` is mounted before `/data/cache`; a mount on a default
+//! destination (`/dev/shm`) replaces the default.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use rustlet_image::Image;
 use rustlet_image::runspec::{self, RunOptions};
 use rustlet_runtime::caps;
 use rustlet_runtime::oci_spec::runtime::{
-    LinuxCapabilitiesBuilder, LinuxCpuBuilder, LinuxMemoryBuilder, LinuxPidsBuilder, LinuxResources, Spec,
+    LinuxCapabilitiesBuilder, LinuxCpuBuilder, LinuxMemoryBuilder, LinuxNamespaceBuilder, LinuxNamespaceType,
+    LinuxPidsBuilder, LinuxResources, Mount, MountBuilder, Spec,
 };
 use rustlet_spec::container::{ContainerConfig, UsernsMode};
+use rustlet_spec::volume::{MountSpec, MountType};
 use rustlet_sys::caps::{Cap, CapSet, last_cap};
 
 use crate::error::{ApiError, ApiResult};
@@ -156,9 +163,23 @@ pub fn image_stop_signal(image: &Image) -> Option<String> {
     parse_signal(&s).ok().map(|_| s)
 }
 
+/// What a start adds to the spec besides the container's options.
+#[derive(Debug, Clone, Default)]
+pub struct RunPlan {
+    pub hostname: String,
+    /// The network namespace to join; `None`: the host's.
+    pub netns: Option<PathBuf>,
+    /// `(destination, host file)`: the generated `/etc` files.
+    pub etc_files: Vec<(String, PathBuf)>,
+    /// The recorded mounts, and where volumes keep their data.
+    pub mounts: Vec<MountSpec>,
+    pub volumes: PathBuf,
+}
+
 /// The full spec for a start of the container `id`, whose rootfs is mounted
 /// at `rootfs`.
-pub fn build(image: &Image, rootfs: &Path, c: &ContainerConfig, hostname: &str, cgroups_path: &str) -> ApiResult<Spec> {
+pub fn build(image: &Image, rootfs: &Path, c: &ContainerConfig, plan: &RunPlan, cgroups_path: &str) -> ApiResult<Spec> {
+    let hostname = plan.hostname.as_str();
     let checked = check(c)?;
     let options = RunOptions {
         args: c.cmd.clone(),
@@ -207,7 +228,118 @@ pub fn build(image: &Image, rootfs: &Path, c: &ContainerConfig, hostname: &str, 
         rustlet_runtime::spec::add_host_device(&mut spec, Path::new(host), Path::new(container), access)
             .map_err(|e| ApiError::invalid(format!("--device {host}: {e}")))?;
     }
+    set_network_namespace(&mut spec, plan.netns.as_deref());
+    add_mounts(&mut spec, plan, c.userns == UsernsMode::Remap)?;
     Ok(spec)
+}
+
+/// Joins `netns`, or, for `None`, shares the runtime's (the host's).
+fn set_network_namespace(spec: &mut Spec, netns: Option<&Path>) {
+    let linux = spec.linux_mut().get_or_insert_with(Default::default);
+    let mut namespaces: Vec<_> = linux
+        .namespaces()
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| n.typ() != LinuxNamespaceType::Network)
+        .collect();
+    if let Some(path) = netns {
+        namespaces.push(
+            LinuxNamespaceBuilder::default()
+                .typ(LinuxNamespaceType::Network)
+                .path(path)
+                .build()
+                .expect("static namespace"),
+        );
+    }
+    linux.set_namespaces(Some(namespaces));
+}
+
+/// The user's mounts and the generated `/etc` files, depth first, replacing
+/// any default mount at the same destination.
+fn add_mounts(spec: &mut Spec, plan: &RunPlan, remap: bool) -> ApiResult<()> {
+    let mut ours: Vec<Mount> = Vec::new();
+    for m in &plan.mounts {
+        ours.push(oci_mount(m, &plan.volumes, remap)?);
+    }
+    for (dest, file) in &plan.etc_files {
+        if plan.mounts.iter().any(|m| &m.target == dest) {
+            continue;
+        }
+        ours.push(bind(file, dest, &["rbind", "rprivate"])?);
+    }
+    // Stable: equal depths keep their order.
+    ours.sort_by_key(|m| m.destination().components().count());
+    let mut mounts: Vec<Mount> = spec
+        .mounts()
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| !ours.iter().any(|m| m.destination() == d.destination()))
+        .collect();
+    mounts.extend(ours);
+    spec.set_mounts(Some(mounts));
+    Ok(())
+}
+
+fn bind(source: &Path, dest: &str, options: &[&str]) -> ApiResult<Mount> {
+    MountBuilder::default()
+        .destination(dest)
+        .typ("bind")
+        .source(source)
+        .options(options.iter().map(|o| o.to_string()).collect::<Vec<_>>())
+        .build()
+        .map_err(|e| ApiError::internal(format!("mount {dest}: {e}")))
+}
+
+/// One recorded mount as the runtime takes it.
+fn oci_mount(m: &MountSpec, volumes: &Path, remap: bool) -> ApiResult<Mount> {
+    let rw = if m.read_only { "ro" } else { "rw" };
+    match m.kind {
+        MountType::Volume => {
+            let name = m
+                .source
+                .as_deref()
+                .ok_or_else(|| ApiError::internal(format!("the volume on {} has no name", m.target)))?;
+            let mut options = vec!["rbind", "rprivate", rw];
+            if remap {
+                options.push("idmap");
+            }
+            bind(&volumes.join(name).join("_data"), &m.target, &options)
+        }
+        MountType::Bind => {
+            let source = m
+                .source
+                .as_deref()
+                .ok_or_else(|| ApiError::internal(format!("the bind on {} has no source", m.target)))?;
+            let mut options = vec!["rbind", "rprivate", rw];
+            if remap && m.idmap {
+                options.push("idmap");
+            }
+            bind(Path::new(source), &m.target, &options)
+        }
+        MountType::Tmpfs => {
+            let mut options: Vec<String> = ["nosuid", "nodev", "noexec"].map(String::from).to_vec();
+            if m.read_only {
+                options.push("ro".into());
+            }
+            // The runtime takes the last word of each pair.
+            options.extend(m.tmpfs_options.iter().cloned());
+            if let Some(size) = m.tmpfs_size {
+                options.push(format!("size={size}"));
+            }
+            if let Some(mode) = m.tmpfs_mode {
+                options.push(format!("mode={mode:o}"));
+            }
+            MountBuilder::default()
+                .destination(&m.target)
+                .typ("tmpfs")
+                .source("tmpfs")
+                .options(options)
+                .build()
+                .map_err(|e| ApiError::internal(format!("mount {}: {e}", m.target)))
+        }
+    }
 }
 
 fn resources(c: &ContainerConfig) -> ApiResult<LinuxResources> {
@@ -304,6 +436,90 @@ mod tests {
         assert_eq!(parse_signal("sigkill").unwrap(), 9);
         assert_eq!(parse_signal("2").unwrap(), 2);
         assert!(parse_signal("999").is_err() && parse_signal("WHAT").is_err());
+    }
+
+    #[test]
+    fn mounts_and_the_network_namespace() {
+        let mut spec = rustlet_runtime::spec::default_spec();
+        let plan = RunPlan {
+            hostname: "web".into(),
+            netns: Some("/run/rustlet/netns/abc".into()),
+            etc_files: vec![
+                ("/etc/hosts".into(), "/c/hosts".into()),
+                ("/etc/resolv.conf".into(), "/c/resolv.conf".into()),
+            ],
+            mounts: vec![
+                MountSpec {
+                    kind: MountType::Volume,
+                    source: Some("cache".into()),
+                    target: "/data/cache".into(),
+                    ..Default::default()
+                },
+                MountSpec {
+                    kind: MountType::Bind,
+                    source: Some("/srv".into()),
+                    target: "/data".into(),
+                    read_only: true,
+                    ..Default::default()
+                },
+                MountSpec {
+                    kind: MountType::Tmpfs,
+                    target: "/dev/shm".into(),
+                    tmpfs_size: Some(1 << 20),
+                    tmpfs_options: vec!["exec".into()],
+                    ..Default::default()
+                },
+                MountSpec {
+                    kind: MountType::Bind,
+                    source: Some("/my/resolv".into()),
+                    target: "/etc/resolv.conf".into(),
+                    ..Default::default()
+                },
+            ],
+            volumes: "/var/lib/rustlet/volumes".into(),
+        };
+        set_network_namespace(&mut spec, plan.netns.as_deref());
+        add_mounts(&mut spec, &plan, true).unwrap();
+        let net: Vec<_> = spec
+            .linux()
+            .as_ref()
+            .unwrap()
+            .namespaces()
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|n| n.typ() == LinuxNamespaceType::Network)
+            .collect();
+        assert_eq!(net.len(), 1);
+        assert_eq!(net[0].path().as_deref(), Some(Path::new("/run/rustlet/netns/abc")));
+        let mounts = spec.mounts().as_ref().unwrap();
+        let dests: Vec<_> = mounts.iter().map(|m| m.destination().display().to_string()).collect();
+        // One /dev/shm (ours), the user's resolv.conf instead of ours, depth order.
+        assert_eq!(dests.iter().filter(|d| *d == "/dev/shm").count(), 1);
+        let pos = |d: &str| dests.iter().position(|x| x == d).unwrap();
+        assert!(pos("/data") < pos("/data/cache"));
+        let resolv = &mounts[pos("/etc/resolv.conf")];
+        assert_eq!(resolv.source().as_deref(), Some(Path::new("/my/resolv")));
+        let cache = &mounts[pos("/data/cache")];
+        assert_eq!(cache.source().as_deref(), Some(Path::new("/var/lib/rustlet/volumes/cache/_data")));
+        assert!(cache.options().as_ref().unwrap().contains(&"idmap".to_owned()), "volumes are idmapped under remap");
+        assert!(mounts[pos("/data")].options().as_ref().unwrap().contains(&"ro".to_owned()));
+        assert!(!mounts[pos("/data")].options().as_ref().unwrap().contains(&"idmap".to_owned()));
+        let shm = mounts[pos("/dev/shm")].options().as_ref().unwrap().join(",");
+        assert_eq!(shm, "nosuid,nodev,noexec,exec,size=1048576");
+        // The host's namespace: no network entry at all.
+        set_network_namespace(&mut spec, None);
+        assert!(
+            !spec
+                .linux()
+                .as_ref()
+                .unwrap()
+                .namespaces()
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|n| n.typ() == LinuxNamespaceType::Network)
+        );
     }
 
     #[test]

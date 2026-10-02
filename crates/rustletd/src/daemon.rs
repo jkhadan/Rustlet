@@ -8,9 +8,13 @@
 //!   3. containers/ becomes a private bind mount of itself
 //!   4. the cgroup parent (ours, minus /daemon, as DelegateSubgroup=daemon
 //!      sets it up), and its shims/ and workers/ cgroups
-//!   5. state.db, then every container in it, reconciled with what is still
-//!      running (the shims that outlived the last daemon)
-//!   6. the API socket; READY=1 to systemd
+//!   5. state.db: the networks (the default one added if missing) and every
+//!      container; the network resources the database says runs hold
+//!   6. the host's network: the netns pin directory, the bridges, the
+//!      firewall, then IP forwarding
+//!   7. every container reconciled with what is still running (the shims
+//!      that outlived the last daemon); the firewall again
+//!   8. the API socket; READY=1 to systemd
 //! ```
 
 use std::collections::BTreeMap;
@@ -30,6 +34,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::events::EventBus;
 use crate::exec::ExecSession;
 use crate::images::{Images, WorkerConfig};
+use crate::network::Networks;
 
 pub struct Daemon {
     pub config: Config,
@@ -37,7 +42,10 @@ pub struct Daemon {
     pub db: Db,
     pub events: EventBus,
     pub images: Images,
+    pub networks: Networks,
     pub containers: RwLock<BTreeMap<String, Arc<Container>>>,
+    /// One copy-up at a time per volume.
+    pub volume_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub execs: Mutex<BTreeMap<String, Arc<ExecSession>>>,
     pub cgroup_parent: String,
     pub runtime: PathBuf,
@@ -47,7 +55,7 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Steps 1–5.
+    /// Steps 1–7.
     pub async fn open(config: Config) -> anyhow::Result<Arc<Daemon>> {
         let paths = Paths::new(&config);
         make_dir(&paths.run_root, 0o711)?;
@@ -57,6 +65,7 @@ impl Daemon {
         let store =
             Store::open(&paths.data_root).with_context(|| format!("open the store {}", paths.data_root.display()))?;
         let data_lock = lock_file(&paths.data_lock)?;
+        make_dir(&paths.volumes, 0o700)?;
         if config.private_containers_mount {
             private_mount(&paths.containers)?;
         }
@@ -94,23 +103,32 @@ impl Daemon {
                 insecure_registries: config.insecure_registries.clone(),
             },
         );
+        let networks = Networks::new(&config, &paths)?;
+        networks.load(&db)?;
         let mut containers = BTreeMap::new();
         for (record, persisted) in db.all()? {
+            if let Some(run) = &persisted.network {
+                networks.restore(&record.id, &record.name, run);
+            }
             containers.insert(record.id.clone(), Arc::new(Container::new(record, persisted)));
         }
+        let netns_dir = paths.netns.clone();
         let daemon = Arc::new(Daemon {
             config,
             paths,
             db,
             events: EventBus::default(),
             images,
+            networks,
             containers: RwLock::new(containers),
+            volume_locks: Mutex::new(BTreeMap::new()),
             execs: Mutex::new(BTreeMap::new()),
             cgroup_parent,
             runtime,
             shim,
             _locks: [run_lock, data_lock],
         });
+        daemon.networks.setup_host(netns_dir).await?;
         daemon.reconcile().await;
         Ok(daemon)
     }

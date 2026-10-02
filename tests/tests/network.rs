@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use rustlet_itests::net::{PinDir, TestLan, TestNetns, fetch, is_mounted, serve};
-use rustlet_itests::{PRIVILEGED, assert_host_mounts_unchanged, host_mounts};
+use rustlet_itests::{PRIVILEGED, host_mounts};
 use rustlet_net::firewall::{NetworkRules, PortRule, Ruleset, dns_redirect, run_nft};
 use rustlet_net::{ipam, link, netns, sysctl};
 use rustlet_sys::netlink::RtNetlink;
@@ -26,9 +26,10 @@ const C1: Ipv4Addr = Ipv4Addr::new(10, 89, 0, 2);
 #[ignore = "needs root: run with `cargo xtask itest`"]
 fn net_a_pinned_namespace_outlives_its_thread_and_unpins() {
     let _ = PRIVILEGED;
-    let before = host_mounts();
+    let path;
     {
         let dir = PinDir::new("pin");
+        path = dir.path.clone();
         assert!(is_mounted(&dir.path), "the pin directory is a mount point");
         let pin = dir.pin("c1");
         netns::create(&pin, || {
@@ -56,7 +57,9 @@ fn net_a_pinned_namespace_outlives_its_thread_and_unpins() {
         assert!(netns::create(&failed, || Err(rustlet_net::Error::Invalid("no".into()))).is_err());
         assert!(!failed.exists());
     }
-    assert_host_mounts_unchanged(&before, &host_mounts());
+    // (The other tests here run alongside, with pins of their own.)
+    let ours: Vec<_> = host_mounts().into_iter().filter(|(mp, _, _)| Path::new(mp).starts_with(&path)).collect();
+    assert!(ours.is_empty(), "left mounted: {ours:?}");
 }
 
 /// The whole path of a published port and the guards around it, against a

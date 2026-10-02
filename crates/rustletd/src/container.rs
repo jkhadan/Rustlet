@@ -20,6 +20,8 @@ use rustlet_shim::client::ShimStream;
 use rustlet_spec::container::{
     ContainerInspect, ContainerState, ContainerStatus, ContainerSummary, RestartPolicy, RestartPolicyName,
 };
+use rustlet_spec::network::NetworkSettings;
+use rustlet_spec::volume::MountPoint;
 use tokio::sync::{oneshot, watch};
 
 use crate::db::{Db, Persisted, Record};
@@ -137,7 +139,7 @@ impl Container {
             created: r.created.clone(),
             state: self.persisted().state,
             labels: r.config.labels.clone(),
-            ports: Vec::new(),
+            ports: self.persisted().network.map(|n| n.ports).unwrap_or_default(),
         }
     }
 
@@ -146,10 +148,29 @@ impl Container {
         self.persisted().cgroup.unwrap_or_else(|| cgroup_path(cgroup_parent, self.id()))
     }
 
-    pub fn inspect(&self, paths: &crate::config::Paths, cgroup_parent: &str) -> ContainerInspect {
+    pub fn inspect(
+        &self,
+        paths: &crate::config::Paths,
+        cgroup_parent: &str,
+        mounts: Vec<MountPoint>,
+    ) -> ContainerInspect {
         let r = &self.record;
         let cgroup = self.cgroup(cgroup_parent);
-        let state = self.persisted().state;
+        let persisted = self.persisted();
+        let state = persisted.state;
+        let run = persisted.network.unwrap_or_default();
+        let network = NetworkSettings {
+            mode: r.config.network.clone(),
+            network: run.network_name.clone().or_else(|| r.config.network.network_name().map(str::to_owned)),
+            network_id: run.network_id.clone(),
+            ip_address: run.ip.map(|ip| ip.to_string()),
+            ip_prefix_len: run.prefix_len,
+            gateway: run.gateway.map(|g| g.to_string()),
+            mac_address: run.mac.clone(),
+            dns_names: run.dns_names.clone(),
+            sandbox: run.netns.as_ref().map(|p| p.display().to_string()),
+            ports: run.ports.clone(),
+        };
         let dir = paths.container_dir(&r.id);
         ContainerInspect {
             id: r.id.clone(),
@@ -167,8 +188,8 @@ impl Container {
             cgroup,
             uid_map: (r.config.userns == rustlet_spec::container::UsernsMode::Remap)
                 .then(|| format!("0 {} {}", rustlet_runtime::spec::REMAP_HOST_ID, rustlet_runtime::spec::REMAP_SIZE)),
-            network: Default::default(),
-            mounts: Vec::new(),
+            network,
+            mounts,
         }
     }
 }

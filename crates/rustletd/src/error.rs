@@ -32,6 +32,12 @@ impl ApiError {
     pub fn no_such_image(name: &str) -> ApiError {
         ApiError::new(ErrorKind::NoSuchImage, format!("no such image: {name}"))
     }
+    pub fn no_such_network(name: &str) -> ApiError {
+        ApiError::new(ErrorKind::NoSuchNetwork, format!("no such network: {name}"))
+    }
+    pub fn no_such_volume(name: &str) -> ApiError {
+        ApiError::new(ErrorKind::NoSuchVolume, format!("no such volume: {name}"))
+    }
 
     /// A failure of `rustlet-runc` with its exit status: 127 and 126 keep
     /// their shell meaning.
@@ -86,6 +92,16 @@ impl From<rustlet_image::Error> for ApiError {
 impl From<rustlet_runtime::Error> for ApiError {
     fn from(e: rustlet_runtime::Error) -> ApiError {
         ApiError::internal(e.to_string())
+    }
+}
+
+impl From<rustlet_net::Error> for ApiError {
+    fn from(e: rustlet_net::Error) -> ApiError {
+        match (&e, e.errno()) {
+            (rustlet_net::Error::Invalid(_), _) => ApiError::invalid(e.to_string()),
+            (_, Some(rustlet_sys::Errno::EADDRINUSE)) => ApiError::conflict(e.to_string()),
+            _ => ApiError::internal(e.to_string()),
+        }
     }
 }
 

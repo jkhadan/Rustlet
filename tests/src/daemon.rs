@@ -1,7 +1,11 @@
 //! A `rustletd` of a test's own: its own socket, data root (a temp dir),
-//! run root (under /run/rustlet, so `scripts/cleanup.sh` sweeps it) and
-//! cgroup parent (inside the itest scope). Dropping it kills everything the
-//! daemon started, unmounts what it mounted and removes its directories.
+//! run root (under /run/rustlet, so `scripts/cleanup.sh` sweeps it), cgroup
+//! parent (inside the itest scope) and network: it runs in a "host" network
+//! namespace of its own, beside a "LAN" one (`crate::net::TestLan`), so its
+//! bridges, firewall table and `ip_forward` never touch the real host's.
+//! Its containers' resolver is the LAN machine, 192.0.2.1. Dropping it
+//! kills everything the daemon started, unmounts what it mounted and
+//! removes its directories.
 
 use std::fs::OpenOptions;
 use std::path::PathBuf;
@@ -14,6 +18,7 @@ use rustlet_image::Store;
 use rustlet_image::import::{config, import};
 
 use crate::images::alpine_layer;
+use crate::net::TestLan;
 use crate::{itest_scope, workspace_binary};
 
 pub struct TestDaemon {
@@ -21,6 +26,9 @@ pub struct TestDaemon {
     pub run: PathBuf,
     pub socket: PathBuf,
     pub cgroup_parent: String,
+    /// The daemon's "host" network namespace and the LAN beside it.
+    pub net: TestLan,
+    config: PathBuf,
     log: PathBuf,
     child: Option<Child>,
     _dir: tempfile::TempDir,
@@ -36,11 +44,17 @@ impl TestDaemon {
         let run = PathBuf::from(format!("/run/rustlet/itest-{}-d{n}", std::process::id()));
         let cgroup_parent = format!("{scope}/d{n}");
         std::fs::create_dir(format!("/sys/fs/cgroup{cgroup_parent}")).unwrap();
+        let resolv = dir.path().join("resolv.conf");
+        std::fs::write(&resolv, format!("nameserver {}\nsearch test.lan\n", TestLan::LAN_IP)).unwrap();
+        let config = dir.path().join("daemon.toml");
+        std::fs::write(&config, format!("resolv_conf = {:?}\n", resolv.display().to_string())).unwrap();
         let mut d = TestDaemon {
             data: dir.path().join("data"),
             socket: run.join("rustlet.sock"),
             run,
             cgroup_parent,
+            net: TestLan::new(),
+            config,
             log: dir.path().join("rustletd.log"),
             child: None,
             _dir: dir,
@@ -51,7 +65,9 @@ impl TestDaemon {
 
     fn spawn(&mut self) {
         let log = OpenOptions::new().create(true).append(true).open(&self.log).unwrap();
-        let child = Command::new(workspace_binary("rustletd"))
+        let mut cmd = Command::new(workspace_binary("rustletd"));
+        cmd.arg("--config")
+            .arg(&self.config)
             .arg("--socket")
             .arg(&self.socket)
             .args(["--socket-group", ""])
@@ -62,9 +78,8 @@ impl TestDaemon {
             .args(["--cgroup-parent", &self.cgroup_parent, "--log-level", "debug"])
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
-            .stderr(log)
-            .spawn()
-            .unwrap();
+            .stderr(log);
+        let child = self.net.host.spawn(&mut cmd);
         self.child = Some(child);
         let deadline = Instant::now() + Duration::from_secs(30);
         while std::os::unix::net::UnixStream::connect(&self.socket).is_err() {
@@ -141,6 +156,9 @@ impl Drop for TestDaemon {
             .iter()
             .filter(|m| std::path::Path::new(m) != containers.canonicalize().unwrap_or_default())
             .collect();
+        // The pins of its containers' network namespaces and their shared
+        // directory are mounts under the run root.
+        let _ = rustlet_sys::tree::unmount_under(&self.run);
         let _ = std::fs::remove_dir_all(&self.run);
         remove_cgroups(&cg);
         if !std::thread::panicking() {

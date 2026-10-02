@@ -30,7 +30,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::container::{Container, Shared, cgroup_path, ran_for, should_restart, start_at_boot};
 use crate::daemon::Daemon;
-use crate::db::{Persisted, Record};
+use crate::db::{NetRun, Persisted, Record};
 use crate::error::{ApiError, ApiResult};
 use crate::spec;
 
@@ -90,8 +90,15 @@ impl Daemon {
             };
             (id, name)
         };
-        let hostname =
-            config.hostname.clone().filter(|h| !h.is_empty()).unwrap_or_else(|| rustlet_spec::short_id(&id).to_owned());
+        let network = self.choose_network(&config, &image)?;
+        let hostname = config
+            .hostname
+            .clone()
+            .filter(|h| !h.is_empty())
+            .or(network.hostname)
+            .unwrap_or_else(|| rustlet_spec::short_id(&id).to_owned());
+        let image_volumes = image_config.and_then(|c| c.volumes().clone()).unwrap_or_default();
+        let mounts = self.resolve_mounts(&config, &image_volumes).await?;
         let record = Record {
             id: id.clone(),
             name: name.clone(),
@@ -102,22 +109,31 @@ impl Daemon {
             config,
             stop_signal,
             hostname,
+            network_container: network.container,
+            ports: network.ports,
+            mounts,
         };
         let dir = self.paths.container_dir(&id);
-        blocking(move || ContainerRootfs::create(&dir).map(drop).map_err(ApiError::from)).await?;
         let persisted = Persisted::default();
-        if let Err(e) = self.db.insert(&record, &persisted) {
+        let created = match blocking(move || ContainerRootfs::create(&dir).map(drop).map_err(ApiError::from)).await {
+            Ok(()) => self.db.insert(&record, &persisted),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = created {
             let dir = self.paths.container_dir(&id);
             let _ = blocking(move || {
                 rustlet_sys::tree::safe_remove_tree(&dir).map_err(|e| ApiError::internal(e.to_string()))
             })
             .await;
+            // The anonymous volumes made for it.
+            let c = Container::new(record, persisted);
+            self.remove_anonymous_volumes(&c).await;
             return Err(e);
         }
         let c = Arc::new(Container::new(record, persisted));
         self.containers.write().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), c.clone());
         self.emit(&c, "create", &[]);
-        Ok(CreateResponse { id, name, warnings: Vec::new() })
+        Ok(CreateResponse { id, name, warnings: network.warnings })
     }
 
     // ── start ──────────────────────────────────────────────────────────────
@@ -181,7 +197,7 @@ impl Daemon {
             })
             .await?
         };
-        match self.start_shim(c, &image, &rootfs).await {
+        match self.start_on(c, &image, &rootfs).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.unmount(&dir).await;
@@ -190,12 +206,117 @@ impl Daemon {
         }
     }
 
+    /// The part of a start after the root filesystem is mounted: the
+    /// network (recorded before anything else can fail), the volumes, the
+    /// `/etc` files, then the shim. A failure undoes the network.
+    async fn start_on(
+        self: &Arc<Self>,
+        c: &Arc<Container>,
+        image: &rustlet_image::Image,
+        rootfs: &Path,
+    ) -> ApiResult<()> {
+        let net = self.attach_network(c).await?;
+        if let Err(e) = c.update(&self.db, |s| s.network = Some(net.clone())) {
+            self.detach_network(c, &net).await;
+            return Err(e);
+        }
+        let started = async {
+            self.prepare_volumes(c, rootfs).await?;
+            let plan = self.run_plan(c, &net).await?;
+            self.start_shim(c, image, rootfs, &plan).await
+        }
+        .await;
+        if started.is_err() {
+            self.detach_network(c, &net).await;
+            let _ = c.update(&self.db, |s| s.network = None);
+        }
+        started
+    }
+
+    /// The hostname, namespace and files of this run: for `--network
+    /// container:<x>`, `x`'s; otherwise written now into the container's
+    /// directory.
+    async fn run_plan(&self, c: &Container, net: &NetRun) -> ApiResult<spec::RunPlan> {
+        let r = &c.record;
+        let mut plan = spec::RunPlan {
+            hostname: r.hostname.clone(),
+            netns: net.netns.clone(),
+            etc_files: Vec::new(),
+            mounts: r.mounts.clone(),
+            volumes: self.paths.volumes.clone(),
+        };
+        let files = ["hosts", "hostname", "resolv.conf"];
+        if let Some(target) = &net.joined {
+            let target = self.find(target)?;
+            plan.hostname = target.record.hostname.clone();
+            let dir = self.paths.container_dir(target.id());
+            plan.etc_files = files.iter().map(|f| (format!("/etc/{f}"), dir.join(f))).collect();
+            return Ok(plan);
+        }
+        let mode = &r.config.network;
+        let gateway =
+            net.gateway.or_else(|| self.networks.find(rustlet_spec::network::DEFAULT_NETWORK).ok().map(|n| n.gateway));
+        let extra: Vec<(String, String)> = r
+            .config
+            .extra_hosts
+            .iter()
+            .filter_map(|h| rustlet_spec::network::parse_extra_host(h).ok())
+            .map(|(name, ip)| {
+                let ip = if ip == rustlet_spec::network::HOST_GATEWAY {
+                    gateway.map(|g| g.to_string()).unwrap_or(ip)
+                } else {
+                    ip
+                };
+                (name, ip)
+            })
+            .collect();
+        let hosts = match (mode, net.ip) {
+            (rustlet_spec::network::NetworkMode::Host, _) => rustlet_net::files::host_network_hosts(
+                &std::fs::read_to_string("/etc/hosts").unwrap_or_default(),
+                &extra,
+            ),
+            (_, Some(ip)) => rustlet_net::files::hosts(Some((ip, std::slice::from_ref(&r.hostname))), &extra),
+            (_, None) => rustlet_net::files::hosts(None, &extra),
+        };
+        let resolver = match mode {
+            rustlet_spec::network::NetworkMode::Host => rustlet_net::files::Resolver::Host,
+            rustlet_spec::network::NetworkMode::Network(_) => rustlet_net::files::Resolver::Embedded,
+            _ => rustlet_net::files::Resolver::Direct,
+        };
+        let dns = rustlet_net::files::DnsOptions {
+            servers: r.config.dns.iter().filter_map(|d| d.parse().ok()).collect(),
+            search: r.config.dns_search.clone(),
+            options: r.config.dns_options.clone(),
+        };
+        let resolv = rustlet_net::files::resolv_conf(&self.networks.host_resolv(), &dns, resolver);
+        let dir = self.paths.container_dir(&r.id);
+        let contents = [hosts, format!("{}\n", plan.hostname), resolv];
+        // Container root (host uid 1000000 under --userns=remap) may edit
+        // them, as in Docker.
+        let owner = (r.config.userns == UsernsMode::Remap).then_some(rustlet_runtime::spec::REMAP_HOST_ID);
+        for (name, text) in files.iter().zip(contents) {
+            let path = dir.join(name);
+            std::fs::write(&path, text).map_err(|e| ApiError::internal(format!("write {}: {e}", path.display())))?;
+            if let Some(id) = owner {
+                std::os::unix::fs::chown(&path, Some(id), Some(id))
+                    .map_err(|e| ApiError::internal(format!("chown {}: {e}", path.display())))?;
+            }
+            plan.etc_files.push((format!("/etc/{name}"), path));
+        }
+        Ok(plan)
+    }
+
     /// What a crashed run may have left: runtime state, a cgroup, a shim
     /// directory. The container isn't running (we hold its op lock and it
     /// isn't live), so all of it can go.
     async fn clear_leftovers(&self, c: &Container) {
         let id = c.id().to_owned();
         self.discard_shim(&id).await;
+        if let Some(net) = c.persisted().network {
+            self.detach_network(c, &net).await;
+            let _ = c.update(&self.db, |s| s.network = None);
+        }
+        self.remove_network_leftovers(&id).await;
         if self.paths.runtime_root.join(&id).exists() {
             self.runc_delete(&id).await;
         }
@@ -253,11 +374,12 @@ impl Daemon {
         c: &Arc<Container>,
         image: &rustlet_image::Image,
         rootfs: &Path,
+        plan: &spec::RunPlan,
     ) -> ApiResult<()> {
         let r = &c.record;
         let dir = self.paths.container_dir(&r.id);
         let cgroup = cgroup_path(&self.cgroup_parent, &r.id);
-        let spec = spec::build(image, rootfs, &r.config, &r.hostname, &cgroup)?;
+        let spec = spec::build(image, rootfs, &r.config, plan, &cgroup)?;
         std::fs::write(dir.join("config.json"), rustlet_runtime::spec::to_pretty_json(&spec))?;
         let paths = self.paths.shim(&r.id);
         std::fs::DirBuilder::new()
@@ -401,9 +523,13 @@ impl Daemon {
         let _ = shim::call(&socket, &Request::Shutdown).await;
         let _ = std::fs::remove_dir_all(self.paths.shim(&id).dir());
         let unmounted = self.unmount(&self.paths.container_dir(&id)).await;
+        if let Some(net) = c.persisted().network {
+            self.detach_network(c, &net).await;
+        }
         let error = error.or_else(|| (!unmounted).then(|| "the root filesystem could not be unmounted".to_owned()));
         tracing::info!(%id, code = exit.code, oom = exit.oom_killed, "container exited");
         c.finish_run(&self.db, |s| {
+            s.network = None;
             s.state.status = if unmounted { ContainerStatus::Exited } else { ContainerStatus::Dead };
             s.state.pid = None;
             s.state.exit_code = Some(exit.code);
@@ -442,7 +568,7 @@ impl Daemon {
             return;
         }
         if c.record.config.auto_remove {
-            if let Err(e) = self.remove_locked(c, false).await {
+            if let Err(e) = self.remove_locked(c, false, true).await {
                 tracing::warn!(id = %c.id(), "--rm: {e}");
             }
             return;
@@ -574,12 +700,13 @@ impl Daemon {
 
     // ── rm and wait ────────────────────────────────────────────────────────
 
-    pub async fn remove(self: &Arc<Self>, c: &Arc<Container>, force: bool) -> ApiResult<()> {
+    /// `volumes`: its anonymous volumes go too (`rm -v`; `--rm` always).
+    pub async fn remove(self: &Arc<Self>, c: &Arc<Container>, force: bool, volumes: bool) -> ApiResult<()> {
         let _op = c.op.lock().await;
-        self.remove_locked(c, force).await
+        self.remove_locked(c, force, volumes).await
     }
 
-    async fn remove_locked(self: &Arc<Self>, c: &Arc<Container>, force: bool) -> ApiResult<()> {
+    async fn remove_locked(self: &Arc<Self>, c: &Arc<Container>, force: bool, volumes: bool) -> ApiResult<()> {
         match c.status() {
             ContainerStatus::Running | ContainerStatus::Paused => {
                 if !force {
@@ -615,6 +742,9 @@ impl Daemon {
         }
         self.db.remove(c.id())?;
         self.containers.write().unwrap_or_else(|e| e.into_inner()).remove(c.id());
+        if volumes || c.record.config.auto_remove {
+            self.remove_anonymous_volumes(c).await;
+        }
         c.mark_removed();
         self.emit(c, "destroy", &[]);
         self.collect_orphaned_image(&c.record.image_id);
@@ -685,6 +815,9 @@ impl Daemon {
             match shim {
                 Some(st) if matches!(st.state, ShimState::Running | ShimState::Paused) => {
                     self.take_over(&c, &st, socket);
+                    if let Some(net) = c.persisted().network {
+                        self.resume_network(&c, &net).await;
+                    }
                     continue;
                 }
                 Some(st) if st.state == ShimState::Exited => {
@@ -714,10 +847,15 @@ impl Daemon {
                 ContainerStatus::Restarting => self.schedule_restart(&c, Duration::ZERO),
                 ContainerStatus::Removing => {
                     let d = self.clone();
-                    let _ = d.remove(&c, true).await;
+                    let _ = d.remove(&c, true, c.record.config.auto_remove).await;
                 }
                 ContainerStatus::Created | ContainerStatus::Exited | ContainerStatus::Dead => {
                     self.unmount(&self.paths.container_dir(&id)).await;
+                    // A start that never got to run its container.
+                    if let Some(net) = c.persisted().network {
+                        self.detach_network(&c, &net).await;
+                        let _ = c.update(&self.db, |s| s.network = None);
+                    }
                     if start_at_boot(&c.record.config.restart, &c.persisted()) {
                         let _op = c.op.lock().await;
                         // Running again: its next exit is the policy's to judge.
@@ -730,6 +868,10 @@ impl Daemon {
                 // Handled above.
                 ContainerStatus::Running | ContainerStatus::Paused => {}
             }
+        }
+        // The ports of the runs that ended meanwhile are gone from it now.
+        if let Err(e) = self.networks.apply_firewall().await {
+            tracing::warn!("{e}");
         }
     }
 

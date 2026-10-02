@@ -19,9 +19,11 @@ use rustlet_spec::event::{EventKind, EventsQuery};
 use rustlet_spec::exec::ExecConfig;
 use rustlet_spec::image::{ImageDeleteQuery, ImageQuery, PullEvent, PullQuery};
 use rustlet_spec::logs::LogsQuery;
+use rustlet_spec::network::{Network, NetworkCreate, NetworkCreateResponse, PruneResponse};
 use rustlet_spec::routes::{action, pattern};
 use rustlet_spec::stats::StatsQuery;
 use rustlet_spec::system::{Info, Version};
+use rustlet_spec::volume::{Volume, VolumeCreate, VolumePruneQuery, VolumeRemoveQuery};
 use rustlet_spec::{NDJSON, StreamError};
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -58,6 +60,12 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
         .route(pattern::IMAGES, get(images).delete(image_remove))
         .route(pattern::IMAGE_PULL, post(image_pull))
         .route(pattern::IMAGE_INSPECT, get(image_inspect))
+        .route(pattern::NETWORKS, get(networks).post(network_create))
+        .route(pattern::NETWORK_PRUNE, post(network_prune))
+        .route(pattern::NETWORK, get(network_inspect).delete(network_remove))
+        .route(pattern::VOLUMES, get(volumes).post(volume_create))
+        .route(pattern::VOLUME_PRUNE, post(volume_prune))
+        .route(pattern::VOLUME, get(volume_inspect).delete(volume_remove))
         .with_state(daemon)
 }
 
@@ -108,8 +116,8 @@ async fn info(State(d): D) -> ApiResult<Json<Info>> {
         paused,
         stopped,
         images,
-        networks: 0,
-        volumes: 0,
+        networks: d.networks.count(),
+        volumes: d.db.volumes()?.len(),
         data_root: d.paths.data_root.display().to_string(),
         run_root: d.paths.run_root.display().to_string(),
         cgroup_parent: d.cgroup_parent.clone(),
@@ -175,12 +183,12 @@ async fn create(State(d): D, Json(config): Json<ContainerConfig>) -> ApiResult<R
 
 async fn inspect(State(d): D, Path(id): Path<String>) -> ApiResult<Json<rustlet_spec::container::ContainerInspect>> {
     let c = d.find(&id)?;
-    Ok(Json(c.inspect(&d.paths, &d.cgroup_parent)))
+    Ok(Json(c.inspect(&d.paths, &d.cgroup_parent, d.mount_points(&c))))
 }
 
 async fn remove(State(d): D, Path(id): Path<String>, Query(q): Query<RemoveQuery>) -> ApiResult<Response> {
     let c = d.find(&id)?;
-    to_the_end(async move { d.remove(&c, q.force).await }).await?;
+    to_the_end(async move { d.remove(&c, q.force, q.volumes).await }).await?;
     Ok(no_content())
 }
 
@@ -377,4 +385,63 @@ async fn image_remove(
         d.events.emit(EventKind::Image, "delete", gone, Default::default());
     }
     Ok(Json(r))
+}
+
+// ── networks ───────────────────────────────────────────────────────────────
+
+async fn networks(State(d): D) -> Json<Vec<Network>> {
+    Json(d.networks.records().iter().map(|n| d.networks.describe(n)).collect())
+}
+
+async fn network_create(State(d): D, Json(req): Json<NetworkCreate>) -> ApiResult<Response> {
+    let n = to_the_end(async move { d.create_network(req).await }).await?;
+    Ok((StatusCode::CREATED, Json(NetworkCreateResponse { id: n.id, name: n.name })).into_response())
+}
+
+async fn network_inspect(State(d): D, Path(id): Path<String>) -> ApiResult<Json<Network>> {
+    let n = d.networks.find(&id)?;
+    Ok(Json(d.networks.describe(&n)))
+}
+
+async fn network_remove(State(d): D, Path(id): Path<String>) -> ApiResult<Response> {
+    to_the_end(async move { d.remove_network(&id).await }).await?;
+    Ok(no_content())
+}
+
+async fn network_prune(State(d): D) -> ApiResult<Json<PruneResponse>> {
+    Ok(Json(to_the_end(async move { d.prune_networks().await }).await?))
+}
+
+// ── volumes ────────────────────────────────────────────────────────────────
+
+async fn volumes(State(d): D) -> ApiResult<Json<Vec<Volume>>> {
+    let users = d.volume_users();
+    Ok(Json(
+        d.db.volumes()?.iter().map(|v| d.describe_volume(v, users.get(&v.name).cloned().unwrap_or_default())).collect(),
+    ))
+}
+
+async fn volume_create(State(d): D, Json(req): Json<VolumeCreate>) -> ApiResult<Response> {
+    let (v, _) = d.create_volume(req.name, req.labels)?;
+    let users = d.volume_users().remove(&v.name).unwrap_or_default();
+    Ok((StatusCode::CREATED, Json(d.describe_volume(&v, users))).into_response())
+}
+
+async fn volume_inspect(State(d): D, Path(name): Path<String>) -> ApiResult<Json<Volume>> {
+    let v = d.find_volume(&name)?;
+    let users = d.volume_users().remove(&v.name).unwrap_or_default();
+    Ok(Json(d.describe_volume(&v, users)))
+}
+
+async fn volume_remove(
+    State(d): D,
+    Path(name): Path<String>,
+    Query(q): Query<VolumeRemoveQuery>,
+) -> ApiResult<Response> {
+    to_the_end(async move { d.remove_volume(&name, q.force).await }).await?;
+    Ok(no_content())
+}
+
+async fn volume_prune(State(d): D, Query(q): Query<VolumePruneQuery>) -> ApiResult<Json<PruneResponse>> {
+    Ok(Json(to_the_end(async move { d.prune_volumes(q.all).await }).await?))
 }
