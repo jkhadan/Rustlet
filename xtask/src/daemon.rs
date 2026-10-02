@@ -5,8 +5,8 @@
 //!  install    as you:  cargo build [--release] rustletd rustlet-shim rustlet-runc rustlet
 //!             as root: copy them to /usr/local/bin (root:root 0755),
 //!                      packaging/rustletd.service → /etc/systemd/system,
-//!                      packaging/networkmanager-rustlet.conf →
-//!                      /etc/NetworkManager/conf.d/rustlet.conf (if NetworkManager
+//!                      packaging/networkmanager-zz-rustlet.conf →
+//!                      /etc/NetworkManager/conf.d/zz-rustlet.conf (if NetworkManager
 //!                      is there; it then leaves rustlet*, rlb* and rlv* links alone),
 //!                      systemctl daemon-reload, then restart rustletd
 //!                      (and `enable` it with --enable)
@@ -32,7 +32,9 @@ const BINARIES: [&str; 4] = ["rustletd", "rustlet-shim", "rustlet-runc", "rustle
 const BIN_DIR: &str = "/usr/local/bin";
 const UNIT: &str = "/etc/systemd/system/rustletd.service";
 const NM_DIR: &str = "/etc/NetworkManager/conf.d";
-const NM_DROP_IN: &str = "/etc/NetworkManager/conf.d/rustlet.conf";
+const NM_DROP_IN: &str = "/etc/NetworkManager/conf.d/zz-rustlet.conf";
+/// The drop-in's first name, which sorted before Ubuntu's own and lost to it.
+const NM_DROP_IN_OLD: &str = "/etc/NetworkManager/conf.d/rustlet.conf";
 
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum DaemonTask {
@@ -105,7 +107,12 @@ pub(crate) fn run_as_root(task: &DaemonTask) -> anyhow::Result<()> {
             write_file(Path::new(UNIT), unit.as_bytes(), 0o644)?;
             println!("installed  {} and {UNIT}", BINARIES.map(|b| format!("{BIN_DIR}/{b}")).join(", "));
             if Path::new(NM_DIR).is_dir() {
-                install_file(&workspace().join("packaging/networkmanager-rustlet.conf"), Path::new(NM_DROP_IN), 0o644)?;
+                install_file(
+                    &workspace().join("packaging/networkmanager-zz-rustlet.conf"),
+                    Path::new(NM_DROP_IN),
+                    0o644,
+                )?;
+                let _ = std::fs::remove_file(NM_DROP_IN_OLD);
                 reload_network_manager();
                 println!("installed  {NM_DROP_IN} (NetworkManager leaves Rustlets' links alone)");
             }
@@ -119,7 +126,7 @@ pub(crate) fn run_as_root(task: &DaemonTask) -> anyhow::Result<()> {
         }
         DaemonTask::Uninstall => {
             let _ = systemctl(&["disable", "--now", "rustletd"]);
-            let files = [PathBuf::from(UNIT), PathBuf::from(NM_DROP_IN)];
+            let files = [PathBuf::from(UNIT), PathBuf::from(NM_DROP_IN), PathBuf::from(NM_DROP_IN_OLD)];
             for p in files.into_iter().chain(BINARIES.iter().map(|b| Path::new(BIN_DIR).join(b))) {
                 match std::fs::remove_file(&p) {
                     Ok(()) => println!("removed    {}", p.display()),

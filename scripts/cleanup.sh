@@ -131,7 +131,9 @@ if [ "$PURGE" = 1 ]; then
   else
     [ -d "$DATA" ] && run rm -rf --one-file-system "$DATA"
   fi
-  [ -f /etc/NetworkManager/conf.d/rustlet.conf ] && run rm -f /etc/NetworkManager/conf.d/rustlet.conf
+  for f in /etc/NetworkManager/conf.d/zz-rustlet.conf /etc/NetworkManager/conf.d/rustlet.conf; do
+    [ -f "$f" ] && run rm -f "$f"
+  done
 fi
 
 say "leftover check"
