@@ -27,14 +27,24 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use rustlet_spec::StreamError;
 use rustlet_spec::container::ContainerStatus;
 use rustlet_spec::logs::{LogEntry, LogStream, LogsQuery};
+use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 
 use crate::container::Shared;
 use crate::error::{ApiError, ApiResult};
 
 const POLL: Duration = Duration::from_millis(200);
+
+/// A line of the `logs` stream: an entry, or the error it ended with.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum LogLine {
+    Entry(LogEntry),
+    Error(StreamError),
+}
 
 /// What a query lets through.
 #[derive(Debug, Clone)]
@@ -173,7 +183,7 @@ pub async fn follow(
     mut pos: Position,
     filter: Filter,
     mut state: watch::Receiver<Shared>,
-    tx: mpsc::Sender<LogEntry>,
+    tx: mpsc::Sender<LogLine>,
 ) {
     loop {
         let running = {
@@ -187,13 +197,14 @@ pub async fn follow(
         match read_new(&path, &mut pos, &filter) {
             Ok(entries) => {
                 for e in entries {
-                    if tx.send(e).await.is_err() {
+                    if tx.send(LogLine::Entry(e)).await.is_err() {
                         return; // the client went away
                     }
                 }
             }
             Err(e) => {
                 tracing::warn!("following {}: {e}", path.display());
+                let _ = tx.send(LogLine::Error(StreamError { error: format!("reading the log: {e}") })).await;
                 return;
             }
         }
@@ -306,6 +317,14 @@ mod tests {
         }
         let expected: Vec<String> = (0..10).map(|i| format!("after {i}\n")).collect();
         assert_eq!(seen, expected, "every entry exactly once, across rotations");
+    }
+
+    #[test]
+    fn a_follow_that_fails_says_so_as_streams_do() {
+        let line = LogLine::Error(StreamError { error: "gone".into() });
+        assert_eq!(serde_json::to_value(line).unwrap(), serde_json::json!({"error": "gone"}));
+        let entry = LogEntry { ts: "t".into(), stream: LogStream::Stdout, log: "x".into() };
+        assert_eq!(serde_json::to_value(LogLine::Entry(entry.clone())).unwrap(), serde_json::to_value(entry).unwrap());
     }
 
     #[test]

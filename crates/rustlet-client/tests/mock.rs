@@ -344,3 +344,29 @@ async fn a_missing_socket_says_the_daemon_isnt_running() {
     // Sessions connect the same way.
     assert!(matches!(client.attach("web", false).await.unwrap_err(), Error::Connect { .. }));
 }
+
+#[tokio::test]
+async fn a_line_that_never_ends_is_refused() {
+    async fn logs() -> Response {
+        let chunk = Bytes::from(vec![b'x'; 1 << 20]);
+        let body = futures::stream::iter((0..17).map(move |_| Ok::<_, std::io::Error>(chunk.clone())))
+            .chain(futures::stream::pending());
+        ([(header::CONTENT_TYPE, rustlet_spec::NDJSON)], Body::from_stream(body)).into_response()
+    }
+    let (_dir, client) = serve(Router::new().route(&routes::pattern::container_action("logs"), get(logs)));
+    let mut entries = within(client.logs("web", &LogsQuery::default())).await.unwrap();
+    assert!(matches!(within(entries.next()).await, Some(Err(Error::Protocol(_)))));
+    assert!(within(entries.next()).await.is_none());
+}
+
+#[tokio::test]
+async fn nothing_is_read_after_an_error_line() {
+    async fn logs() -> Response {
+        let body = "{\"error\":\"gone\"}\n{\"ts\":\"t\",\"stream\":\"stdout\",\"log\":\"after\\n\"}\n";
+        ([(header::CONTENT_TYPE, rustlet_spec::NDJSON)], body).into_response()
+    }
+    let (_dir, client) = serve(Router::new().route(&routes::pattern::container_action("logs"), get(logs)));
+    let entries: Vec<_> = within(within(client.logs("web", &LogsQuery::default())).await.unwrap().collect()).await;
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert!(matches!(&entries[0], Err(Error::Stream(m)) if m == "gone"));
+}

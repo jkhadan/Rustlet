@@ -4,7 +4,9 @@
 //! Attaching to a container that isn't running yet registers the client
 //! with the container: `start` opens the shim stream for it, and applies its
 //! terminal size, *before* the program runs, so `rustlet run` sees all of
-//! its output from the first byte. Until then, its input is held back.
+//! its output from the first byte. Until then, its input is held back. The
+//! registration happens before the upgrade's `101`: a client may send the
+//! start as soon as it has that, before the upgraded connection is served.
 
 use std::sync::{Arc, Mutex};
 
@@ -13,13 +15,12 @@ use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use rustlet_shim::client::{ShimClient, ShimStream, StreamEvent};
 use rustlet_shim::protocol::{ExitStatus, Request, Response};
-use rustlet_spec::container::ContainerStatus;
 use rustlet_spec::stream::{Control, STDERR, STDIN, STDOUT, data_message, parse_data_message};
 use tokio::sync::oneshot;
 
 use crate::container::{Container, PendingAttach};
 use crate::daemon::Daemon;
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiResult};
 
 /// Input held back while an attach waits for its container to start.
 const MAX_EARLY_INPUT: usize = 1 << 20;
@@ -27,25 +28,53 @@ const MAX_EARLY_INPUT: usize = 1 << 20;
 type Sink = SplitSink<WebSocket, Message>;
 type Source = SplitStream<WebSocket>;
 
-/// `GET /v1/containers/{id}/attach`, once upgraded.
-pub async fn attach(daemon: Arc<Daemon>, c: Arc<Container>, ws: WebSocket, stdin: bool) {
+/// An attach registered with a container that isn't running yet.
+pub struct Waiting {
+    rx: oneshot::Receiver<ApiResult<ShimStream>>,
+    /// The client's latest terminal size, for the start to apply.
+    resize: Arc<Mutex<Option<(u16, u16)>>>,
+}
+
+/// Registers an attach with `c`, which isn't running: its next start
+/// connects it.
+pub fn register(c: &Container, stdin: bool) -> Waiting {
+    let (tx, rx) = oneshot::channel();
+    let resize = Arc::new(Mutex::new(None));
+    c.pending_attach.lock().unwrap_or_else(|e| e.into_inner()).push(PendingAttach {
+        stdin,
+        resize: resize.clone(),
+        tx,
+    });
+    Waiting { rx, resize }
+}
+
+/// `GET /v1/containers/{id}/attach`, once upgraded: `waiting` if it was
+/// registered for the next start. The session ends with the run after
+/// `exits` (the current one, or the next start's).
+pub async fn attach(
+    daemon: Arc<Daemon>,
+    c: Arc<Container>,
+    ws: WebSocket,
+    stdin: bool,
+    exits: u64,
+    waiting: Option<Waiting>,
+) {
     let (mut sink, mut source) = ws.split();
-    // The run this session ends with is the one after `exits` (the current
-    // one, or the next start's).
     let mut state = c.subscribe();
-    let exits = state.borrow().exits;
-    let stream = if c.status().is_live() {
-        let socket = daemon.paths.shim(c.id()).socket();
-        let opened = async { ShimClient::connect(&socket).await?.open_stream(&Request::Attach { stdin }).await }.await;
-        match opened {
-            Ok((Response::Ok, Some(stream))) => stream,
-            other => {
-                let e = ApiError::internal(format!("attach to {}: {other:?}", c.record.name));
-                return send_error(&mut sink, &e).await;
+    let stream = match waiting {
+        None => {
+            let socket = daemon.paths.shim(c.id()).socket();
+            let opened =
+                async { ShimClient::connect(&socket).await?.open_stream(&Request::Attach { stdin }).await }.await;
+            match opened {
+                Ok((Response::Ok, Some(stream))) => stream,
+                other => {
+                    let e = ApiError::internal(format!("attach to {}: {other:?}", c.record.name));
+                    return send_error(&mut sink, &e).await;
+                }
             }
         }
-    } else {
-        match wait_for_start(&c, stdin, &mut sink, &mut source).await {
+        Some(waiting) => match wait_for_start(waiting, stdin, &mut sink, &mut source).await {
             Some((stream, early, eof)) => {
                 let mut stream = stream;
                 if !early.is_empty() && stream.writer().stdin(&early).await.is_err() {
@@ -57,7 +86,7 @@ pub async fn attach(daemon: Arc<Daemon>, c: Arc<Container>, ws: WebSocket, stdin
                 stream
             }
             None => return,
-        }
+        },
     };
     // The client hears of the exit once the daemon has handled it: a `rm`
     // or `inspect` right after must see the container exited.
@@ -68,26 +97,16 @@ pub async fn attach(daemon: Arc<Daemon>, c: Arc<Container>, ws: WebSocket, stdin
     bridge(sink, source, stream, stdin, handled).await;
 }
 
-/// Registers the client with the container and waits for `start` to hand
-/// over its stream. Returns it with the input that arrived meanwhile (and
-/// whether that input ended), or `None` if the client or container went away.
+/// Waits for `start` to hand over the stream. Returns it with the input
+/// that arrived meanwhile (and whether that input ended), or `None` if the
+/// client or container went away.
 async fn wait_for_start(
-    c: &Container,
+    waiting: Waiting,
     stdin: bool,
     sink: &mut Sink,
     source: &mut Source,
 ) -> Option<(ShimStream, Vec<u8>, bool)> {
-    let (tx, rx) = oneshot::channel();
-    let resize = Arc::new(Mutex::new(None));
-    c.pending_attach.lock().unwrap_or_else(|e| e.into_inner()).push(PendingAttach {
-        stdin,
-        resize: resize.clone(),
-        tx,
-    });
-    if matches!(c.status(), ContainerStatus::Removing | ContainerStatus::Dead) {
-        send_error(sink, &ApiError::conflict(format!("container {} is {}", c.record.name, c.status()))).await;
-        return None;
-    }
+    let Waiting { rx, resize } = waiting;
     tokio::pin!(rx);
     let mut early = Vec::new();
     let mut eof = false;

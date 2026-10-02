@@ -413,12 +413,12 @@ async fn read_json<T: DeserializeOwned>(response: Response<Incoming>) -> Result<
 /// [`ErrorBody`]; whatever else it is (a proxy's page, a chunk-framed body
 /// from a refused upgrade) still gives a message.
 fn api_error(status: u16, reason: Option<&str>, body: &[u8]) -> Error {
-    let parsed = serde_json::from_slice::<ErrorBody>(body).ok().or_else(|| {
+    let parsed = error_body(body, status).or_else(|| {
         // The body of a refused upgrade comes as read off the socket:
         // possibly with chunked framing around the JSON.
         let start = body.iter().position(|&b| b == b'{')?;
         let end = body.iter().rposition(|&b| b == b'}')?;
-        serde_json::from_slice::<ErrorBody>(body.get(start..=end)?).ok()
+        error_body(body.get(start..=end)?, status)
     });
     let mut body = parsed.unwrap_or_else(|| {
         let text = String::from_utf8_lossy(body).trim().to_owned();
@@ -430,6 +430,18 @@ fn api_error(status: u16, reason: Option<&str>, body: &[u8]) -> Error {
         body.message = format!("HTTP {status} {}", reason.unwrap_or("")).trim().to_owned();
     }
     Error::Api { status, body }
+}
+
+/// An [`ErrorBody`] if `json` is one: it has a message. A kind this client
+/// doesn't know (from a newer daemon), or none, is the status's.
+fn error_body(json: &[u8], status: u16) -> Option<ErrorBody> {
+    let v: serde_json::Value = serde_json::from_slice(json).ok()?;
+    let message = v.get("message")?.as_str().filter(|m| !m.is_empty())?.to_owned();
+    let kind = v
+        .get("kind")
+        .and_then(|k| serde_json::from_value::<ErrorKind>(k.clone()).ok())
+        .unwrap_or_else(|| kind_for_status(status));
+    Some(ErrorBody::new(kind, message))
 }
 
 /// The best guess at a kind when the body doesn't say.
@@ -498,5 +510,17 @@ mod tests {
         assert_eq!(e.to_string(), "HTTP 502 Bad Gateway");
         let e = api_error(400, None, b"plain text");
         assert_eq!((e.kind(), e.to_string().as_str()), (Some(ErrorKind::Invalid), "plain text"));
+    }
+
+    #[test]
+    fn error_bodies_that_arent_ours_keep_their_text() {
+        // A kind from a newer daemon: the message stays, the kind is the
+        // status's.
+        let e = api_error(409, Some("Conflict"), br#"{"message":"is paused","kind":"brand_new_kind"}"#);
+        assert_eq!((e.kind(), e.to_string().as_str()), (Some(ErrorKind::Conflict), "is paused"));
+        // Somebody else's JSON: its text.
+        let e = api_error(400, Some("Bad Request"), br#"{"error":"bad name"}"#);
+        assert_eq!(e.kind(), Some(ErrorKind::Invalid));
+        assert!(e.to_string().contains("bad name"), "{e}");
     }
 }

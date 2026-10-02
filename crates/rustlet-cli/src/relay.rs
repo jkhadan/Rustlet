@@ -36,6 +36,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use rustlet_client::{Client, Session, SessionEvent, SessionSender};
+use rustlet_spec::ErrorKind;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -64,7 +65,8 @@ pub enum End {
     /// The user detached; the process keeps running.
     Detached,
     /// The CLI got this signal (SIGTERM or SIGHUP) with the terminal in
-    /// raw mode, restored it and left; the process keeps running.
+    /// raw mode, restored it and left; or one to pass on to a container that
+    /// is gone. The process keeps running, if there is one.
     Signaled(i32),
 }
 
@@ -111,7 +113,7 @@ pub async fn relay(client: &Client, session: Session, options: Options, console:
 
     let (signal_tx, mut signaled) = mpsc::channel::<i32>(1);
     if let Some(id) = &options.sig_proxy {
-        tasks.spawn(proxy_signals(client.clone(), id.clone()));
+        tasks.spawn(proxy_signals(client.clone(), id.clone(), signal_tx));
     } else if raw {
         tasks.spawn(watch_termination(signal_tx));
     }
@@ -233,26 +235,36 @@ async fn watch_size(out: mpsc::Sender<Outgoing>) {
     }
 }
 
-/// The signals `--sig-proxy` passes on, and their names for `kill`.
-fn proxied() -> [(SignalKind, &'static str); 6] {
+/// The signals `--sig-proxy` passes on, their names for `kill` and their
+/// numbers.
+fn proxied() -> [(SignalKind, &'static str, i32); 6] {
     [
-        (SignalKind::interrupt(), "INT"),
-        (SignalKind::terminate(), "TERM"),
-        (SignalKind::hangup(), "HUP"),
-        (SignalKind::quit(), "QUIT"),
-        (SignalKind::user_defined1(), "USR1"),
-        (SignalKind::user_defined2(), "USR2"),
+        (SignalKind::interrupt(), "INT", 2),
+        (SignalKind::terminate(), "TERM", 15),
+        (SignalKind::hangup(), "HUP", 1),
+        (SignalKind::quit(), "QUIT", 3),
+        (SignalKind::user_defined1(), "USR1", 10),
+        (SignalKind::user_defined2(), "USR2", 12),
     ]
 }
 
-async fn proxy_signals(client: Client, id: String) {
-    let mut signals: Vec<(Signal, &str)> =
-        proxied().into_iter().filter_map(|(kind, name)| Some((signal(kind).ok()?, name))).collect();
+/// Passes signals on with `kill`. One the container isn't there to take
+/// ends the session unless its exit arrives in a moment: without that,
+/// Ctrl-C would do nothing at all to a session whose container is gone.
+async fn proxy_signals(client: Client, id: String, undeliverable: mpsc::Sender<i32>) {
+    let mut signals: Vec<(Signal, (&str, i32))> =
+        proxied().into_iter().filter_map(|(kind, name, signo)| Some((signal(kind).ok()?, (name, signo)))).collect();
     loop {
-        let name = next_signal(&mut signals).await;
-        // One that can't be delivered (the container has just exited)
-        // changes nothing: the session reports the exit.
-        let _ = client.kill(&id, Some(name)).await;
+        let (name, signo) = next_signal(&mut signals).await;
+        match client.kill(&id, Some(name)).await {
+            Err(e) if matches!(e.kind(), Some(ErrorKind::Conflict | ErrorKind::NoSuchContainer)) => {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let _ = undeliverable.send(signo).await;
+                return;
+            }
+            // Delivered; or not, for a reason the session will report.
+            _ => {}
+        }
     }
 }
 
@@ -373,6 +385,21 @@ mod tests {
             }
         }
         (forwarded, false)
+    }
+
+    #[tokio::test]
+    async fn the_detach_keys_end_the_input_without_an_eof() {
+        let (chunks_tx, chunks) = mpsc::channel(4);
+        let (out, mut outgoing) = mpsc::channel(8);
+        let (detach, mut detached) = mpsc::channel(1);
+        chunks_tx.send(b"ab\x10".to_vec()).await.unwrap();
+        chunks_tx.send(b"\x11cd".to_vec()).await.unwrap();
+        drop(chunks_tx);
+        pump_stdin(chunks, out, Some(DetachKeys::default()), detach).await;
+        assert!(matches!(outgoing.recv().await, Some(Outgoing::Stdin(d)) if d == b"ab"));
+        // Detaching leaves the container's input open: no stdin_eof.
+        assert!(outgoing.recv().await.is_none());
+        assert_eq!(detached.recv().await, Some(()));
     }
 
     #[test]

@@ -212,22 +212,33 @@ impl Images {
     async fn run_worker(&self, args: Vec<String>, events: mpsc::Sender<PullEvent>) -> ApiResult<String> {
         static N: AtomicU64 = AtomicU64::new(0);
         let _turn = self.gc.read().await;
-        let cg = CgroupPath::parse(&format!(
-            "{}/{}-{}",
-            self.worker.cgroup_dir,
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ))?;
-        let settings = vec![
-            Setting::new("memory.max", self.worker.memory_max.to_string()),
-            Setting::new("memory.swap.max", "0"),
-            Setting::new("pids.max", self.worker.pids_max.to_string()),
-        ];
-        let cgroup = {
-            let cg = cg.clone();
-            tokio::task::spawn_blocking(move || Cgroup::create(&cg, &settings, &SystemdDelegated))
-                .await
-                .map_err(|e| ApiError::internal(e.to_string()))??
+        let made = async {
+            let cg = CgroupPath::parse(&format!(
+                "{}/{}-{}",
+                self.worker.cgroup_dir,
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ))?;
+            let settings = vec![
+                Setting::new("memory.max", self.worker.memory_max.to_string()),
+                Setting::new("memory.swap.max", "0"),
+                Setting::new("pids.max", self.worker.pids_max.to_string()),
+            ];
+            let cgroup = {
+                let cg = cg.clone();
+                tokio::task::spawn_blocking(move || Cgroup::create(&cg, &settings, &SystemdDelegated))
+                    .await
+                    .map_err(|e| ApiError::internal(e.to_string()))??
+            };
+            Ok::<_, ApiError>((cg, cgroup))
+        };
+        let (cg, cgroup) = match made.await {
+            Ok(made) => made,
+            Err(e) => {
+                drop(_turn);
+                let _ = events.send(PullEvent::Error { message: format!("a cgroup for the worker: {e}") }).await;
+                return Err(e);
+            }
         };
         let mut cmd = tokio::process::Command::new(&self.worker.exe);
         cmd.arg("worker").args(&args).args(["--cgroup", &cg.as_path().display().to_string()]);
@@ -289,6 +300,11 @@ impl Images {
         })
         .await;
         drop(_turn);
+        // Every failure ends the stream with an error (the worker may not
+        // have got as far as saying one).
+        if let (Err(e), None) = (&result, &last) {
+            last = Some(PullEvent::Error { message: e.message.clone() });
+        }
         if let Some(event) = last {
             let _ = events.send(event).await;
         }
@@ -638,6 +654,16 @@ mod tests {
             .collect();
         assert!(left.is_empty(), "{left:?}");
         assert_eq!(std::fs::read_dir(&ingest).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_pull_that_fails_before_its_worker_runs_ends_with_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // No such cgroup to put the worker in.
+        let im = images(dir.path());
+        let (tx, mut rx) = mpsc::channel(8);
+        assert!(block_on(im.pull("alpine", PullPolicy::Never, tx)).is_err());
+        assert!(matches!(rx.try_recv(), Ok(PullEvent::Error { .. })));
     }
 
     #[test]

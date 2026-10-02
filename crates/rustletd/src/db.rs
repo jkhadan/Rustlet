@@ -75,18 +75,20 @@ impl Db {
         conn.pragma_update(None, "synchronous", "FULL")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
-            0 => {
-                conn.execute_batch(
-                    "CREATE TABLE containers (
-                        id      TEXT PRIMARY KEY,
-                        name    TEXT NOT NULL UNIQUE,
-                        created TEXT NOT NULL,
-                        record  TEXT NOT NULL,
-                        state   TEXT NOT NULL
-                    );",
-                )?;
-                conn.pragma_update(None, "user_version", SCHEMA)?;
-            }
+            // One transaction (`user_version` is part of it): a crash in
+            // between can't leave a table at version 0.
+            0 => conn.execute_batch(&format!(
+                "BEGIN;
+                 CREATE TABLE containers (
+                     id      TEXT PRIMARY KEY,
+                     name    TEXT NOT NULL UNIQUE,
+                     created TEXT NOT NULL,
+                     record  TEXT NOT NULL,
+                     state   TEXT NOT NULL
+                 );
+                 PRAGMA user_version = {SCHEMA};
+                 COMMIT;"
+            ))?,
             SCHEMA => {}
             v => anyhow::bail!("{}: schema version {v} is newer than this daemon's ({SCHEMA})", path.display()),
         }

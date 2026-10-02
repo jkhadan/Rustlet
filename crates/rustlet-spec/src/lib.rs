@@ -183,6 +183,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exit_codes_for_programs_that_cant_run() {
+        assert_eq!(ErrorKind::CommandNotFound.cli_exit_code(), 127);
+        assert_eq!(ErrorKind::CommandNotExecutable.cli_exit_code(), 126);
+        assert_eq!(ErrorKind::Conflict.cli_exit_code(), 125);
+    }
+
+    #[test]
     fn names() {
         for ok in ["web", "a", "web-1", "my_app.v2", "0abc"] {
             assert!(valid_container_name(ok), "{ok}");

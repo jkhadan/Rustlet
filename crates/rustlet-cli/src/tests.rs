@@ -338,6 +338,22 @@ async fn images() -> Json<Vec<ImageSummary>> {
     ])
 }
 
+/// Serves `app`; returns the `-H` value that reaches it, and the directory
+/// guard.
+fn serve(app: Router) -> (String, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("rustlet.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("unix://{}", socket.display()), dir)
+}
+
+/// Ctrl-C, as the terminal would send it. (nextest runs each test in a
+/// process of its own.)
+fn sigint_ourselves() {
+    std::process::Command::new("kill").args(["-INT", &std::process::id().to_string()]).status().unwrap();
+}
+
 /// Serves a mock daemon; returns it, the `-H` value that reaches it, and
 /// the directory guard.
 fn daemon() -> (Arc<Daemon>, String, tempfile::TempDir) {
@@ -358,11 +374,8 @@ fn daemon() -> (Arc<Daemon>, String, tempfile::TempDir) {
         .route(pattern::IMAGES, get(images))
         .route(pattern::INFO, get(info))
         .with_state(d.clone());
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("rustlet.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (d, format!("unix://{}", socket.display()), dir)
+    let (host, dir) = serve(app);
+    (d, host, dir)
 }
 
 /// Runs `rustlet -H host args…` with `stdin`; returns the exit code and
@@ -465,6 +478,108 @@ async fn exec_detached_sends_no_input() {
     assert_eq!(d.calls(), ["exec create", "exec start -d"]);
     // Nothing would ever send it any (nor end it): `cat` would run forever.
     assert!(!d.execs.lock().unwrap()[0].stdin);
+}
+
+/// Ctrl-C passed on to a container that is gone (it exited as the attach
+/// began): the kill fails, and the session must still end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_c_ends_an_attach_whose_container_is_gone() {
+    let inspect = || async {
+        Json(rustlet_spec::container::ContainerInspect {
+            id: ID.into(),
+            name: "web".into(),
+            state: ContainerState { status: ContainerStatus::Running, ..ContainerState::default() },
+            ..Default::default()
+        })
+    };
+    // An attach that waits for a start that never comes.
+    let attach = |ws: WebSocketUpgrade| async move {
+        ws.on_upgrade(|socket| async move {
+            let _socket = socket;
+            std::future::pending::<()>().await
+        })
+    };
+    let kill = || async { error(ErrorKind::Conflict, "container web is not running") };
+    let (host, _dir) = serve(
+        Router::new()
+            .route(pattern::CONTAINER, get(inspect))
+            .route(&pattern::container_action("attach"), get(attach))
+            .route(&pattern::container_action("kill"), post(kill)),
+    );
+    let ctrl_c = async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        sigint_ourselves();
+    };
+    let ((code, _, _), ()) = tokio::join!(rustlet(&host, &["attach", "--no-stdin", "web"], b""), ctrl_c);
+    assert_eq!(code, 130);
+}
+
+#[tokio::test]
+async fn a_detached_start_that_fails_removes_its_rm_container() {
+    let (d, host, _dir) = daemon();
+    *d.start_fails.lock().unwrap() = Some(ErrorBody::new(ErrorKind::CommandNotFound, "exec: \"nope\": not found"));
+    let (code, stdout, _) = rustlet(&host, &["run", "-d", "--rm", "alpine", "nope"], b"").await;
+    assert_eq!((code, stdout.text().as_str()), (127, ""));
+    assert_eq!(d.calls().last().unwrap(), &format!("rm {}", rustlet_spec::short_id(ID)));
+}
+
+/// Without a terminal, Ctrl-C goes to the container (`kill INT`), and the
+/// CLI waits for its exit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigint_is_passed_on_to_the_container() {
+    let killed = Arc::new(Notify::new());
+    let signals = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+    let (k, s) = (killed.clone(), signals.clone());
+    let kill = move |Query(q): Query<KillQuery>| async move {
+        s.lock().unwrap().push(q.signal);
+        k.notify_one();
+        StatusCode::NO_CONTENT
+    };
+    let k = killed.clone();
+    // A container that exits once it gets a signal.
+    let attach = move |ws: WebSocketUpgrade| async move {
+        ws.on_upgrade(move |mut socket| async move {
+            k.notified().await;
+            let exit = serde_json::to_string(&Control::Exit { code: 130, oom_killed: false }).unwrap();
+            socket.send(Message::Text(exit.into())).await.unwrap();
+        })
+    };
+    let created = || async {
+        let created = CreateResponse { id: ID.into(), name: "x".into(), warnings: vec![] };
+        (StatusCode::CREATED, Json(created)).into_response()
+    };
+    let (host, _dir) = serve(
+        Router::new()
+            .route(pattern::CONTAINERS, post(created))
+            .route(&pattern::container_action("start"), post(|| async { StatusCode::NO_CONTENT }))
+            .route(&pattern::container_action("kill"), post(kill))
+            .route(&pattern::container_action("attach"), get(attach)),
+    );
+    let ctrl_c = async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        sigint_ourselves();
+    };
+    let ((code, _, stderr), ()) = tokio::join!(rustlet(&host, &["run", "alpine", "sleep", "1000"], b""), ctrl_c);
+    assert_eq!(code, 130, "{}", stderr.text());
+    assert_eq!(signals.lock().unwrap().as_slice(), [Some("INT".to_owned())]);
+}
+
+#[tokio::test]
+async fn a_closed_stdout_ends_quietly_with_141() {
+    struct Closed;
+    impl std::io::Write for Closed {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let (_d, host, _dir) = daemon();
+    let (mut console, _, stderr) = console(b"");
+    console.stdout = Box::new(Closed);
+    let code = run_cli(parse(&["-H", &host, "ps", "-a"]), console).await;
+    assert_eq!((code, stderr.text().as_str()), (141, ""));
 }
 
 #[tokio::test]

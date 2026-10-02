@@ -239,7 +239,7 @@ async fn container_logs(State(d): D, Path(id): Path<String>, Query(q): Query<Log
     let state = c.subscribe();
     tokio::spawn(async move {
         for e in entries {
-            if tx.send(e).await.is_err() {
+            if tx.send(logs::LogLine::Entry(e)).await.is_err() {
                 return;
             }
         }
@@ -304,7 +304,11 @@ async fn attach(
     }
     // Input only reaches a container that keeps a stdin (`-i`).
     let stdin = q.stdin && c.record.config.open_stdin;
-    Ok(ws.on_upgrade(move |socket| crate::attach::attach(d, c, socket, stdin)))
+    // Before the `101`: the client may start the container as soon as it
+    // has it.
+    let exits = c.subscribe().borrow().exits;
+    let waiting = (!c.status().is_live()).then(|| crate::attach::register(&c, stdin));
+    Ok(ws.on_upgrade(move |socket| crate::attach::attach(d, c, socket, stdin, exits, waiting)))
 }
 
 // ── exec ───────────────────────────────────────────────────────────────────
