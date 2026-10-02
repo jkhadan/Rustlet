@@ -1,0 +1,128 @@
+---
+source: crates/rustlet-net/src/firewall.rs
+assertion_line: 375
+expression: "dns_redirect(40001, 40002)"
+---
+{
+  "nftables": [
+    {
+      "add": {
+        "table": {
+          "family": "ip",
+          "name": "rustlet_dns"
+        }
+      }
+    },
+    {
+      "delete": {
+        "table": {
+          "family": "ip",
+          "name": "rustlet_dns"
+        }
+      }
+    },
+    {
+      "add": {
+        "table": {
+          "family": "ip",
+          "name": "rustlet_dns"
+        }
+      }
+    },
+    {
+      "add": {
+        "chain": {
+          "family": "ip",
+          "hook": "output",
+          "name": "output",
+          "policy": "accept",
+          "prio": -100,
+          "table": "rustlet_dns",
+          "type": "nat"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "output",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "daddr",
+                    "protocol": "ip"
+                  }
+                },
+                "op": "==",
+                "right": "127.0.0.11"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "dport",
+                    "protocol": "udp"
+                  }
+                },
+                "op": "==",
+                "right": 53
+              }
+            },
+            {
+              "dnat": {
+                "addr": "127.0.0.11",
+                "port": 40001
+              }
+            }
+          ],
+          "family": "ip",
+          "table": "rustlet_dns"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "output",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "daddr",
+                    "protocol": "ip"
+                  }
+                },
+                "op": "==",
+                "right": "127.0.0.11"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "dport",
+                    "protocol": "tcp"
+                  }
+                },
+                "op": "==",
+                "right": 53
+              }
+            },
+            {
+              "dnat": {
+                "addr": "127.0.0.11",
+                "port": 40002
+              }
+            }
+          ],
+          "family": "ip",
+          "table": "rustlet_dns"
+        }
+      }
+    }
+  ]
+}

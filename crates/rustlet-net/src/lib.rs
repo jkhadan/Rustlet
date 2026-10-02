@@ -22,13 +22,27 @@
 //!
 //! | module | what |
 //! |---|---|
+//! | [`netns`] | pinning network namespaces, running code inside one |
+//! | [`link`] | bridges, veth pairs, addresses and routes (rtnetlink) |
+//! | [`ipam`] | subnets for networks, addresses and MACs for containers |
+//! | [`firewall`] | the `inet rustlet` nftables table: NAT, published ports, guards |
+//! | [`sysctl`] | IP forwarding (recorded for `cleanup.sh`), per-namespace defaults |
+//! | [`files`] | the containers' `hosts`, `hostname` and `resolv.conf` |
 //! | [`dns`] | the embedded DNS server at `127.0.0.11` |
 //! | [`proxy`] | the userland proxy for published ports |
+//! | [`ufw`] | asking an active ufw to route the bridges |
 
 #![forbid(unsafe_code)]
 
 pub mod dns;
 pub mod error;
+pub mod files;
+pub mod firewall;
+pub mod ipam;
+pub mod link;
+pub mod netns;
 pub mod proxy;
+pub mod sysctl;
+pub mod ufw;
 
 pub use error::{Context, Error, Result};

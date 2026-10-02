@@ -1,0 +1,829 @@
+---
+source: crates/rustlet-net/src/firewall.rs
+assertion_line: 334
+expression: sample().to_json()
+---
+{
+  "nftables": [
+    {
+      "add": {
+        "table": {
+          "family": "inet",
+          "name": "rustlet"
+        }
+      }
+    },
+    {
+      "delete": {
+        "table": {
+          "family": "inet",
+          "name": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "table": {
+          "family": "inet",
+          "name": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "chain": {
+          "family": "inet",
+          "hook": "prerouting",
+          "name": "raw_prerouting",
+          "policy": "accept",
+          "prio": -300,
+          "table": "rustlet",
+          "type": "filter"
+        }
+      }
+    },
+    {
+      "add": {
+        "chain": {
+          "family": "inet",
+          "hook": "prerouting",
+          "name": "prerouting",
+          "policy": "accept",
+          "prio": -100,
+          "table": "rustlet",
+          "type": "nat"
+        }
+      }
+    },
+    {
+      "add": {
+        "chain": {
+          "family": "inet",
+          "hook": "output",
+          "name": "output",
+          "policy": "accept",
+          "prio": -100,
+          "table": "rustlet",
+          "type": "nat"
+        }
+      }
+    },
+    {
+      "add": {
+        "chain": {
+          "family": "inet",
+          "hook": "postrouting",
+          "name": "postrouting",
+          "policy": "accept",
+          "prio": 100,
+          "table": "rustlet",
+          "type": "nat"
+        }
+      }
+    },
+    {
+      "add": {
+        "chain": {
+          "family": "inet",
+          "hook": "forward",
+          "name": "forward",
+          "policy": "accept",
+          "prio": 0,
+          "table": "rustlet",
+          "type": "filter"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "raw_prerouting",
+          "comment": "10.89.0.0/24 is only reachable through rustlet0",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "op": "==",
+                "right": "ipv4"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "daddr",
+                    "protocol": "ip"
+                  }
+                },
+                "op": "==",
+                "right": {
+                  "prefix": {
+                    "addr": "10.89.0.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "!=",
+                "right": "rustlet0"
+              }
+            },
+            {
+              "drop": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "raw_prerouting",
+          "comment": "10.89.1.0/24 is only reachable through rlb0123456789ab",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "op": "==",
+                "right": "ipv4"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "daddr",
+                    "protocol": "ip"
+                  }
+                },
+                "op": "==",
+                "right": {
+                  "prefix": {
+                    "addr": "10.89.1.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "!=",
+                "right": "rlb0123456789ab"
+              }
+            },
+            {
+              "drop": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "prerouting",
+          "comment": "web 8080/tcp -> 10.89.0.2:80",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "op": "==",
+                "right": "ipv4"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "!=",
+                "right": "rustlet0"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "fib": {
+                    "flags": [
+                      "daddr"
+                    ],
+                    "result": "type"
+                  }
+                },
+                "op": "==",
+                "right": "local"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "dport",
+                    "protocol": "tcp"
+                  }
+                },
+                "op": "==",
+                "right": 8080
+              }
+            },
+            {
+              "dnat": {
+                "addr": "10.89.0.2",
+                "family": "ip",
+                "port": 80
+              }
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "output",
+          "comment": "web 8080/tcp -> 10.89.0.2:80",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "op": "==",
+                "right": "ipv4"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "fib": {
+                    "flags": [
+                      "daddr"
+                    ],
+                    "result": "type"
+                  }
+                },
+                "op": "==",
+                "right": "local"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "daddr",
+                    "protocol": "ip"
+                  }
+                },
+                "op": "!=",
+                "right": {
+                  "prefix": {
+                    "addr": "127.0.0.0",
+                    "len": 8
+                  }
+                }
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "dport",
+                    "protocol": "tcp"
+                  }
+                },
+                "op": "==",
+                "right": 8080
+              }
+            },
+            {
+              "dnat": {
+                "addr": "10.89.0.2",
+                "family": "ip",
+                "port": 80
+              }
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "prerouting",
+          "comment": "dns 5353/udp -> 10.89.0.3:53",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "op": "==",
+                "right": "ipv4"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "!=",
+                "right": "rustlet0"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "daddr",
+                    "protocol": "ip"
+                  }
+                },
+                "op": "==",
+                "right": "192.168.50.143"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "dport",
+                    "protocol": "udp"
+                  }
+                },
+                "op": "==",
+                "right": 5353
+              }
+            },
+            {
+              "dnat": {
+                "addr": "10.89.0.3",
+                "family": "ip",
+                "port": 53
+              }
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "output",
+          "comment": "dns 5353/udp -> 10.89.0.3:53",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "op": "==",
+                "right": "ipv4"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "daddr",
+                    "protocol": "ip"
+                  }
+                },
+                "op": "==",
+                "right": "192.168.50.143"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "dport",
+                    "protocol": "udp"
+                  }
+                },
+                "op": "==",
+                "right": 5353
+              }
+            },
+            {
+              "dnat": {
+                "addr": "10.89.0.3",
+                "family": "ip",
+                "port": 53
+              }
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "postrouting",
+          "comment": "10.89.0.0/24 out",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "op": "==",
+                "right": "ipv4"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "saddr",
+                    "protocol": "ip"
+                  }
+                },
+                "op": "==",
+                "right": {
+                  "prefix": {
+                    "addr": "10.89.0.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "op": "!=",
+                "right": "rustlet0"
+              }
+            },
+            {
+              "masquerade": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "forward",
+          "comment": "replies to rustlet0",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "op": "==",
+                "right": "rustlet0"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "op": "in",
+                "right": [
+                  "established",
+                  "related"
+                ]
+              }
+            },
+            {
+              "accept": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "forward",
+          "comment": "published ports on rustlet0",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "op": "==",
+                "right": "rustlet0"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "ct": {
+                    "key": "status"
+                  }
+                },
+                "op": "in",
+                "right": "dnat"
+              }
+            },
+            {
+              "accept": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "forward",
+          "comment": "within rustlet0",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "==",
+                "right": "rustlet0"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "op": "==",
+                "right": "rustlet0"
+              }
+            },
+            {
+              "accept": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "forward",
+          "comment": "nothing else into rustlet0",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "op": "==",
+                "right": "rustlet0"
+              }
+            },
+            {
+              "drop": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "forward",
+          "comment": "replies to rlb0123456789ab",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "op": "==",
+                "right": "rlb0123456789ab"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "op": "in",
+                "right": [
+                  "established",
+                  "related"
+                ]
+              }
+            },
+            {
+              "accept": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "forward",
+          "comment": "within rlb0123456789ab",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "==",
+                "right": "rlb0123456789ab"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "op": "==",
+                "right": "rlb0123456789ab"
+              }
+            },
+            {
+              "accept": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "forward",
+          "comment": "nothing else into rlb0123456789ab",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "op": "==",
+                "right": "rlb0123456789ab"
+              }
+            },
+            {
+              "drop": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "forward",
+          "comment": "rustlet0 out",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "==",
+                "right": "rustlet0"
+              }
+            },
+            {
+              "accept": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "forward",
+          "comment": "rlb0123456789ab internal: no way out",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "==",
+                "right": "rlb0123456789ab"
+              }
+            },
+            {
+              "drop": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "forward",
+          "comment": "Rustlets turned forwarding on: nothing but its own bridges is forwarded",
+          "expr": [
+            {
+              "drop": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    }
+  ]
+}

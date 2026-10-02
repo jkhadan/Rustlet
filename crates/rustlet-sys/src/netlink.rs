@@ -1,6 +1,7 @@
 //! A minimal rtnetlink encoder/decoder: enough to create a bridge and veth
-//! pairs, move a link into another network namespace, assign addresses,
-//! add routes and bring links up. This is what `ip link`/`ip addr`/`ip route`
+//! pairs (the peer straight into another network namespace), attach links
+//! to a bridge, assign addresses, add routes, bring links up, and list
+//! links, addresses and routes. This is what `ip link`/`ip addr`/`ip route`
 //! do under the hood.
 //!
 //! ## Wire format
@@ -16,7 +17,8 @@
 //!
 //! Everything here is safe code; the socket itself comes from `nix`.
 
-use std::os::fd::{AsFd, OwnedFd};
+use std::net::Ipv4Addr;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 use nix::sys::socket::{
     AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType, bind, recv, send, socket,
@@ -34,6 +36,7 @@ pub mod consts {
     pub const RTM_GETADDR: u16 = 22;
     pub const RTM_NEWROUTE: u16 = 24;
     pub const RTM_DELROUTE: u16 = 25;
+    pub const RTM_GETROUTE: u16 = 26;
 
     pub const NLMSG_NOOP: u16 = 1;
     pub const NLMSG_ERROR: u16 = 2;
@@ -63,17 +66,23 @@ pub mod consts {
 
     pub const IFA_ADDRESS: u16 = 1;
     pub const IFA_LOCAL: u16 = 2;
+    pub const IFA_LABEL: u16 = 3;
     pub const IFA_BROADCAST: u16 = 4;
 
     pub const RTA_DST: u16 = 1;
     pub const RTA_OIF: u16 = 4;
     pub const RTA_GATEWAY: u16 = 5;
+    pub const RTA_PRIORITY: u16 = 6;
+    pub const RTA_PREFSRC: u16 = 7;
+    pub const RTA_TABLE: u16 = 15;
 
     pub const RT_TABLE_MAIN: u8 = 254;
     pub const RTPROT_BOOT: u8 = 3;
     pub const RT_SCOPE_UNIVERSE: u8 = 0;
     pub const RT_SCOPE_LINK: u8 = 253;
+    pub const RT_SCOPE_HOST: u8 = 254;
     pub const RTN_UNICAST: u8 = 1;
+    pub const RTN_LOCAL: u8 = 2;
 
     pub const IFF_UP: u32 = 0x1;
     pub const IFF_LOOPBACK: u32 = 0x8;
@@ -149,6 +158,18 @@ impl IfAddrMsg {
         b[4..8].copy_from_slice(&self.index.to_ne_bytes());
         b
     }
+    pub fn parse(b: &[u8]) -> Option<IfAddrMsg> {
+        if b.len() < 8 {
+            return None;
+        }
+        Some(IfAddrMsg {
+            family: b[0],
+            prefixlen: b[1],
+            flags: b[2],
+            scope: b[3],
+            index: u32::from_ne_bytes(b[4..8].try_into().ok()?),
+        })
+    }
 }
 
 /// `struct rtmsg` (12 bytes).
@@ -180,6 +201,22 @@ impl RtMsg {
         ]);
         b[8..12].copy_from_slice(&self.flags.to_ne_bytes());
         b
+    }
+    pub fn parse(b: &[u8]) -> Option<RtMsg> {
+        if b.len() < 12 {
+            return None;
+        }
+        Some(RtMsg {
+            family: b[0],
+            dst_len: b[1],
+            src_len: b[2],
+            tos: b[3],
+            table: b[4],
+            protocol: b[5],
+            scope: b[6],
+            rtm_type: b[7],
+            flags: u32::from_ne_bytes(b[8..12].try_into().ok()?),
+        })
     }
 }
 
@@ -352,6 +389,105 @@ fn cstr_attr(d: &[u8]) -> String {
     String::from_utf8_lossy(&d[..end]).into_owned()
 }
 
+fn ipv4_attr(d: &[u8]) -> Option<Ipv4Addr> {
+    let b: [u8; 4] = d.get(..4)?.try_into().ok()?;
+    Some(Ipv4Addr::from(b))
+}
+
+fn u32_attr(d: &[u8]) -> Option<u32> {
+    Some(u32::from_ne_bytes(d.get(..4)?.try_into().ok()?))
+}
+
+/// A decoded IPv4 `RTM_NEWADDR` (from a GETADDR dump).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddrInfo {
+    pub index: u32,
+    /// `IFA_LOCAL`: the interface's own address.
+    pub address: Ipv4Addr,
+    pub prefix_len: u8,
+}
+
+impl AddrInfo {
+    pub fn parse(payload: &[u8]) -> Option<AddrInfo> {
+        let hdr = IfAddrMsg::parse(payload)?;
+        if hdr.family != AF_INET {
+            return None;
+        }
+        let (mut local, mut address) = (None, None);
+        for (ty, data) in attrs(payload.get(8..)?) {
+            match ty {
+                IFA_LOCAL => local = ipv4_attr(data),
+                IFA_ADDRESS => address = ipv4_attr(data),
+                _ => {}
+            }
+        }
+        // On a point-to-point link IFA_ADDRESS is the peer's; IFA_LOCAL,
+        // when present, is always ours.
+        Some(AddrInfo { index: hdr.index, address: local.or(address)?, prefix_len: hdr.prefixlen })
+    }
+}
+
+/// A decoded IPv4 `RTM_NEWROUTE` (from a GETROUTE dump).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteInfo {
+    /// The destination network (`0.0.0.0/0` for a default route).
+    pub dst: Ipv4Addr,
+    pub dst_len: u8,
+    pub gateway: Option<Ipv4Addr>,
+    pub oif: Option<u32>,
+    /// `RT_TABLE_MAIN` (254), `local` (255), …
+    pub table: u32,
+    /// `RTN_UNICAST`, `RTN_LOCAL`, `RTN_BROADCAST`, …
+    pub kind: u8,
+}
+
+impl RouteInfo {
+    pub fn parse(payload: &[u8]) -> Option<RouteInfo> {
+        let hdr = RtMsg::parse(payload)?;
+        if hdr.family != AF_INET {
+            return None;
+        }
+        let mut r = RouteInfo {
+            dst: Ipv4Addr::UNSPECIFIED,
+            dst_len: hdr.dst_len,
+            gateway: None,
+            oif: None,
+            table: u32::from(hdr.table),
+            kind: hdr.rtm_type,
+        };
+        for (ty, data) in attrs(payload.get(12..)?) {
+            match ty {
+                RTA_DST => r.dst = ipv4_attr(data)?,
+                RTA_GATEWAY => r.gateway = ipv4_attr(data),
+                RTA_OIF => r.oif = u32_attr(data),
+                // The 8-bit field can't hold table ids above 255.
+                RTA_TABLE => r.table = u32_attr(data)?,
+                _ => {}
+            }
+        }
+        Some(r)
+    }
+}
+
+/// The far end of a veth pair being created: its name, and where it goes.
+#[derive(Debug, Clone, Copy)]
+pub struct VethPeer<'a> {
+    pub name: &'a str,
+    /// The network namespace to create it in (`IFLA_NET_NS_FD`); `None`:
+    /// the caller's.
+    pub netns: Option<BorrowedFd<'a>>,
+    /// Its MAC address; `None`: a random one, the kernel's choice.
+    pub mac: Option<[u8; 6]>,
+}
+
+/// The broadcast address of `addr/prefix_len` (what `ip addr add … brd +`
+/// computes).
+pub fn broadcast(addr: Ipv4Addr, prefix_len: u8) -> Ipv4Addr {
+    let host_bits = 32 - u32::from(prefix_len.min(32));
+    let mask = if host_bits == 32 { u32::MAX } else { (1u32 << host_bits) - 1 };
+    Ipv4Addr::from(u32::from(addr) | mask)
+}
+
 /// A `NETLINK_ROUTE` socket bound in the calling thread's network namespace.
 ///
 /// A netlink socket talks to the netns it was *created* in, even if the
@@ -366,7 +502,7 @@ pub struct RtNetlink {
 impl RtNetlink {
     pub fn open() -> Result<RtNetlink> {
         let fd = socket(AddressFamily::Netlink, SockType::Raw, SockFlag::SOCK_CLOEXEC, SockProtocol::NetlinkRoute)?;
-        bind(std::os::fd::AsRawFd::as_raw_fd(&fd), &NetlinkAddr::new(0, 0))?;
+        bind(fd.as_raw_fd(), &NetlinkAddr::new(0, 0))?;
         Ok(RtNetlink { fd, seq: 1 })
     }
 
@@ -377,11 +513,11 @@ impl RtNetlink {
         self.seq = self.seq.wrapping_add(1);
         let seq = self.seq;
         let bytes = msg.finish(seq);
-        send(std::os::fd::AsRawFd::as_raw_fd(&self.fd), &bytes, MsgFlags::empty())?;
+        send(self.fd.as_raw_fd(), &bytes, MsgFlags::empty())?;
         let mut replies = Vec::new();
         let mut buf = vec![0u8; 64 * 1024];
         loop {
-            let n = recv(std::os::fd::AsRawFd::as_raw_fd(&self.fd.as_fd()), &mut buf, MsgFlags::empty())?;
+            let n = recv(self.fd.as_fd().as_raw_fd(), &mut buf, MsgFlags::empty())?;
             for m in parse_messages(&buf[..n]) {
                 if m.seq != seq {
                     continue;
@@ -412,6 +548,13 @@ impl RtNetlink {
         self.request(MsgBuilder::new(RTM_NEWLINK, NLM_F_ACK).header(&hdr.to_bytes())).map(drop)
     }
 
+    /// Clears `IFF_UP` (`ip link set … down`).
+    pub fn set_link_down(&mut self, index: i32) -> Result<()> {
+        const IFF_UP: u32 = libc::IFF_UP as u32;
+        let hdr = IfInfoMsg { index, flags: 0, change: IFF_UP, ..Default::default() };
+        self.request(MsgBuilder::new(RTM_NEWLINK, 0).header(&hdr.to_bytes())).map(drop)
+    }
+
     /// Looks up a link by name.
     pub fn link_by_name(&mut self, name: &str) -> Result<Option<LinkInfo>> {
         let msg = MsgBuilder::new(RTM_GETLINK, 0).header(&IfInfoMsg::default().to_bytes()).attr_str(IFLA_IFNAME, name);
@@ -420,6 +563,113 @@ impl RtNetlink {
             Err(Errno::ENODEV) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Creates a bridge (`ip link add NAME type bridge`); `EEXIST` if a link
+    /// of that name exists. It starts down, without addresses.
+    pub fn create_bridge(&mut self, name: &str) -> Result<()> {
+        let msg = MsgBuilder::new(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL)
+            .header(&IfInfoMsg::default().to_bytes())
+            .attr_str(IFLA_IFNAME, name)
+            .begin_nest(IFLA_LINKINFO)
+            .attr_str(IFLA_INFO_KIND, "bridge")
+            .end_nest();
+        self.request(msg).map(drop)
+    }
+
+    /// Creates a veth pair: `name` here, `peer` in the namespace it names,
+    /// in one request (`ip link add NAME type veth peer name P netns N`), so
+    /// the peer never exists in this namespace under a name that could
+    /// clash. Both ends start down.
+    pub fn create_veth(&mut self, name: &str, peer: &VethPeer<'_>) -> Result<()> {
+        let mut msg = MsgBuilder::new(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL)
+            .header(&IfInfoMsg::default().to_bytes())
+            .attr_str(IFLA_IFNAME, name)
+            .begin_nest(IFLA_LINKINFO)
+            .attr_str(IFLA_INFO_KIND, "veth")
+            .begin_nest(IFLA_INFO_DATA)
+            .begin_nest(VETH_INFO_PEER)
+            .header(&IfInfoMsg::default().to_bytes())
+            .attr_str(IFLA_IFNAME, peer.name);
+        if let Some(ns) = peer.netns {
+            msg = msg.attr_u32(IFLA_NET_NS_FD, ns.as_raw_fd() as u32);
+        }
+        if let Some(mac) = peer.mac {
+            msg = msg.attr(IFLA_ADDRESS, &mac);
+        }
+        self.request(msg.end_nest().end_nest().end_nest()).map(drop)
+    }
+
+    /// Deletes a link (`ip link del`); a veth's peer goes with it, wherever
+    /// it is.
+    pub fn delete_link(&mut self, index: i32) -> Result<()> {
+        let hdr = IfInfoMsg { index, ..Default::default() };
+        self.request(MsgBuilder::new(RTM_DELLINK, 0).header(&hdr.to_bytes())).map(drop)
+    }
+
+    /// Makes `master` (a bridge) the link's master (`ip link set … master`).
+    pub fn set_master(&mut self, index: i32, master: i32) -> Result<()> {
+        let hdr = IfInfoMsg { index, ..Default::default() };
+        let msg = MsgBuilder::new(RTM_NEWLINK, 0).header(&hdr.to_bytes()).attr_u32(IFLA_MASTER, master as u32);
+        self.request(msg).map(drop)
+    }
+
+    /// Adds `addr/prefix_len` to a link, with its broadcast address (`ip
+    /// addr add A/P brd + dev …`); `EEXIST` if it has it already.
+    pub fn add_address(&mut self, index: i32, addr: Ipv4Addr, prefix_len: u8) -> Result<()> {
+        let hdr = IfAddrMsg {
+            family: AF_INET,
+            prefixlen: prefix_len,
+            flags: 0,
+            scope: RT_SCOPE_UNIVERSE,
+            index: index as u32,
+        };
+        let msg = MsgBuilder::new(RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL)
+            .header(&hdr.to_bytes())
+            .attr(IFA_LOCAL, &addr.octets())
+            .attr(IFA_ADDRESS, &addr.octets())
+            .attr(IFA_BROADCAST, &broadcast(addr, prefix_len).octets());
+        self.request(msg).map(drop)
+    }
+
+    /// Every IPv4 address in this namespace.
+    pub fn addresses(&mut self) -> Result<Vec<AddrInfo>> {
+        let hdr = IfAddrMsg { family: AF_INET, ..Default::default() };
+        let msg = MsgBuilder::new(RTM_GETADDR, NLM_F_DUMP).header(&hdr.to_bytes());
+        Ok(self.request(msg)?.iter().filter_map(|m| AddrInfo::parse(&m.payload)).collect())
+    }
+
+    /// Adds a route in the main table to `dst/dst_len` (`0.0.0.0/0`: the
+    /// default route) through `gateway`, or directly on link `oif`
+    /// (`ip route add`); `EEXIST` if there is one already.
+    pub fn add_route(&mut self, dst: Ipv4Addr, dst_len: u8, gateway: Option<Ipv4Addr>, oif: Option<i32>) -> Result<()> {
+        let hdr = RtMsg {
+            family: AF_INET,
+            dst_len,
+            table: RT_TABLE_MAIN,
+            protocol: RTPROT_BOOT,
+            scope: if gateway.is_some() { RT_SCOPE_UNIVERSE } else { RT_SCOPE_LINK },
+            rtm_type: RTN_UNICAST,
+            ..Default::default()
+        };
+        let mut msg = MsgBuilder::new(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL).header(&hdr.to_bytes());
+        if dst_len > 0 {
+            msg = msg.attr(RTA_DST, &dst.octets());
+        }
+        if let Some(gw) = gateway {
+            msg = msg.attr(RTA_GATEWAY, &gw.octets());
+        }
+        if let Some(oif) = oif {
+            msg = msg.attr_u32(RTA_OIF, oif as u32);
+        }
+        self.request(msg).map(drop)
+    }
+
+    /// Every IPv4 route in this namespace, all tables.
+    pub fn routes(&mut self) -> Result<Vec<RouteInfo>> {
+        let hdr = RtMsg { family: AF_INET, ..Default::default() };
+        let msg = MsgBuilder::new(RTM_GETROUTE, NLM_F_DUMP).header(&hdr.to_bytes());
+        Ok(self.request(msg)?.iter().filter_map(|m| RouteInfo::parse(&m.payload)).collect())
     }
 }
 
@@ -459,5 +709,90 @@ mod tests {
         let mut nl = RtNetlink::open().unwrap();
         let links = nl.links().unwrap();
         assert!(links.iter().any(|l| l.name == "lo"));
+    }
+
+    #[test]
+    fn can_dump_addresses_and_routes_unprivileged() {
+        let mut nl = RtNetlink::open().unwrap();
+        let lo = nl.link_by_name("lo").unwrap().unwrap();
+        let addrs = nl.addresses().unwrap();
+        assert!(
+            addrs.iter().any(|a| a.index == lo.index as u32 && a.address == Ipv4Addr::LOCALHOST && a.prefix_len == 8),
+            "{addrs:?}"
+        );
+        // The kernel's own route for 127.0.0.0/8 in the local table.
+        let routes = nl.routes().unwrap();
+        assert!(
+            routes.iter().any(|r| r.table == 255 && r.kind == RTN_LOCAL && r.dst == Ipv4Addr::new(127, 0, 0, 0)),
+            "{routes:?}"
+        );
+    }
+
+    #[test]
+    fn creating_needs_privileges() {
+        // As an ordinary user in the host's namespace: EPERM, and nothing made.
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let mut nl = RtNetlink::open().unwrap();
+        assert_eq!(nl.create_bridge("rltestnope0"), Err(Errno::EPERM));
+        assert!(nl.link_by_name("rltestnope0").unwrap().is_none());
+    }
+
+    #[test]
+    fn veth_requests_carry_the_peers_namespace_and_mac() {
+        let peer = IfInfoMsg::default().to_bytes();
+        let msg = MsgBuilder::new(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL)
+            .header(&IfInfoMsg::default().to_bytes())
+            .attr_str(IFLA_IFNAME, "rlv0")
+            .begin_nest(IFLA_LINKINFO)
+            .attr_str(IFLA_INFO_KIND, "veth")
+            .begin_nest(IFLA_INFO_DATA)
+            .begin_nest(VETH_INFO_PEER)
+            .header(&peer)
+            .attr_str(IFLA_IFNAME, "eth0")
+            .attr_u32(IFLA_NET_NS_FD, 7)
+            .attr(IFLA_ADDRESS, &[2, 0x52, 10, 89, 0, 2])
+            .end_nest()
+            .end_nest()
+            .end_nest()
+            .finish(1);
+        let body = &msg[NLMSG_HDRLEN + 16..];
+        let linkinfo = attrs(body).find(|a| a.0 == IFLA_LINKINFO).unwrap().1;
+        let data = attrs(linkinfo).find(|a| a.0 == IFLA_INFO_DATA).unwrap().1;
+        let peer = attrs(data).find(|a| a.0 == VETH_INFO_PEER).unwrap().1;
+        // The peer is an ifinfomsg followed by its own attributes.
+        let peer_attrs: Vec<_> = attrs(&peer[16..]).collect();
+        assert_eq!(peer_attrs[0], (IFLA_IFNAME, &b"eth0\0"[..]));
+        assert_eq!(peer_attrs[1], (IFLA_NET_NS_FD, &7u32.to_ne_bytes()[..]));
+        assert_eq!(peer_attrs[2], (IFLA_ADDRESS, &[2, 0x52, 10, 89, 0, 2][..]));
+    }
+
+    #[test]
+    fn addresses_and_routes_decode() {
+        let hdr = IfAddrMsg { family: AF_INET, prefixlen: 24, index: 3, ..Default::default() };
+        let msg = MsgBuilder::new(RTM_NEWADDR, 0)
+            .header(&hdr.to_bytes())
+            .attr(IFA_ADDRESS, &[10, 89, 0, 1])
+            .attr(IFA_LOCAL, &[10, 89, 0, 1])
+            .finish(1);
+        let a = AddrInfo::parse(&msg[NLMSG_HDRLEN..]).unwrap();
+        assert_eq!(a, AddrInfo { index: 3, address: Ipv4Addr::new(10, 89, 0, 1), prefix_len: 24 });
+        let hdr =
+            RtMsg { family: AF_INET, dst_len: 0, table: RT_TABLE_MAIN, rtm_type: RTN_UNICAST, ..Default::default() };
+        let msg = MsgBuilder::new(RTM_NEWROUTE, 0)
+            .header(&hdr.to_bytes())
+            .attr(RTA_GATEWAY, &[192, 168, 50, 1])
+            .attr_u32(RTA_OIF, 2)
+            .attr_u32(RTA_TABLE, 254)
+            .finish(1);
+        let r = RouteInfo::parse(&msg[NLMSG_HDRLEN..]).unwrap();
+        assert_eq!(
+            (r.dst, r.dst_len, r.gateway, r.oif, r.table),
+            (Ipv4Addr::UNSPECIFIED, 0, Some(Ipv4Addr::new(192, 168, 50, 1)), Some(2), 254)
+        );
+        assert_eq!(broadcast(Ipv4Addr::new(10, 89, 0, 1), 24), Ipv4Addr::new(10, 89, 0, 255));
+        assert_eq!(broadcast(Ipv4Addr::new(10, 89, 3, 7), 16), Ipv4Addr::new(10, 89, 255, 255));
+        assert_eq!(broadcast(Ipv4Addr::new(10, 0, 0, 1), 32), Ipv4Addr::new(10, 0, 0, 1));
     }
 }
