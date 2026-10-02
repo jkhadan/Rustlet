@@ -251,8 +251,14 @@ fn dm_stop_restart_pause_kill() {
     let d = daemon();
     block_on(async {
         let c = d.client();
-        let id = c.create_container(&sh("trap 'echo bye; exit 0' TERM; while :; do sleep 0.1; done")).await.unwrap().id;
+        let id = c
+            .create_container(&sh("trap 'echo bye; exit 0' TERM; echo ready; while :; do sleep 0.1; done"))
+            .await
+            .unwrap()
+            .id;
         c.start(&id).await.unwrap();
+        // PID 1 ignores TERM without a handler: stop once the trap is set.
+        until("the trap", async || logs(&c, &id, LogsQuery::default()).await.iter().any(|(_, t)| t == "ready\n")).await;
         c.stop(&id, Some(5)).await.unwrap();
         let i = c.inspect_container(&id).await.unwrap();
         assert_eq!((i.state.status, i.state.exit_code), (ContainerStatus::Exited, Some(0)));

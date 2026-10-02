@@ -267,6 +267,7 @@ impl Daemon {
             .spawn()
             .map_err(|e| ApiError::internal(format!("start {}: {e}", self.shim.display())))?;
         let stdout = child.stdout.take().expect("piped");
+        let shim_pid = child.id();
         // The shim outlives this call (and maybe this daemon); collect it
         // when it exits, so it doesn't linger as a zombie.
         tokio::spawn(async move {
@@ -281,7 +282,14 @@ impl Daemon {
                 let log = std::fs::read_to_string(paths.shim_log()).unwrap_or_default();
                 return Err(ApiError::internal(format!("the shim exited without a word: {}", log.trim())));
             }
-            Err(_) => return Err(ApiError::internal("the shim didn't finish creating the container in time")),
+            Err(_) => {
+                // Not reaped yet (the task above waits for it), so the pid
+                // is still the shim's.
+                if let Some(pid) = shim_pid {
+                    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::SIGKILL);
+                }
+                return Err(ApiError::internal("the shim didn't finish creating the container in time"));
+            }
         };
         let init_pid = match handshake {
             Handshake::Ready { init_pid, .. } => init_pid,

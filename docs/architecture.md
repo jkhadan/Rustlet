@@ -232,13 +232,15 @@ Commands follow the OCI runtime spec: `create`, `start`, `state`, `kill`, `delet
 - Include a small disassembler for tests and for the learn chapter.
 
 ### 2.3 `rustlet-shim`
-- The shim `setsid()`s and sets `PR_SET_CHILD_SUBREAPER` itself. The daemon can't use `pre_exec`, which is unsafe, and the daemon forbids unsafe code.
-- It runs `rustlet-runc create`, reports the pid, then runs `start` when told to.
-- **Reaping:** one SIGCHLD handler → a `waitid(P_ALL, WNOHANG)` loop reaps everything (container init, exec processes, runc invocations). No `tokio::process` child handles, because they conflict with a subreaper's reaping.
-- **I/O:** a PTY master (received over the console socket) or stdout/stderr pipes. For a container with a user namespace, the pipes are chowned to the container's mapped user before `create`, as containerd's shim does (`IoUID`/`IoGID`), so the container can reopen `/dev/stdout`. Logs are JSON-lines (`{ts, stream, log}`) in `/var/lib/rustlet/containers/<id>/container.log`, with size-based rotation.
-- **Control socket `/run/rustlet/shims/<id>/shim.sock`:** length-prefixed serde messages: `Start`, `Kill{sig}`, `Exec{spec, tty}`, `Resize`, `Attach`, `Wait`, `Shutdown`.
-- On exit it writes `exit.json` (code, signal, OOM flag from `memory.events`) and notifies the daemon. After a daemon restart, the daemon finds shims again through their sockets.
-- Runtime: tokio `current_thread`.
+One per container *start*, started by the daemon with plain `Command::spawn` (the daemon forbids `unsafe`, so no `pre_exec`). Library half: the wire protocol, its file layout and an async client, for the daemon (`protocol.rs`, `paths.rs`, `client.rs`, `logfile.rs`).
+- **Setup, in order:** `setsid()` (no controlling terminal; signals to the daemon's process group don't reach it), `PR_SET_CHILD_SUBREAPER`, a move into `<cgroup parent>/shims`, `shim.sock` bound, then `rustlet-runc create`. Its stderr is `shims/<short id>/shim.log`, opened by the daemon, so a shim that outlives the daemon still has somewhere to write.
+- **Handshake:** one JSON line on stdout, a pipe to the daemon: `Ready{init_pid}` or `Failed{message, exit_code}` (the runtime's 126/127), then stdout becomes `/dev/null`.
+- **Reaping:** a `SIGCHLD` loop over `waitid(P_ALL, WNOHANG)` reaps everything (init once `create` has exited and it is re-parented, exec'd processes, every `rustlet-runc`). Statuses nobody watches yet are kept; the shim is single-threaded (tokio `current_thread`), so watching right after spawning, with no `.await` in between, can't miss one. Never `tokio::process` or `Child::wait`.
+- **I/O:** the PTY master from the console socket (checked to be a master, `TIOCGPTN`), or pipes whose container ends belong to the *process user's host ids* (container uid 101 is host 1000101 under `--userns`), so a non-root process can reopen `/dev/stdout`, as containerd's `IoUID`/`IoGID`. Output goes into `containers/<id>/container.log`, JSON lines `{ts, stream, log}` (one entry per line, 16 KiB cap, size rotation 10 MiB × 3), and to every attach stream through a broadcast channel; attach input reaches the container through one stdin pump. `stdin_once`: the first stdin client's end of input closes the container's stdin.
+- **Each `rustlet-runc` call** gets its own `--log` file (JSON): without a terminal, the runtime's stderr is the container's, so its error is read from the log's last `ERROR` line.
+- **Control socket `/run/rustlet/shims/<short id>/shim.sock`** (named by the 12-character short id: `sun_path` holds 108 bytes): frames `[u32 length][kind][payload]`, kind 0 a JSON message, 1–3 stdin/stdout/stderr bytes. Requests: `Status`, `Start`, `Kill{signal, all}`, `Pause`, `Resume`, `Wait`, `Attach{stdin}`, `Exec{…}`, `Resize`, `CloseStdin`, `Delete{force}`, `Shutdown`. `Attach` and `Exec` turn the connection into a stream that ends with `Exited`.
+- **Exec:** `rustlet-runc exec -d --process` with the container's own process (args, env, cwd and an exactly resolved user changed), with its own pipes or terminal; the process is re-parented to the shim when `rustlet-runc` exits, and its output is drained even after the client hangs up.
+- **Exit:** after init's exit the shim waits briefly for the last output, reads the container cgroup's `memory.events` (`oom_kill`), writes `exit.json` and answers `Wait`. It keeps serving (a new daemon may ask) until `Delete` + `Shutdown`.
 
 ### 2.4 `rustlet-image` — OCI images, storage, snapshots
 - **Pull** (`pull/mod.rs`; the registry protocol, bearer tokens and HTTP are `oci-client`'s):
@@ -255,8 +257,8 @@ Commands follow the OCI runtime spec: `create`, `start`, `state`, `kill`, `delet
   4. `.wh.<name>` becomes an overlay whiteout (char 0:0), `.wh..wh..opq` the opaque xattr; a directory that meets its own layer's whiteout is opaque too. Other `.wh..wh.*` (AUFS) entries are skipped.
   5. **The blob digest and the uncompressed stream's digest are checked against the manifest and the config's `diff_id`** before the atomic rename into `snapshots/<chainID>`. Otherwise one malicious image could poison a snapshot that other images share.
 - **Snapshots and rootfs:**
-  - `snapshots/<chainID>/{fs/,snapshot.json}` (`snapshot.rs`): one directory per layer, keyed by chain ID; shared layers are unpacked once, and concurrent unpacks of one layer converge on a single snapshot (the first rename wins).
-  - Container rootfs (`rootfs.rs`) = overlayfs at `containers/<id>/rootfs`, with `upper/` and `work/` beside it, built with the new mount API: one `fsconfig("lowerdir+")` per layer (6.8+). `fsconfig` takes string values of at most 255 bytes, so the classic `lowerdir=a:b:c` (which also needs `:` escaped) doesn't fit three snapshot paths. `metacopy=off`, `index=off` and `redirect_dir=nofollow` are set explicitly so a container's changes stay a self-contained diff (`nofollow` rather than `off`, which would still *follow* a redirect it found; no layer should have one, and unpacking drops `trusted.overlay.*`). Mounted `nodev`, with the source name `rustlet`.
+  - `snapshots/<chainID>/{fs/,snapshot.json}` (`snapshot.rs`): one directory per layer, keyed by chain ID; shared layers are unpacked once. Unpacks of one chain ID take turns, across threads and processes (the daemon unpacks in workers), under an OFD lock on `snapshots/.locks/<chain ID>` held from the check for the snapshot until it is in place.
+  - Container rootfs (`rootfs.rs`) = overlayfs at `containers/<id>/rootfs`, with `upper/` and `work/` beside it (`ContainerRootfs::{create, open, mount_layers, unmount, remove}`: the daemon mounts it at each start and unmounts it at each exit; `upper/` lasts until `rm`), built with the new mount API: one `fsconfig("lowerdir+")` per layer (6.8+). `fsconfig` takes string values of at most 255 bytes, so the classic `lowerdir=a:b:c` (which also needs `:` escaped) doesn't fit three snapshot paths. `metacopy=off`, `index=off` and `redirect_dir=nofollow` are set explicitly so a container's changes stay a self-contained diff (`nofollow` rather than `off`, which would still *follow* a redirect it found; no layer should have one, and unpacking drops `trusted.overlay.*`). Mounted `nodev`, with the source name `rustlet`.
   - For `--userns=remap`: **idmapped lower layers**. A parked helper process (`rustlet_sys::process::UsernsHolder`, sound even in a multithreaded caller) holds a user namespace with the container's maps, written through `IdMapper`; each layer becomes `open_tree(CLONE)` + `mount_setattr(MOUNT_ATTR_IDMAP)`, so on-disk uid 0 is seen as container root (host 1000000). Before 6.15, overlay only takes layers *attached* in the mounter's namespace, so the idmapped trees sit under a 0700 `lower/` only until the overlay exists (it keeps private clones). Upper is owned by the mapped root.
 - **Image config → OCI spec** (`runspec.rs`, `user.rs`):
   - merge Entrypoint/Cmd with overrides (an overridden entrypoint drops the image's Cmd, as in Docker)
@@ -291,33 +293,26 @@ Commands follow the OCI runtime spec: `create`, `start`, `state`, `kill`, `delet
 - Everything sits behind a `NetworkBackend` trait. Rootless later: a pasta backend.
 
 ### 2.6 `rustletd` — the daemon
-- **Socket:** tokio + axum on `/run/rustlet/rustlet.sock` (mode 0660, group `rustlet`, so the CLI and GUI work without sudo). Docs will say plainly that this group is root-equivalent.
-- **API `/v1/...`**, shaped after the Docker Engine API:
-  - containers: create / start / stop / kill / restart / pause / unpause / rm / json / inspect
-  - `logs` (NDJSON follow), `attach` and `exec` (WebSocket), `stats` (NDJSON)
-  - images: pull (NDJSON progress) / json / inspect / rm / save / load / build
-  - networks, volumes, and `/events` (WebSocket)
-- **State:** SQLite via `rusqlite` (bundled): containers, images and tags, networks, IP allocations, volumes, build cache. Volatile state lives in `/run`.
-- **Container state machine:** Created → Running ⇄ Paused → Exited(code, oomKilled) → Removed, plus Restarting. Restart policies: `no`, `on-failure[:N]`, `always`, `unless-stopped`, with backoff. Healthchecks run through shim exec.
-- **Stop:** send StopSignal (default SIGTERM) → wait for the timeout → `cgroup.kill`.
+- **Socket:** axum on `/run/rustlet/rustlet.sock`, mode 0660 group `rustlet` if that group exists, else 0600 (root only). The group is root-equivalent: whoever can create containers can mount the host's `/` into one.
+- **API `/v1/...`** (the route table, error kinds and stream framing are types in `rustlet-spec`): containers create / start / stop / kill / restart / pause / unpause / delete / list / inspect / wait; `logs`, `stats`, `events` and `pull` as NDJSON; `attach` and exec (create, then start attached over a WebSocket or detached) as WebSockets; images list / inspect / pull / delete; version, info, ping. Image names are query parameters (they contain slashes). **Deviation:** `/events` is NDJSON, not a WebSocket: it is one-directional, and a curl-able stream is as easy for the GUI to read.
+- **State:** SQLite (`rusqlite`, bundled) in `/var/lib/rustlet/state.db`: one `containers` row each, the create-time record and the changing state as JSON columns, a unique name, `PRAGMA user_version` migrations. **Deviation:** images and their names stay in the store's `index.json` (§2.4); which images and snapshots are in use is derived from the containers' rows. Volatile state lives in `/run`.
+- **Container state machine:** Created → Running ⇄ Paused → Exited(code, oomKilled) → Removed, plus Restarting, Removing and Dead (cleanup failed). In memory the state sits in a `watch` channel: every change is persisted, then published. Lifecycle operations hold a per-container op lock; the exit monitor (a `Wait` on the shim) cleans up, publishes the exit and only then hands the restart policy to a task that takes the op lock, so a `stop` waiting for the exit it caused can't deadlock with it. Clients hear of an exit (an attach stream's last message) only once it is handled.
+- **Restart policies:** `no`, `on-failure[:N]`, `always`, `unless-stopped`, with Docker's backoff (100 ms doubling to a minute, reset after 10 s up), cancelled by start, stop or rm. `stop` and `kill` with the stop signal or KILL count as a manual stop. `--rm` and a restart policy are refused together. At daemon start, as in Docker, stopped `always` containers start again, and `unless-stopped` ones unless stopped by hand.
+- **Stop:** StopSignal (the container's, else the image's, else SIGTERM) → wait for the timeout (default 10 s) → `kill --all KILL` (`cgroup.kill`). A paused container is resumed first.
 - **Start/remove flow:**
-  - **start** (the daemon's part, then the shim's):
-    1. mount the overlay
-    2. pin the netns, set up veth/IP/sysctls/DNS
-    3. write `config.json`
-    4. spawn the shim; the shim runs `create`
-    5. add nft DNAT rules
-    6. the shim runs `start`
-    7. emit an event
-  - **remove:** runtime `delete` → unmount → release the IP → unpin the netns → drop nft rules → `safe_remove_tree` (§4).
-- **Startup reconciliation:** reconnect to live shims, mark dead containers exited, re-apply nft rules and sysctls, restart `always` containers.
-- **EventBus:** a `tokio::sync::broadcast` feeding `/events`; the GUI updates live from it.
-- **systemd unit `packaging/rustletd.service`:**
-  - `Delegate=yes`, `DelegateSubgroup=daemon` (systemd ≥ 254; this host has 255)
+  - **start:** snapshots (unpacked in a worker if missing) → mount the overlay on `containers/<id>/rootfs` (§2.4) → `config.json` from the image and the options (`spec.rs`) → spawn the shim, which runs `create` → connect attaches that were waiting, apply their terminal size → shim `Start` → emit an event. (Network setup joins in Phase 5.)
+  - **exit:** shim `Delete` + `Shutdown` → unmount the overlay (a stopped container holds no mounts; restarts reuse its upper layer).
+  - **remove:** kill if forced → remove `containers/<id>` (`safe_remove_tree`) → drop the row; an image whose names were all removed is collected with its last container.
+- **Image work** runs in children: `rustletd worker pull|unpack` moves itself into `<cgroup parent>/workers/<n>` (memory.max 1 GiB, no swap, pids.max 256) before it reads anything a registry or layer sent, and reports NDJSON events. A hostile image costs a worker, not the daemon. `rmi` removes names, then deletes the blobs and snapshots that no name and no container reaches, never while a pull or unpack runs.
+- **Startup:** an OFD lock on `<run>/rustletd.lock` (one daemon per run root); `containers/` becomes a private bind mount of itself, so container overlays don't propagate into other mount namespaces; the cgroup parent is the daemon's own cgroup minus `/daemon` (`DelegateSubgroup=daemon`), unless configured; then **reconciliation**: shims still running are taken over, runs that ended meanwhile (or with the host) are handled as exits (`exit.json`, else 255), and restart policies apply. `READY=1` to systemd only after that.
+- **EventBus:** a `tokio::sync::broadcast` plus a ring of the last 1024 events for `since`.
+- **Config:** `/etc/rustlet/daemon.toml` (optional; every key has a default), command-line flags on top: socket, socket group, data root, run root, cgroup parent, runtime and shim paths, log rotation, worker limits.
+- **systemd unit `packaging/rustletd.service`** (installed with `cargo xtask daemon install`):
+  - `Type=notify`, `Delegate=yes`, `DelegateSubgroup=daemon` (systemd ≥ 254; this host has 255): the daemon in `rustletd.service/daemon`, shims in `…/shims`, workers in `…/workers/<n>`, containers in `…/containers/<id>`
   - `KillMode=process`, so shims and containers survive `systemctl restart rustletd`
   - `TasksMax=infinity`; the default 15% cap would also count shims
   - `OOMScoreAdjust=-500`
-  - **No** `PrivateTmp`, `ProtectSystem`, `ProtectHome` or `PrivateMounts`. Overlay mounts and netns pins must land in the host mount namespace, where the host and `cleanup.sh` can see them.
+  - **No** `PrivateTmp`, `ProtectSystem`, `ProtectHome` or `PrivateMounts`. Overlay mounts and netns pins must land in the host mount namespace, where the host and `cleanup.sh` can see them. No `DevicePolicy=`/`DeviceAllow=` (§2.2.2).
 
 ### 2.7 `rustlet` — the CLI (clap)
 Docker-like UX, for example: `rustlet run -it --rm --name web -p 8080:80 -v data:/data --memory 512m --cpus 1.5 --pids-limit 100 --cap-drop ALL --net host --security-opt seccomp=unconfined alpine sh`.

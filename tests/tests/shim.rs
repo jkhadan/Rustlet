@@ -248,3 +248,16 @@ fn sh_oom_kill_is_reported() {
         shim.finish().await;
     });
 }
+
+/// A container that never started, deleted by force and shut down at
+/// once (the daemon's cleanup after a failed start): the shim waits for
+/// init's exit instead of refusing, and goes.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn sh_shutdown_right_after_a_forced_delete() {
+    let mut s = spec(&["true"]);
+    set_cgroup(&mut s, "sh-abort");
+    let shim = TestShim::start(&s, false, false);
+    ready(&shim);
+    block_on(async { shim.finish().await });
+}

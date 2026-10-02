@@ -45,6 +45,8 @@ use crate::stdio::{ConsoleSocket, FdIo, PipeEnds, host_ids, pipes};
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long `create` may take to send the terminal after it has exited.
 const MASTER_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `Shutdown` waits for an exit that is under way.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// What `main` got on the command line.
 pub struct Config {
@@ -492,6 +494,10 @@ async fn serve(shim: Rc<Shim>, stream: UnixStream) {
             shim.runc(args).await
         }
         Request::Shutdown => {
+            // Right after a forced delete, init may not be reaped yet: give
+            // its exit a moment to arrive.
+            let mut rx = shim.exit.subscribe();
+            let _ = tokio::time::timeout(SHUTDOWN_GRACE, rx.wait_for(Option::is_some)).await;
             if !shim.exited() {
                 error("the container is still running (delete it first)")
             } else {
