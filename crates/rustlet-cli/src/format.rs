@@ -138,9 +138,10 @@ pub fn command_text(command: &[String], full: bool) -> String {
     format!("{line:?}")
 }
 
-/// The PORTS column of `ps`: `0.0.0.0:8080->80/tcp, …`, in Docker's order
-/// (by container port, then host address, host port and protocol). Unlike
-/// Docker's, a range is shown port by port.
+/// The PORTS column of `ps`: `0.0.0.0:8080->80/tcp, [::1]:8080->80/tcp, …`,
+/// in Docker's order (by container port, then host address, IPv4 before
+/// IPv6, host port and protocol). Unlike Docker's, a range is shown port by
+/// port.
 pub fn ports_text(ports: &[PublishedPort]) -> String {
     let mut ports = ports.to_vec();
     ports.sort_by_key(|p| (p.container_port, p.host_ip, p.host_port, p.protocol));
@@ -516,22 +517,25 @@ mod tests {
 
     #[test]
     fn ports_are_shown_in_dockers_order() {
-        let port = |ip: [u8; 4], host_port, container_port, protocol| PublishedPort {
-            host_ip: ip.into(),
+        let port = |ip: &str, host_port, container_port, protocol| PublishedPort {
+            host_ip: ip.parse().unwrap(),
             host_port,
             container_port,
             protocol,
         };
         let ports = [
-            port([127, 0, 0, 1], 8443, 443, Protocol::Tcp),
-            port([0, 0, 0, 0], 5353, 53, Protocol::Udp),
-            port([0, 0, 0, 0], 8081, 80, Protocol::Tcp),
-            port([0, 0, 0, 0], 8080, 80, Protocol::Udp),
+            port("127.0.0.1", 8443, 443, Protocol::Tcp),
+            port("::1", 8080, 80, Protocol::Tcp),
+            port("0.0.0.0", 5353, 53, Protocol::Udp),
+            port("0.0.0.0", 8081, 80, Protocol::Tcp),
+            port("0.0.0.0", 8080, 80, Protocol::Udp),
         ];
-        // By container port, then host address and port, then protocol.
+        // By container port, then host address (IPv4 first, IPv6 in
+        // brackets) and port, then protocol.
         assert_eq!(
             ports_text(&ports),
-            "0.0.0.0:5353->53/udp, 0.0.0.0:8080->80/udp, 0.0.0.0:8081->80/tcp, 127.0.0.1:8443->443/tcp"
+            "0.0.0.0:5353->53/udp, 0.0.0.0:8080->80/udp, 0.0.0.0:8081->80/tcp, [::1]:8080->80/tcp, \
+             127.0.0.1:8443->443/tcp"
         );
         assert_eq!(ports_text(&[]), "");
     }

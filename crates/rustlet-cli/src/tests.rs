@@ -25,8 +25,8 @@ use rustlet_spec::exec::{ExecConfig, ExecCreated};
 use rustlet_spec::image::{BlobKind, ImageQuery, ImageSummary, PullEvent, PullQuery};
 use rustlet_spec::logs::{LogEntry, LogStream, LogsQuery};
 use rustlet_spec::network::{
-    Network, NetworkCreate, NetworkCreateResponse, NetworkMode, NetworkSettings, PortMapping, Protocol, PruneResponse,
-    PublishedPort,
+    Network, NetworkConnect, NetworkCreate, NetworkCreateResponse, NetworkDisconnect, NetworkMode, NetworkSettings,
+    PortMapping, Protocol, PruneResponse, PublishedPort,
 };
 use rustlet_spec::routes::pattern;
 use rustlet_spec::stats::{StatsQuery, StatsSample};
@@ -99,6 +99,8 @@ struct Daemon {
     /// The options of each `rm`.
     removals: Mutex<Vec<RemoveQuery>>,
     network_creates: Mutex<Vec<NetworkCreate>>,
+    network_connects: Mutex<Vec<NetworkConnect>>,
+    network_disconnects: Mutex<Vec<NetworkDisconnect>>,
     volume_creates: Mutex<Vec<VolumeCreate>>,
     /// A prune has removed what there was.
     networks_pruned: AtomicBool,
@@ -227,21 +229,23 @@ async fn remove(State(d): Shared, Path(id): Path<String>, Query(q): Query<Remove
     StatusCode::NO_CONTENT
 }
 
-fn published(host_ip: [u8; 4], host_port: u16, container_port: u16, protocol: Protocol) -> PublishedPort {
-    PublishedPort { host_ip: Ipv4Addr::from(host_ip).into(), host_port, container_port, protocol }
+fn published(host_ip: &str, host_port: u16, container_port: u16, protocol: Protocol) -> PublishedPort {
+    PublishedPort { host_ip: host_ip.parse().unwrap(), host_port, container_port, protocol }
 }
 
-/// `web`, with four published ports (out of order); nothing else exists.
+/// `web`, with five published ports (out of order), one on an IPv6
+/// address; nothing else exists.
 async fn inspect_container(State(d): Shared, Path(id): Path<String>) -> Response {
     d.call(format!("inspect container {id}"));
     if id != "web" {
         return error(ErrorKind::NoSuchContainer, &format!("no such container: {id}"));
     }
     let ports = vec![
-        published([127, 0, 0, 1], 8443, 443, Protocol::Tcp),
-        published([0, 0, 0, 0], 8080, 80, Protocol::Tcp),
-        published([0, 0, 0, 0], 5353, 53, Protocol::Udp),
-        published([127, 0, 0, 1], 9090, 80, Protocol::Tcp),
+        published("127.0.0.1", 8443, 443, Protocol::Tcp),
+        published("::1", 9090, 80, Protocol::Tcp),
+        published("0.0.0.0", 8080, 80, Protocol::Tcp),
+        published("0.0.0.0", 5353, 53, Protocol::Udp),
+        published("127.0.0.1", 9090, 80, Protocol::Tcp),
     ];
     let network = NetworkSettings { ports, ..NetworkSettings::default() };
     Json(ContainerInspect { id: "b".repeat(64), name: id, network, ..ContainerInspect::default() }).into_response()
@@ -295,8 +299,9 @@ async fn list() -> Json<Vec<ContainerSummary>> {
                 ..ContainerState::default()
             },
             ports: vec![
-                published([127, 0, 0, 1], 8443, 443, Protocol::Tcp),
-                published([0, 0, 0, 0], 8080, 80, Protocol::Tcp),
+                published("::1", 8443, 443, Protocol::Tcp),
+                published("127.0.0.1", 8443, 443, Protocol::Tcp),
+                published("0.0.0.0", 8080, 80, Protocol::Tcp),
             ],
             ..ContainerSummary::default()
         },
@@ -349,6 +354,7 @@ async fn version() -> Json<Version> {
 }
 
 /// The mock's networks, in no particular order; ids `bbbb…` to `eeee…`.
+/// `backend` has IPv6 too.
 fn networks() -> Vec<Network> {
     let network = |id: &str, name: &str, subnet: &str| Network {
         id: id.repeat(64),
@@ -357,10 +363,16 @@ fn networks() -> Vec<Network> {
         subnet: subnet.into(),
         ..Network::default()
     };
+    let backend = Network {
+        ipv6: true,
+        subnet6: Some("fd00:89:0:1::/64".into()),
+        gateway6: Some("fd00:89:0:1::1".into()),
+        ..network("c", "backend", "10.89.1.0/24")
+    };
     vec![
         network("b", "bridge", "10.89.0.0/24"),
         network("d", "net10", "10.89.10.0/24"),
-        network("c", "backend", "10.89.1.0/24"),
+        backend,
         network("e", "net2", "10.89.2.0/24"),
     ]
 }
@@ -394,6 +406,26 @@ async fn network_remove(State(d): Shared, Path(id): Path<String>) -> Response {
         Some(_) => StatusCode::NO_CONTENT.into_response(),
         None => error(ErrorKind::NoSuchNetwork, &format!("no such network: {id}")),
     }
+}
+
+async fn network_connect(State(d): Shared, Path(id): Path<String>, Json(body): Json<NetworkConnect>) -> Response {
+    d.call(format!("network connect {id} {}", body.container));
+    if find_network(&id).is_none() {
+        return error(ErrorKind::NoSuchNetwork, &format!("no such network: {id}"));
+    }
+    d.network_connects.lock().unwrap().push(body);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// With `force`, a network that is gone is no error: the container just
+/// forgets it, as the spec has it.
+async fn network_disconnect(State(d): Shared, Path(id): Path<String>, Json(body): Json<NetworkDisconnect>) -> Response {
+    d.call(format!("network disconnect {id} {}", body.container));
+    if find_network(&id).is_none() && !body.force {
+        return error(ErrorKind::NoSuchNetwork, &format!("no such network: {id}"));
+    }
+    d.network_disconnects.lock().unwrap().push(body);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// The first prune removes two networks; the next finds nothing.
@@ -542,6 +574,8 @@ fn daemon() -> (Arc<Daemon>, String, tempfile::TempDir) {
         .route(pattern::NETWORKS, get(network_list).post(network_create))
         .route(pattern::NETWORK, get(network_inspect).delete(network_remove))
         .route(pattern::NETWORK_PRUNE, post(network_prune))
+        .route(pattern::NETWORK_CONNECT, post(network_connect))
+        .route(pattern::NETWORK_DISCONNECT, post(network_disconnect))
         .route(pattern::VOLUMES, get(volume_list).post(volume_create))
         .route(pattern::VOLUME, get(volume_inspect).delete(volume_remove))
         .route(pattern::VOLUME_PRUNE, post(volume_prune))
@@ -813,11 +847,12 @@ async fn ps_draws_dockers_table() {
     let (_d, host, _dir) = daemon();
     let (code, stdout, _) = rustlet(&host, &["ps", "-a"], b"").await;
     assert_eq!(code, 0);
-    // Ports by container port, in Docker's place for them.
+    // Ports by container port, in Docker's place for them; an IPv6 host
+    // address in brackets, after the IPv4 ones.
     let expected = "\
-CONTAINER ID   IMAGE        COMMAND                  CREATED          STATUS                     PORTS                                           NAMES
-bbbbbbbbbbbb   nginx:1.27   \"/docker-entrypoint.…\"   10 minutes ago   Up 5 minutes               0.0.0.0:8080->80/tcp, 127.0.0.1:8443->443/tcp   web
-aaaaaaaaaaaa   alpine       \"sleep 1000\"             2 hours ago      Exited (0) 3 minutes ago                                                   old
+CONTAINER ID   IMAGE        COMMAND                  CREATED          STATUS                     PORTS                                                                NAMES
+bbbbbbbbbbbb   nginx:1.27   \"/docker-entrypoint.…\"   10 minutes ago   Up 5 minutes               0.0.0.0:8080->80/tcp, 127.0.0.1:8443->443/tcp, [::1]:8443->443/tcp   web
+aaaaaaaaaaaa   alpine       \"sleep 1000\"             2 hours ago      Exited (0) 3 minutes ago                                                                        old
 ";
     assert_eq!(stdout.text(), expected);
     let (_, stdout, _) = rustlet(&host, &["ps", "-q", "--no-trunc"], b"").await;
@@ -846,16 +881,18 @@ async fn port_shows_published_ports_like_docker() {
     let (d, host, _dir) = daemon();
     let (code, stdout, stderr) = rustlet(&host, &["port", "web"], b"").await;
     assert_eq!(code, 0, "{}", stderr.text());
+    // An IPv6 host address in brackets, after the IPv4 ones.
     assert_eq!(
         stdout.text(),
         "53/udp -> 0.0.0.0:5353\n\
          80/tcp -> 0.0.0.0:8080\n\
          80/tcp -> 127.0.0.1:9090\n\
+         80/tcp -> [::1]:9090\n\
          443/tcp -> 127.0.0.1:8443\n"
     );
     // One port: the host addresses it is published on.
     let (code, stdout, _) = rustlet(&host, &["port", "web", "80"], b"").await;
-    assert_eq!((code, stdout.text().as_str()), (0, "0.0.0.0:8080\n127.0.0.1:9090\n"));
+    assert_eq!((code, stdout.text().as_str()), (0, "0.0.0.0:8080\n127.0.0.1:9090\n[::1]:9090\n"));
     let (code, stdout, _) = rustlet(&host, &["port", "web", "53/udp"], b"").await;
     assert_eq!((code, stdout.text().as_str()), (0, "0.0.0.0:5353\n"));
     // 53 is published for UDP only, and a port without a protocol is TCP's.
@@ -914,6 +951,108 @@ async fn run_sends_ports_networks_and_mounts() {
 }
 
 #[tokio::test]
+async fn run_and_create_join_several_networks_at_chosen_addresses() {
+    let (d, host, _dir) = daemon();
+    let args = [
+        "run",
+        "-d",
+        "--network",
+        "backend",
+        "--ip",
+        "10.89.1.5",
+        "--ip6",
+        "fd00:89:0:1::5",
+        "--network-alias",
+        "api",
+        "--net",
+        "net2",
+        "--network",
+        "default",
+        "nginx",
+    ];
+    let (code, _, stderr) = rustlet(&host, &args, b"").await;
+    assert_eq!(code, 0, "{}", stderr.text());
+    let (code, _, stderr) = rustlet(&host, &["create", "--network", "bridge", "--net", "backend", "alpine"], b"").await;
+    assert_eq!(code, 0, "{}", stderr.text());
+    // The first network is the mode, and the aliases and addresses are on
+    // it; the others go by name, `default` as the default network's.
+    let first = ContainerConfig {
+        image: "nginx".into(),
+        network: NetworkMode::Network("backend".into()),
+        network_aliases: vec!["api".into()],
+        ip: Some(Ipv4Addr::new(10, 89, 1, 5)),
+        ip6: Some("fd00:89:0:1::5".parse().unwrap()),
+        extra_networks: vec!["net2".into(), "bridge".into()],
+        ..ContainerConfig::default()
+    };
+    let second = ContainerConfig {
+        image: "alpine".into(),
+        network: NetworkMode::Bridge,
+        extra_networks: vec!["backend".into()],
+        ..ContainerConfig::default()
+    };
+    assert_eq!(*d.configs.lock().unwrap(), [first, second]);
+}
+
+#[tokio::test]
+async fn network_options_that_cant_work_are_refused_before_any_request() {
+    let (d, host, _dir) = daemon();
+    let alone = |a, b| {
+        format!(
+            "conflicting options: --network {a} and --network {b} (host, none and container:NAME can't be combined \
+             with other networks)"
+        )
+    };
+    let twice = |n| format!("--network {n} is given more than once");
+    let chosen = |flag, mode| {
+        format!("{flag} needs a user-defined network as the first --network: {mode} doesn't take static addresses")
+    };
+    let shared = |flag| {
+        format!(
+            "conflicting options: --network container:web and {flag} (on web's network, the ports, addresses, DNS \
+             settings, /etc/hosts and host name are web's)"
+        )
+    };
+    let cases: [(&[&str], String); 13] = [
+        // Only bridge networks go together.
+        (&["--network", "host", "--network", "backend"], alone("host", "backend")),
+        (&["--network", "backend", "--network", "bridge", "--network", "none"], alone("backend", "none")),
+        (&["--net", "default", "--net", "container:web"], alone("bridge", "container:web")),
+        // The same network twice; `default` is `bridge`.
+        (&["--network", "backend", "--network", "backend"], twice("backend")),
+        (&["--network", "default", "--network", "bridge"], twice("bridge")),
+        (&["--network", "host", "--network", "host"], twice("host")),
+        // An address of one's choosing, only on a user-defined first network.
+        (&["--ip", "10.89.0.5"], chosen("--ip", "bridge")),
+        (&["--network", "bridge", "--network", "backend", "--ip6", "fd00:89:0:1::5"], chosen("--ip6", "bridge")),
+        (&["--network", "none", "--ip", "10.89.0.5"], chosen("--ip", "none")),
+        (&["--network", "host", "--ip6", "::5"], chosen("--ip6", "host")),
+        // On another container's network, the addresses are that one's.
+        (&["--network", "container:web", "--ip", "10.89.1.5"], shared("--ip")),
+        (&["--network", "container:web", "--ip6", "fd00::5"], shared("--ip6")),
+        // Aliases are the first network's too.
+        (
+            &["--network", "bridge", "--network", "backend", "--network-alias", "api"],
+            "--network-alias needs a user-defined network (--network NAME): bridge has no DNS server to answer it"
+                .into(),
+        ),
+    ];
+    for command in ["run", "create"] {
+        for (args, error) in &cases {
+            let argv = [&[command][..], args, &["alpine"]].concat();
+            let (code, _, stderr) = rustlet(&host, &argv, b"").await;
+            assert_eq!((code, stderr.text()), (125, format!("rustlet: error: {error}\n")), "{argv:?}");
+        }
+    }
+    // An address that isn't one is a bad command line, as any bad value.
+    for (flag, bad) in [("--ip", "10.89.1"), ("--ip", "fd00::5"), ("--ip6", "10.89.1.5"), ("--ip6", "nope")] {
+        let e = Cli::try_parse_from(["rustlet", "run", flag, bad, "alpine"]).unwrap_err();
+        assert_eq!(e.kind(), clap::error::ErrorKind::ValueValidation, "{flag} {bad}");
+    }
+    assert!(!d.calls().iter().any(|c| c.starts_with("create")), "{:?}", d.calls());
+}
+
+#[tokio::test]
 async fn networks_are_created_listed_inspected_and_removed() {
     let (d, host, _dir) = daemon();
     let args = [
@@ -947,11 +1086,12 @@ async fn networks_are_created_listed_inspected_and_removed() {
     assert_eq!((code, stderr.text().as_str()), (125, "rustlet: error: --gateway needs the --subnet it belongs to\n"));
     assert_eq!(d.network_creates.lock().unwrap().len(), 1);
 
-    // By name, naturally: net2 before net10.
+    // By name, naturally: net2 before net10; a network's IPv6 subnet after
+    // its IPv4 one.
     let (code, stdout, _) = rustlet(&host, &["network", "ls"], b"").await;
     let expected = "\
 NETWORK ID     NAME      DRIVER    SUBNET
-cccccccccccc   backend   bridge    10.89.1.0/24
+cccccccccccc   backend   bridge    10.89.1.0/24, fd00:89:0:1::/64
 bbbbbbbbbbbb   bridge    bridge    10.89.0.0/24
 eeeeeeeeeeee   net2      bridge    10.89.2.0/24
 dddddddddddd   net10     bridge    10.89.10.0/24
@@ -976,6 +1116,139 @@ dddddddddddd   net10     bridge    10.89.10.0/24
     );
     let removed: Vec<String> = d.calls().into_iter().filter(|c| c.starts_with("network rm")).collect();
     assert_eq!(removed, ["network rm backend", "network rm nope", "network rm net2"]);
+}
+
+#[tokio::test]
+async fn network_create_sorts_subnets_and_gateways_by_family() {
+    let (d, host, _dir) = daemon();
+    let args = [
+        "network",
+        "create",
+        "--ipv6",
+        "--subnet",
+        "fd00:89:0:5::/64",
+        "--gateway",
+        "fd00:89:0:5::1",
+        "--subnet",
+        "10.89.5.0/24",
+        "--gateway",
+        "10.89.5.1",
+        "dual",
+    ];
+    let (code, _, stderr) = rustlet(&host, &args, b"").await;
+    assert_eq!(code, 0, "{}", stderr.text());
+    // --ipv6 alone: both subnets from the daemon's pools.
+    let (code, _, stderr) = rustlet(&host, &["network", "create", "--ipv6", "pooled"], b"").await;
+    assert_eq!(code, 0, "{}", stderr.text());
+    let dual = NetworkCreate {
+        name: "dual".into(),
+        subnet: Some("10.89.5.0/24".into()),
+        gateway: Some("10.89.5.1".into()),
+        ipv6: true,
+        subnet6: Some("fd00:89:0:5::/64".into()),
+        gateway6: Some("fd00:89:0:5::1".into()),
+        ..NetworkCreate::default()
+    };
+    let pooled = NetworkCreate { name: "pooled".into(), ipv6: true, ..NetworkCreate::default() };
+    assert_eq!(*d.network_creates.lock().unwrap(), [dual, pooled]);
+
+    // What the values' families alone say is wrong; the rest (prefix
+    // lengths, host bits, overlaps) is the daemon's to find.
+    for (args, error) in [
+        (&["--subnet", "fd00:89:0:5::/64"][..], "--subnet fd00:89:0:5::/64: an IPv6 subnet needs --ipv6"),
+        (
+            &["--subnet", "10.89.5.0/24", "--subnet", "10.89.6.0/24"],
+            "--subnet 10.89.5.0/24 and --subnet 10.89.6.0/24: a network has one IPv4 subnet at most",
+        ),
+        (
+            &["--ipv6", "--subnet", "fd00:89:0:5::/64", "--subnet", "fd00:89:0:6::/64"],
+            "--subnet fd00:89:0:5::/64 and --subnet fd00:89:0:6::/64: a network has one IPv6 subnet at most",
+        ),
+        (
+            &["--subnet", "backend/24"],
+            "--subnet \"backend/24\": not a subnet in CIDR form (10.89.5.0/24, fd00:89:0:5::/64)",
+        ),
+        (&["--subnet", "10.89.5.0/24", "--gateway", "10.89.5"], "--gateway \"10.89.5\": not an IP address"),
+        (&["--subnet", "10.89.5.0/24", "--gateway", "fd00:89:0:5::1"], "--gateway needs the --subnet it belongs to"),
+        (
+            &["--ipv6", "--subnet", "fd00:89:0:5::/64", "--gateway", "10.89.5.1"],
+            "--gateway needs the --subnet it belongs to",
+        ),
+        (
+            &["--subnet", "10.89.5.0/24", "--gateway", "10.89.5.1", "--gateway", "10.89.5.2"],
+            "--gateway 10.89.5.1 and --gateway 10.89.5.2: a subnet has one gateway",
+        ),
+    ] {
+        let argv = [&["network", "create"][..], args, &["x"]].concat();
+        let (code, _, stderr) = rustlet(&host, &argv, b"").await;
+        assert_eq!((code, stderr.text()), (125, format!("rustlet: error: {error}\n")), "{args:?}");
+    }
+    assert_eq!(d.network_creates.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn containers_are_connected_to_networks_and_disconnected() {
+    let (d, host, _dir) = daemon();
+    let args = [
+        "network",
+        "connect",
+        "--alias",
+        "db",
+        "--alias",
+        "store",
+        "--ip",
+        "10.89.1.5",
+        "--ip6",
+        "fd00:89:0:1::5",
+        "backend",
+        "web",
+    ];
+    // Nothing printed, as with Docker.
+    let (code, stdout, stderr) = rustlet(&host, &args, b"").await;
+    assert_eq!((code, stdout.text().as_str(), stderr.text().as_str()), (0, "", ""));
+    let (code, _, stderr) = rustlet(&host, &["network", "connect", "net2", "web"], b"").await;
+    assert_eq!(code, 0, "{}", stderr.text());
+    let chosen = NetworkConnect {
+        container: "web".into(),
+        aliases: vec!["db".into(), "store".into()],
+        ipv4_address: Some(Ipv4Addr::new(10, 89, 1, 5)),
+        ipv6_address: Some("fd00:89:0:1::5".parse().unwrap()),
+    };
+    let plain = NetworkConnect { container: "web".into(), ..NetworkConnect::default() };
+    assert_eq!(*d.network_connects.lock().unwrap(), [chosen, plain]);
+    // The daemon's refusal is the command's error.
+    let (code, _, stderr) = rustlet(&host, &["network", "connect", "nope", "web"], b"").await;
+    assert_eq!((code, stderr.text().as_str()), (125, "rustlet: error: no such network: nope\n"));
+    // A name the DNS server couldn't answer is refused before any request,
+    // and an address that isn't one is a bad command line.
+    let (code, _, stderr) = rustlet(&host, &["network", "connect", "--alias", "a b", "backend", "web"], b"").await;
+    assert_eq!((code, stderr.text().as_str()), (125, "rustlet: error: --alias \"a b\" is not a host name\n"));
+    for (flag, bad) in [("--ip", "10.89.1"), ("--ip", "fd00::5"), ("--ip6", "10.89.1.5")] {
+        let e = Cli::try_parse_from(["rustlet", "network", "connect", flag, bad, "backend", "web"]).unwrap_err();
+        assert_eq!(e.kind(), clap::error::ErrorKind::ValueValidation, "{flag} {bad}");
+    }
+    let connects: Vec<String> = d.calls().into_iter().filter(|c| c.starts_with("network connect")).collect();
+    assert_eq!(connects, ["network connect backend web", "network connect net2 web", "network connect nope web"]);
+
+    let (code, stdout, stderr) = rustlet(&host, &["network", "disconnect", "backend", "web"], b"").await;
+    assert_eq!((code, stdout.text().as_str(), stderr.text().as_str()), (0, "", ""));
+    // From a network that is gone, only with --force.
+    let (code, _, stderr) = rustlet(&host, &["network", "disconnect", "gone", "web"], b"").await;
+    assert_eq!((code, stderr.text().as_str()), (125, "rustlet: error: no such network: gone\n"));
+    let (code, _, stderr) = rustlet(&host, &["network", "disconnect", "-f", "gone", "web"], b"").await;
+    assert_eq!(code, 0, "{}", stderr.text());
+    assert_eq!(
+        *d.network_disconnects.lock().unwrap(),
+        [
+            NetworkDisconnect { container: "web".into(), force: false },
+            NetworkDisconnect { container: "web".into(), force: true },
+        ]
+    );
+    let disconnects: Vec<String> = d.calls().into_iter().filter(|c| c.starts_with("network disconnect")).collect();
+    assert_eq!(
+        disconnects,
+        ["network disconnect backend web", "network disconnect gone web", "network disconnect gone web"]
+    );
 }
 
 #[tokio::test]

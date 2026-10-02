@@ -8,7 +8,9 @@
 //! rustlet stats                           # live resource use
 //! rustlet stop web && rustlet rm web
 //! rustlet network create backend          # a network whose containers find each other by name
-//! rustlet run -d --network backend -p 8080:80 -v site:/usr/share/nginx/html nginx
+//! rustlet run -d --name site --network backend -p 8080:80 -v site:/usr/share/nginx/html nginx
+//! rustlet network create --ipv6 edge      # dual stack: an IPv6 subnet too
+//! rustlet network connect edge site       # site joins it too, at once if it runs
 //! ```
 //!
 //! Every command is a few calls to the daemon's API through

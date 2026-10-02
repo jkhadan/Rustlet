@@ -2,6 +2,7 @@
 //! socket: real HTTP, chunked NDJSON and WebSocket upgrades, with routes
 //! that do just enough to check what the client sent.
 
+use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,7 +20,9 @@ use rustlet_spec::container::{AttachQuery, ContainerConfig, ContainerSummary, Cr
 use rustlet_spec::exec::{ExecConfig, ExecCreated, ExecStarted};
 use rustlet_spec::image::{PullEvent, PullPolicy, PullQuery};
 use rustlet_spec::logs::{LogStream, LogsQuery};
-use rustlet_spec::network::{Network, NetworkCreate, NetworkCreateResponse, PruneResponse};
+use rustlet_spec::network::{
+    Network, NetworkConnect, NetworkCreate, NetworkCreateResponse, NetworkDisconnect, PruneResponse,
+};
 use rustlet_spec::stream::{self, Control};
 use rustlet_spec::volume::{Volume, VolumeCreate, VolumePruneQuery, VolumeRemoveQuery};
 use rustlet_spec::{ErrorBody, ErrorKind, routes};
@@ -188,6 +191,62 @@ async fn network_routes() {
     within(client.remove_network("backend")).await.unwrap();
     assert_eq!(within(client.prune_networks()).await.unwrap().deleted, ["old", "test"]);
     assert_eq!(*seen.lock().unwrap(), [format!("create {config:?}"), "rm backend".into(), "prune".into()]);
+}
+
+#[tokio::test]
+async fn containers_are_connected_and_disconnected() {
+    async fn connect(State(seen): State<Seen>, Path(id): Path<String>, Json(body): Json<NetworkConnect>) -> Response {
+        saw(&seen, format!("connect {id} {body:?}"));
+        match id.as_str() {
+            "backend" => StatusCode::NO_CONTENT.into_response(),
+            _ => not_found(ErrorKind::NoSuchNetwork, &format!("no such network: {id}")),
+        }
+    }
+    async fn disconnect(
+        State(seen): State<Seen>,
+        Path(id): Path<String>,
+        Json(body): Json<NetworkDisconnect>,
+    ) -> Response {
+        saw(&seen, format!("disconnect {id} {body:?}"));
+        if body.container == "web" {
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        let message = format!("container {} is not connected to the network {id}", body.container);
+        (StatusCode::CONFLICT, Json(ErrorBody::new(ErrorKind::Conflict, message))).into_response()
+    }
+    let seen = Seen::default();
+    let app = Router::new()
+        .route(routes::pattern::NETWORK_CONNECT, post(connect))
+        .route(routes::pattern::NETWORK_DISCONNECT, post(disconnect))
+        .with_state(seen.clone());
+    let (_dir, client) = serve(app);
+
+    let connect = NetworkConnect {
+        container: "web".into(),
+        aliases: vec!["api".into(), "www".into()],
+        ipv4_address: Some(Ipv4Addr::new(10, 89, 1, 5)),
+        ipv6_address: Some("fd00:89:0:1::5".parse().unwrap()),
+    };
+    within(client.connect_network("backend", &connect)).await.unwrap();
+    // A name that isn't a path segment still reaches the route as one.
+    let e = within(client.connect_network("front/end", &connect)).await.unwrap_err();
+    assert_eq!((e.kind(), e.to_string().as_str()), (Some(ErrorKind::NoSuchNetwork), "no such network: front/end"));
+    let forced = NetworkDisconnect { container: "web".into(), force: true };
+    within(client.disconnect_network("backend", &forced)).await.unwrap();
+    let elsewhere = NetworkDisconnect { container: "db".into(), force: false };
+    let e = within(client.disconnect_network("backend", &elsewhere)).await.unwrap_err();
+    assert_eq!((e.status(), e.kind()), (Some(409), Some(ErrorKind::Conflict)));
+    assert_eq!(e.to_string(), "container db is not connected to the network backend");
+    // Each body arrived whole, as JSON.
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            format!("connect backend {connect:?}"),
+            format!("connect front/end {connect:?}"),
+            format!("disconnect backend {forced:?}"),
+            format!("disconnect backend {elsewhere:?}"),
+        ]
+    );
 }
 
 #[tokio::test]

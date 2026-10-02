@@ -187,24 +187,25 @@ fn parse_tail(s: &str) -> anyhow::Result<Option<u64>> {
 }
 
 /// `rustlet port`: what a running container publishes, a line per host
-/// address (`80/tcp -> 0.0.0.0:8080`); with `PRIVATE_PORT[/PROTO]`, only
-/// that port's host addresses (`0.0.0.0:8080`), and exit 1 if it has none.
+/// address (`80/tcp -> 0.0.0.0:8080`, `80/tcp -> [::1]:8080`); with
+/// `PRIVATE_PORT[/PROTO]`, only that port's host addresses
+/// (`0.0.0.0:8080`), and exit 1 if it has none.
 pub async fn port(ctx: &mut Ctx, container: &str, private: Option<&str>) -> anyhow::Result<i32> {
     let wanted = private.map(parse_private_port).transpose()?;
     let mut ports = ctx.client.inspect_container(container).await?.network.ports;
-    // Docker sorts the lines naturally: by port, protocol, host address and
-    // host port.
+    // Docker sorts the lines naturally: by port, protocol, host address
+    // (IPv4 before IPv6) and host port.
     ports.sort_by_key(|p| (p.container_port, p.protocol, p.host_ip, p.host_port));
     let out = &mut ctx.console.stdout;
     let Some((port, protocol)) = wanted else {
         for p in &ports {
-            writeln!(out, "{}/{} -> {}:{}", p.container_port, p.protocol, p.host_ip, p.host_port)?;
+            writeln!(out, "{}/{} -> {}", p.container_port, p.protocol, p.host_addr())?;
         }
         return Ok(0);
     };
     let mut found = false;
     for p in ports.iter().filter(|p| p.container_port == port && Some(p.protocol) == protocol) {
-        writeln!(out, "{}:{}", p.host_ip, p.host_port)?;
+        writeln!(out, "{}", p.host_addr())?;
         found = true;
     }
     if !found {

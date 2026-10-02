@@ -74,7 +74,9 @@ use rustlet_spec::image::{
     ImageDeleteQuery, ImageDeleteResponse, ImageInspect, ImageQuery, ImageSummary, PullEvent, PullPolicy, PullQuery,
 };
 use rustlet_spec::logs::{LogEntry, LogsQuery};
-use rustlet_spec::network::{Network, NetworkCreate, NetworkCreateResponse, PruneResponse};
+use rustlet_spec::network::{
+    Network, NetworkConnect, NetworkCreate, NetworkCreateResponse, NetworkDisconnect, PruneResponse,
+};
 use rustlet_spec::stats::{StatsQuery, StatsSample};
 use rustlet_spec::system::{Info, Version};
 use rustlet_spec::volume::{Volume, VolumeCreate, VolumePruneQuery, VolumeRemoveQuery};
@@ -334,6 +336,18 @@ impl Client {
         self.call(Method::DELETE, routes::network(&segment(id))).await
     }
 
+    /// Connects a container to the network `id` (id, unique prefix or
+    /// name): at once if it runs, otherwise from its next start.
+    pub async fn connect_network(&self, id: &str, body: &NetworkConnect) -> Result<()> {
+        self.call_with(Method::POST, routes::network_connect(&segment(id)), body).await
+    }
+
+    /// Disconnects a container from the network `id`; with `force`, also
+    /// from one that is gone (the container forgets it).
+    pub async fn disconnect_network(&self, id: &str, body: &NetworkDisconnect) -> Result<()> {
+        self.call_with(Method::POST, routes::network_disconnect(&segment(id)), body).await
+    }
+
     /// Removes the user-defined networks no container uses; the answer
     /// names them.
     pub async fn prune_networks(&self) -> Result<PruneResponse> {
@@ -416,9 +430,12 @@ impl Client {
 
     /// A request whose answer carries nothing (204, or `OK`).
     async fn call(&self, method: Method, path: String) -> Result<()> {
-        let response = self.request(method, path, None).await?;
-        response.into_body().collect().await?;
-        Ok(())
+        read_empty(self.request(method, path, None).await?).await
+    }
+
+    /// [`call`](Self::call) with a JSON body.
+    async fn call_with<B: Serialize>(&self, method: Method, path: String, body: &B) -> Result<()> {
+        read_empty(self.request(method, path, Some(serde_json::to_vec(body)?)).await?).await
     }
 
     async fn stream<T>(&self, path: String, check: fn(T) -> Result<T>) -> Result<JsonStream<T>>
@@ -477,6 +494,13 @@ fn segment(s: &str) -> Cow<'_, str> {
 async fn read_json<T: DeserializeOwned>(response: Response<Incoming>) -> Result<T> {
     let body = response.into_body().collect().await?.to_bytes();
     Ok(serde_json::from_slice(&body)?)
+}
+
+/// Reads an answer that carries nothing to its end: a daemon that hangs up
+/// halfway is still an error.
+async fn read_empty(response: Response<Incoming>) -> Result<()> {
+    response.into_body().collect().await?;
+    Ok(())
 }
 
 /// An error response as [`Error::Api`]. The body should be an

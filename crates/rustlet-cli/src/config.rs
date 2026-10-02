@@ -5,14 +5,15 @@
 //! `-v ./dir:…` its current directory, `--entrypoint ""` becomes "no
 //! entrypoint", labels become a map, port ranges one mapping per port. It
 //! also refuses what can't work (`--rm` with a restart policy, a name the
-//! daemon would reject, `-p` on another container's network, two mounts
-//! on one path), so that the error comes before anything exists. What the
+//! daemon would reject, `-p` on another container's network, `--network
+//! host` beside another network, `--ip` on the default one, two mounts on
+//! one path), so that the error comes before anything exists. What the
 //! flags *mean* (an entrypoint replacing the image's, a user looked up in
 //! the image, a volume created on first use) is the daemon's business.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
@@ -101,12 +102,18 @@ pub struct CreateFlags {
     /// Publish every port the image exposes, each on a free host port
     #[arg(short = 'P', long)]
     pub publish_all: bool,
-    /// Network to join: bridge (the default), none, host, container:NAME|ID, or a network's name
+    /// Network to join: bridge (the default), none, host, container:NAME|ID, or a network's name (repeatable, to join more networks)
     #[arg(long, visible_alias = "net", value_name = "NETWORK")]
-    pub network: Option<String>,
-    /// Another name for the container on its (user-defined) network (repeatable)
+    pub network: Vec<String>,
+    /// Another name for the container on its first (user-defined) network (repeatable)
     #[arg(long, value_name = "ALIAS")]
     pub network_alias: Vec<String>,
+    /// IPv4 address on its first network, a user-defined one (default: the next free one)
+    #[arg(long, value_name = "IPV4")]
+    pub ip: Option<Ipv4Addr>,
+    /// IPv6 address on its first network, a user-defined one with IPv6 (default: the next free one)
+    #[arg(long, value_name = "IPV6")]
+    pub ip6: Option<Ipv6Addr>,
     /// DNS server to use instead of the host's (repeatable)
     #[arg(long, value_name = "IP")]
     pub dns: Vec<String>,
@@ -190,10 +197,7 @@ impl CreateFlags {
         }
         // 0 means no limit, as for Docker.
         let cpus = self.cpus.filter(|&c| c > 0.0);
-        let network = match &self.network {
-            Some(mode) => NetworkMode::parse(mode).map_err(anyhow::Error::msg)?,
-            None => NetworkMode::default(),
-        };
+        let (network, extra_networks) = self.networks()?;
         self.check_network(&network)?;
         Ok(ContainerConfig {
             image,
@@ -227,9 +231,9 @@ impl CreateFlags {
             devices: self.device.clone(),
             network,
             network_aliases: self.network_alias.clone(),
-            ip: None,
-            ip6: None,
-            extra_networks: Vec::new(),
+            ip: self.ip,
+            ip6: self.ip6,
+            extra_networks,
             ports: parse_ports(&self.publish)?,
             publish_all: self.publish_all,
             dns: parse_dns(&self.dns)?,
@@ -256,10 +260,44 @@ impl CreateFlags {
         Ok(mounts)
     }
 
+    /// `--network`, given once or more: the first is the container's
+    /// network mode, any later one another network to connect it to, by
+    /// name (`bridge` and `default` are the default network). Only bridge
+    /// networks go together: on the host's network, on none or on another
+    /// container's, the container has no network namespace of its own to
+    /// connect anywhere else.
+    fn networks(&self) -> anyhow::Result<(NetworkMode, Vec<String>)> {
+        let modes = self.network.iter().map(|n| NetworkMode::parse(n));
+        let modes: Vec<NetworkMode> = modes.collect::<Result<_, _>>().map_err(anyhow::Error::msg)?;
+        let mut seen = HashSet::new();
+        for mode in &modes {
+            if !seen.insert(mode) {
+                bail!("--network {mode} is given more than once");
+            }
+        }
+        if modes.len() > 1
+            && let Some(alone) = modes.iter().position(|m| m.network_name().is_none())
+        {
+            // The first and the one that can't go with it, or the second if
+            // that is the first.
+            let (a, b) = (&modes[0], &modes[alone.max(1)]);
+            bail!(
+                "conflicting options: --network {a} and --network {b} (host, none and container:NAME can't be \
+                 combined with other networks)"
+            );
+        }
+        // Bridge networks all, by now.
+        let extra = modes.iter().skip(1).filter_map(NetworkMode::network_name).map(str::to_owned).collect();
+        Ok((modes.into_iter().next().unwrap_or_default(), extra))
+    }
+
     /// Refuses what `mode` leaves no room for, as Docker does: a container
-    /// on another container's network has that one's ports, DNS settings,
-    /// hosts file and host name; and aliases are names for the DNS server
-    /// that only a user-defined network has.
+    /// on another container's network has that one's ports, addresses, DNS
+    /// settings, hosts file and host name; aliases are names for the DNS
+    /// server that only a user-defined network has; and an address of the
+    /// user's choosing (`--ip`, `--ip6`) is for a user-defined network too,
+    /// the default one's subnet being the daemon's configuration, not the
+    /// user's.
     fn check_network(&self, mode: &NetworkMode) -> anyhow::Result<()> {
         if let NetworkMode::Container(other) = mode {
             let given = [
@@ -271,11 +309,13 @@ impl CreateFlags {
                 ("--add-host", !self.add_host.is_empty()),
                 ("--hostname", self.hostname.is_some()),
                 ("--network-alias", !self.network_alias.is_empty()),
+                ("--ip", self.ip.is_some()),
+                ("--ip6", self.ip6.is_some()),
             ];
             if let Some((flag, _)) = given.iter().find(|(_, given)| *given) {
                 bail!(
                     "conflicting options: --network container:{other} and {flag} (on {other}'s network, the ports, \
-                     DNS settings, /etc/hosts and host name are {other}'s)"
+                     addresses, DNS settings, /etc/hosts and host name are {other}'s)"
                 );
             }
         }
@@ -283,6 +323,12 @@ impl CreateFlags {
             bail!(
                 "--network-alias needs a user-defined network (--network NAME): {mode} has no DNS server to answer it"
             );
+        }
+        let addresses = [("--ip", self.ip.is_some()), ("--ip6", self.ip6.is_some())];
+        if let Some((flag, _)) = addresses.iter().find(|(_, given)| *given)
+            && !matches!(mode, NetworkMode::Network(_))
+        {
+            bail!("{flag} needs a user-defined network as the first --network: {mode} doesn't take static addresses");
         }
         Ok(())
     }
@@ -408,8 +454,6 @@ pub fn parse_labels(values: &[String]) -> anyhow::Result<BTreeMap<String, String
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
-
     use clap::Parser;
     use rustlet_spec::network::Protocol;
     use rustlet_spec::volume::MountType;
@@ -501,6 +545,14 @@ mod tests {
             "api",
             "--network-alias",
             "www",
+            "--ip",
+            "10.89.1.5",
+            "--ip6",
+            "fd00:89:0:1::5",
+            "--net",
+            "net2",
+            "--network",
+            "default",
             "--dns",
             "10.0.0.2",
             "--dns",
@@ -565,9 +617,10 @@ mod tests {
             devices: vec!["/dev/fuse".into()],
             network: NetworkMode::Network("backend".into()),
             network_aliases: vec!["api".into(), "www".into()],
-            ip: None,
-            ip6: None,
-            extra_networks: Vec::new(),
+            ip: Some(Ipv4Addr::new(10, 89, 1, 5)),
+            ip6: Some("fd00:89:0:1::5".parse().unwrap()),
+            // `default` is the default network, by its name.
+            extra_networks: vec!["net2".into(), "bridge".into()],
             // The range is one mapping per port.
             ports: vec![
                 mapping(None, 8080, 80, Protocol::Tcp),
@@ -648,7 +701,11 @@ mod tests {
         assert_eq!(network(&["--network", "container:db"]), NetworkMode::Container("db".into()));
         let e = config(&["--network", "a b"]).unwrap_err().to_string();
         assert!(e.starts_with("--network \"a b\": "), "{e}");
-        assert!(Probe::try_parse_from(["p", "--network", "a", "--network", "b"]).is_err(), "one network");
+        // Given again: more networks, after the first.
+        let c = config(&["--network", "bridge", "--net", "b", "--network=a"]).unwrap();
+        assert_eq!((c.network, c.extra_networks), (NetworkMode::Bridge, vec!["b".into(), "a".into()]));
+        let e = config(&["--network", "a", "--network", "b c"]).unwrap_err().to_string();
+        assert!(e.starts_with("--network \"b c\": "), "{e}");
     }
 
     #[test]
@@ -662,6 +719,8 @@ mod tests {
             ("--add-host", &["--add-host", "db:10.0.0.5"]),
             ("--hostname", &["--hostname", "box"]),
             ("--network-alias", &["--network-alias", "api"]),
+            ("--ip", &["--ip", "10.89.1.5"]),
+            ("--ip6", &["--ip6", "fd00::5"]),
         ] {
             let e = config(&[&["--network", "container:db"][..], args].concat()).unwrap_err().to_string();
             assert!(e.starts_with(&format!("conflicting options: --network container:db and {flag} (")), "{e}");
