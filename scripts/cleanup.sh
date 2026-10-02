@@ -98,7 +98,7 @@ unmount_under "$DATA" "$PURGE"
 
 say "5. removing netns pins and network links"
 [ -d "$RUN/netns" ] && run find "$RUN/netns" -mindepth 1 -maxdepth 1 -type f -delete
-for l in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | grep -E '^(rustlet[0-9]*|rlv[0-9a-f]+|rlb-.*)$'); do
+for l in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | grep -E '^(rustlet[0-9]*|rlv[0-9a-f]+|rlb[0-9a-f]+)$'); do
   run ip link delete "$l" && echo "   deleted link $l"
 done
 
@@ -139,7 +139,7 @@ say "leftover check"
 [ "$(id -u)" != 0 ] && echo "   (not root: the nft and cgroup checks below may miss leftovers; use sudo for a full answer)"
 left=0
 if grep -qE " ($DATA|$RUN)/" /proc/self/mountinfo; then echo "   mounts:";  grep -E " ($DATA|$RUN)/" /proc/self/mountinfo | awk '{print "     " $5}'; left=1; fi
-if ip -o link show 2>/dev/null | grep -qE ': (rustlet|rlv)'; then echo "   links remain"; left=1; fi
+if ip -o link show 2>/dev/null | grep -qE ': (rustlet|rlv|rlb)'; then echo "   links remain"; left=1; fi
 if nft list table inet rustlet >/dev/null 2>&1; then echo "   nft table remains"; left=1; fi
 if [ -d "$CG/system.slice/rustletd.service/containers" ] && [ -n "$(ls -A "$CG/system.slice/rustletd.service/containers" 2>/dev/null)" ]; then
   echo "   container cgroups remain"; left=1
