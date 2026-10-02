@@ -20,6 +20,7 @@ doc = false
 [dependencies]
 rustlet-runtime.workspace = true
 rustlet-image.workspace = true
+rustlet-net.workspace = true
 rustlet-sys.workspace = true
 rustlet-shim.workspace = true
 rustlet-spec.workspace = true

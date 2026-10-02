@@ -14,6 +14,7 @@
 pub mod daemon;
 pub mod e2e;
 pub mod images;
+pub mod net;
 pub mod shim;
 
 use std::path::{Path, PathBuf};
