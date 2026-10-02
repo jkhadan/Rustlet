@@ -12,6 +12,8 @@
 
 use std::io::{self, IsTerminal, Read, Write};
 
+use anyhow::bail;
+
 /// Standard input, output and error, and whether each is a terminal.
 pub struct Console {
     /// Taken by the first session that forwards input.
@@ -35,6 +37,56 @@ impl Console {
             stderr_tty: io::stderr().is_terminal(),
         }
     }
+
+    /// Docker's confirmation: `question` and ` [y/N] ` on stdout, then a
+    /// line of stdin as the answer, whatever stdin is (`echo y | …` answers
+    /// too). `y` or `Y` is a yes, any other answer (an empty line too) a
+    /// no. Input that ends before any answer (a script without `-f`, with
+    /// nobody to ask) is an error, where Docker takes a quiet no: a script
+    /// can't then mistake a prune that never happened for one that found
+    /// nothing.
+    pub async fn confirm(&mut self, question: &str) -> anyhow::Result<bool> {
+        write!(self.stdout, "{question} [y/N] ")?;
+        self.stdout.flush()?;
+        let answer = match self.stdin.take() {
+            Some(mut stdin) => {
+                // A blocking read, off the runtime's threads.
+                let (stdin, answer) = tokio::task::spawn_blocking(move || {
+                    let answer = read_line(&mut *stdin);
+                    (stdin, answer)
+                })
+                .await?;
+                self.stdin = Some(stdin);
+                answer?
+            }
+            None => String::new(),
+        };
+        // Only a terminal echoes the answer, and its newline: otherwise the
+        // question's line is still open.
+        if !(self.stdin_tty && answer.ends_with('\n')) {
+            writeln!(self.stdout)?;
+        }
+        if answer.is_empty() {
+            bail!("no answer on stdin, so nothing was done (-f goes ahead without asking)");
+        }
+        Ok(answer.trim().eq_ignore_ascii_case("y"))
+    }
+}
+
+/// Input up to and with the first newline, or to its end: read a byte at a
+/// time, so that nothing after the line is taken from whoever reads next.
+fn read_line(input: &mut dyn Read) -> io::Result<String> {
+    let mut line = Vec::new();
+    let mut byte = [0];
+    while line.last() != Some(&b'\n') {
+        match input.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => line.push(byte[0]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(String::from_utf8_lossy(&line).into_owned())
 }
 
 #[cfg(test)]
@@ -79,5 +131,36 @@ pub mod testing {
             stderr_tty: false,
         };
         (console, stdout, stderr)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::console;
+    use super::*;
+
+    #[tokio::test]
+    async fn a_confirmation_takes_one_line() {
+        let (mut c, stdout, _) = console(b"Y\nmore input\n");
+        // As if typed: the terminal has echoed the answer and its newline.
+        c.stdin_tty = true;
+        assert!(c.confirm("Sure?").await.unwrap());
+        assert_eq!(stdout.text(), "Sure? [y/N] ");
+        // What follows the line is still there for the next reader.
+        let mut rest = String::new();
+        c.stdin.take().unwrap().read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, "more input\n");
+
+        // Ctrl-D on a terminal: no answer, and the line ends here.
+        let (mut c, stdout, _) = console(b"");
+        c.stdin_tty = true;
+        let e = c.confirm("Sure?").await.unwrap_err();
+        assert!(e.to_string().starts_with("no answer on stdin"), "{e}");
+        assert_eq!(stdout.text(), "Sure? [y/N] \n");
+
+        // An answer without a newline, at the end of piped input.
+        let (mut c, stdout, _) = console(b" y ");
+        assert!(c.confirm("Sure?").await.unwrap());
+        assert_eq!(stdout.text(), "Sure? [y/N] \n");
     }
 }

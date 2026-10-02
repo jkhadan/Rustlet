@@ -1,22 +1,25 @@
-//! How the CLI shows things: tables, sizes, durations, states and names,
-//! the way `docker` shows them.
+//! How the CLI shows things: tables, sizes, durations, states, ports and
+//! names, the way `docker` shows them and in its order.
 //!
 //! People read these outputs by eye and scripts by column, and both know
 //! Docker's, so the wording and arithmetic are Docker's (its CLI and the
 //! `go-units` package it uses): `Up 5 minutes`, `Exited (0) 3 seconds
 //! ago`, memory in binary units with four significant digits (`5.629MiB`),
-//! transfer and image sizes in decimal ones with three (`7.81MB`). Where
-//! Docker prints something odd (`1e+03kB` for a value that rounds up to
-//! the next unit) this prints the plain number instead.
+//! transfer and image sizes in decimal ones with three (`7.81MB`), the
+//! space a prune freed with four (`7.812MB`). Where Docker prints
+//! something odd (`1e+03kB` for a value that rounds up to the next unit)
+//! this prints the plain number instead.
 //!
 //! Everything that depends on the time takes "now" as an argument, so the
 //! tests can pin it.
 
+use std::cmp::Ordering;
 use std::io::{self, Write};
 use std::time::Duration;
 
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use rustlet_spec::container::{ContainerState, ContainerStatus};
+use rustlet_spec::network::PublishedPort;
 
 /// A table laid out as `docker` lays them out (Go's `tabwriter` with a
 /// minimum width of 10 and a padding of 3): every column but the last is
@@ -135,6 +138,52 @@ pub fn command_text(command: &[String], full: bool) -> String {
     format!("{line:?}")
 }
 
+/// The PORTS column of `ps`: `0.0.0.0:8080->80/tcp, …`, in Docker's order
+/// (by container port, then host address, host port and protocol). Unlike
+/// Docker's, a range is shown port by port.
+pub fn ports_text(ports: &[PublishedPort]) -> String {
+    let mut ports = ports.to_vec();
+    ports.sort_by_key(|p| (p.container_port, p.host_ip, p.host_port, p.protocol));
+    ports.iter().map(PublishedPort::to_string).collect::<Vec<_>>().join(", ")
+}
+
+/// Docker's order for names in a list (`sortorder.NaturalLess`): a run of
+/// digits compares as a number (`net2` before `net10`) and comes before
+/// any other character; the rest compares byte by byte. Of two equal
+/// numbers, the one with fewer leading zeros comes first.
+pub fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    // The first index from `i` on whose byte isn't of `class`, or the end.
+    let end =
+        |s: &[u8], i: usize, class: fn(&u8) -> bool| s[i..].iter().position(|c| !class(c)).map_or(s.len(), |n| i + n);
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match (a[i].is_ascii_digit(), b[j].is_ascii_digit()) {
+            (true, false) => return Ordering::Less,
+            (false, true) => return Ordering::Greater,
+            (false, false) if a[i] != b[j] => return a[i].cmp(&b[j]),
+            (false, false) => (i, j) = (i + 1, j + 1),
+            (true, true) => {
+                // Each number's significant digits, after its leading zeros.
+                let (start_a, start_b) = (end(a, i, |c| *c == b'0'), end(b, j, |c| *c == b'0'));
+                let (end_a, end_b) = (end(a, start_a, u8::is_ascii_digit), end(b, start_b, u8::is_ascii_digit));
+                // Fewer digits is smaller; else the first digit that differs
+                // decides; else fewer zeros comes first.
+                let order = (end_a - start_a)
+                    .cmp(&(end_b - start_b))
+                    .then_with(|| a[start_a..end_a].cmp(&b[start_b..end_b]))
+                    .then_with(|| (start_a - i).cmp(&(start_b - j)));
+                if order != Ordering::Equal {
+                    return order;
+                }
+                (i, j) = (end_a, end_b);
+            }
+        }
+    }
+    // Equal so far: the one that ended first comes first.
+    (a.len() - i).cmp(&(b.len() - j))
+}
+
 /// `s` cut to `max` characters, the last of them `…`.
 pub fn ellipsis(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -154,8 +203,16 @@ pub fn bytes_iec(n: u64) -> String {
 /// Bytes in decimal units, three significant digits: `7.81MB`. For
 /// network and block I/O and image sizes.
 pub fn bytes_si(n: u64) -> String {
-    scaled(n, 1000.0, &["B", "kB", "MB", "GB", "TB", "PB", "EB"], 3)
+    scaled(n, 1000.0, &SI_UNITS, 3)
 }
+
+/// Bytes in decimal units, four significant digits: `7.812MB`, as Docker's
+/// `HumanSize`. For the space a prune reclaimed.
+pub fn human_size(n: u64) -> String {
+    scaled(n, 1000.0, &SI_UNITS, 4)
+}
+
+const SI_UNITS: [&str; 7] = ["B", "kB", "MB", "GB", "TB", "PB", "EB"];
 
 fn scaled(n: u64, base: f64, units: &[&str], digits: usize) -> String {
     let mut v = n as f64;
@@ -315,6 +372,8 @@ fn parse_go_duration(s: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    use rustlet_spec::network::Protocol;
+
     use super::*;
 
     fn at(s: &str) -> DateTime<Utc> {
@@ -448,6 +507,44 @@ mod tests {
         assert_eq!(bytes_si(7_812_345), "7.81MB");
         assert_eq!(bytes_si(187_430_000), "187MB");
         assert_eq!(bytes_si(1_234_567_890), "1.23GB");
+        assert_eq!(human_size(0), "0B");
+        assert_eq!(human_size(999), "999B");
+        assert_eq!(human_size(1200), "1.2kB");
+        assert_eq!(human_size(7_812_345), "7.812MB");
+        assert_eq!(human_size(1_234_567_890), "1.235GB");
+    }
+
+    #[test]
+    fn ports_are_shown_in_dockers_order() {
+        let port = |ip: [u8; 4], host_port, container_port, protocol| PublishedPort {
+            host_ip: ip.into(),
+            host_port,
+            container_port,
+            protocol,
+        };
+        let ports = [
+            port([127, 0, 0, 1], 8443, 443, Protocol::Tcp),
+            port([0, 0, 0, 0], 5353, 53, Protocol::Udp),
+            port([0, 0, 0, 0], 8081, 80, Protocol::Tcp),
+            port([0, 0, 0, 0], 8080, 80, Protocol::Udp),
+        ];
+        // By container port, then host address and port, then protocol.
+        assert_eq!(
+            ports_text(&ports),
+            "0.0.0.0:5353->53/udp, 0.0.0.0:8080->80/udp, 0.0.0.0:8081->80/tcp, 127.0.0.1:8443->443/tcp"
+        );
+        assert_eq!(ports_text(&[]), "");
+    }
+
+    #[test]
+    fn names_sort_naturally() {
+        let mut names = ["net10", "net2", "Net1", "a", "net02", "net2a", "9e", "10", "net", "web"];
+        names.sort_by(|a, b| natural_cmp(a, b));
+        // Numbers by value, before letters; of equal ones, fewer zeros first,
+        // whatever follows (sortorder's rule).
+        assert_eq!(names, ["9e", "10", "Net1", "a", "net", "net2", "net2a", "net02", "net10", "web"]);
+        assert_eq!(natural_cmp("db", "db"), Ordering::Equal);
+        assert_eq!(natural_cmp("a00", "a0"), Ordering::Greater);
     }
 
     #[test]

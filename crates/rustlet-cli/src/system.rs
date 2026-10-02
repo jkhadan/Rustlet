@@ -48,6 +48,8 @@ pub async fn info(ctx: &mut Ctx) -> anyhow::Result<i32> {
     writeln!(out, " Paused: {}", info.paused)?;
     writeln!(out, " Stopped: {}", info.stopped)?;
     writeln!(out, "Images: {}", info.images)?;
+    writeln!(out, "Networks: {}", info.networks)?;
+    writeln!(out, "Volumes: {}", info.volumes)?;
     writeln!(out, "Server Version: {}", version.version)?;
     writeln!(out, "Storage Driver: {}", info.storage_driver)?;
     writeln!(out, "Cgroup Parent: {}", info.cgroup_parent)?;

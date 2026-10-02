@@ -12,14 +12,16 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use futures::{SinkExt, StreamExt};
 use rustlet_client::{Client, Error, SessionEvent};
-use rustlet_spec::container::{AttachQuery, ContainerConfig, ContainerSummary, CreateResponse, ListQuery};
+use rustlet_spec::container::{AttachQuery, ContainerConfig, ContainerSummary, CreateResponse, ListQuery, RemoveQuery};
 use rustlet_spec::exec::{ExecConfig, ExecCreated, ExecStarted};
 use rustlet_spec::image::{PullEvent, PullPolicy, PullQuery};
 use rustlet_spec::logs::{LogStream, LogsQuery};
+use rustlet_spec::network::{Network, NetworkCreate, NetworkCreateResponse, PruneResponse};
 use rustlet_spec::stream::{self, Control};
+use rustlet_spec::volume::{Volume, VolumeCreate, VolumePruneQuery, VolumeRemoveQuery};
 use rustlet_spec::{ErrorBody, ErrorKind, routes};
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot};
@@ -108,6 +110,146 @@ async fn error_bodies_become_api_errors() {
     assert_eq!(e.to_string(), "no such container: a/b c");
     let e = within(client.start("web")).await.unwrap_err();
     assert_eq!(e.kind().map(ErrorKind::cli_exit_code), Some(127));
+}
+
+/// What a mock route was sent, one line per request, for the test to
+/// compare once the calls are done.
+type Seen = Arc<Mutex<Vec<String>>>;
+
+fn saw(seen: &Seen, what: String) {
+    seen.lock().unwrap().push(what);
+}
+
+#[tokio::test]
+async fn container_removal_takes_its_volumes_only_when_asked() {
+    async fn remove(State(seen): State<Seen>, Path(id): Path<String>, Query(q): Query<RemoveQuery>) -> StatusCode {
+        saw(&seen, format!("rm {id} force={} volumes={}", q.force, q.volumes));
+        StatusCode::NO_CONTENT
+    }
+    let seen = Seen::default();
+    let (_dir, client) =
+        serve(Router::new().route(routes::pattern::CONTAINER, delete(remove)).with_state(seen.clone()));
+
+    within(client.remove_container("web", true)).await.unwrap();
+    within(client.remove_container_with("web", &RemoveQuery { force: false, volumes: true })).await.unwrap();
+    assert_eq!(*seen.lock().unwrap(), ["rm web force=true volumes=false", "rm web force=false volumes=true"]);
+}
+
+#[tokio::test]
+async fn network_routes() {
+    async fn create(State(seen): State<Seen>, Json(config): Json<NetworkCreate>) -> Response {
+        saw(&seen, format!("create {config:?}"));
+        let created = NetworkCreateResponse { id: "1d".repeat(32), name: config.name };
+        (StatusCode::CREATED, Json(created)).into_response()
+    }
+    async fn list() -> Json<Vec<Network>> {
+        let network = |name: &str| Network { name: name.into(), driver: "bridge".into(), ..Network::default() };
+        Json(vec![network("bridge"), network("backend")])
+    }
+    async fn inspect(Path(id): Path<String>) -> Response {
+        if id != "backend" {
+            return not_found(ErrorKind::NoSuchNetwork, &format!("no such network: {id}"));
+        }
+        let subnet = "10.89.1.0/24".to_owned();
+        Json(Network { id: "1d".repeat(32), name: id, subnet, ..Network::default() }).into_response()
+    }
+    async fn remove(State(seen): State<Seen>, Path(id): Path<String>) -> StatusCode {
+        saw(&seen, format!("rm {id}"));
+        StatusCode::NO_CONTENT
+    }
+    async fn prune(State(seen): State<Seen>) -> Json<PruneResponse> {
+        saw(&seen, "prune".into());
+        Json(PruneResponse { deleted: vec!["old".into(), "test".into()], space_reclaimed: 0 })
+    }
+    let seen = Seen::default();
+    let app = Router::new()
+        .route(routes::pattern::NETWORKS, get(list).post(create))
+        .route(routes::pattern::NETWORK, get(inspect).delete(remove))
+        .route(routes::pattern::NETWORK_PRUNE, post(prune))
+        .with_state(seen.clone());
+    let (_dir, client) = serve(app);
+
+    let config = NetworkCreate {
+        name: "backend".into(),
+        subnet: Some("10.89.1.0/24".into()),
+        gateway: Some("10.89.1.1".into()),
+        internal: true,
+        labels: [("tier".to_owned(), "db".to_owned())].into(),
+    };
+    let created = within(client.create_network(&config)).await.unwrap();
+    assert_eq!((created.id, created.name.as_str()), ("1d".repeat(32), "backend"));
+    let names: Vec<String> = within(client.list_networks()).await.unwrap().into_iter().map(|n| n.name).collect();
+    assert_eq!(names, ["bridge", "backend"]);
+    assert_eq!(within(client.inspect_network("backend")).await.unwrap().subnet, "10.89.1.0/24");
+    let e = within(client.inspect_network("front/end")).await.unwrap_err();
+    assert!(e.is_not_found());
+    assert_eq!((e.kind(), e.to_string().as_str()), (Some(ErrorKind::NoSuchNetwork), "no such network: front/end"));
+    within(client.remove_network("backend")).await.unwrap();
+    assert_eq!(within(client.prune_networks()).await.unwrap().deleted, ["old", "test"]);
+    assert_eq!(*seen.lock().unwrap(), [format!("create {config:?}"), "rm backend".into(), "prune".into()]);
+}
+
+#[tokio::test]
+async fn volume_routes() {
+    async fn create(State(seen): State<Seen>, Json(config): Json<VolumeCreate>) -> Response {
+        saw(&seen, format!("create {config:?}"));
+        let name = config.name.unwrap_or_else(|| "a5".repeat(32));
+        let volume = Volume { mountpoint: format!("/var/lib/rustlet/volumes/{name}/_data"), name, ..Volume::default() };
+        (StatusCode::CREATED, Json(volume)).into_response()
+    }
+    async fn list() -> Json<Vec<Volume>> {
+        Json(vec![Volume { name: "data".into(), driver: "local".into(), ..Volume::default() }])
+    }
+    async fn inspect(Path(name): Path<String>) -> Response {
+        match name.as_str() {
+            "data" => Json(Volume { name, containers: vec!["web".into()], ..Volume::default() }).into_response(),
+            _ => not_found(ErrorKind::NoSuchVolume, &format!("no such volume: {name}")),
+        }
+    }
+    async fn remove(
+        State(seen): State<Seen>,
+        Path(name): Path<String>,
+        Query(q): Query<VolumeRemoveQuery>,
+    ) -> StatusCode {
+        saw(&seen, format!("rm {name} force={}", q.force));
+        StatusCode::NO_CONTENT
+    }
+    async fn prune(State(seen): State<Seen>, Query(q): Query<VolumePruneQuery>) -> Json<PruneResponse> {
+        saw(&seen, format!("prune all={}", q.all));
+        Json(PruneResponse { deleted: vec!["cache".into()], space_reclaimed: 4096 })
+    }
+    let seen = Seen::default();
+    let app = Router::new()
+        .route(routes::pattern::VOLUMES, get(list).post(create))
+        .route(routes::pattern::VOLUME, get(inspect).delete(remove))
+        .route(routes::pattern::VOLUME_PRUNE, post(prune))
+        .with_state(seen.clone());
+    let (_dir, client) = serve(app);
+
+    let named = VolumeCreate { name: Some("data".into()), labels: [("k".to_owned(), String::new())].into() };
+    assert_eq!(within(client.create_volume(&named)).await.unwrap().mountpoint, "/var/lib/rustlet/volumes/data/_data");
+    let anonymous = within(client.create_volume(&VolumeCreate::default())).await.unwrap();
+    assert_eq!(anonymous.name, "a5".repeat(32));
+    assert_eq!(within(client.list_volumes()).await.unwrap()[0].driver, "local");
+    assert_eq!(within(client.inspect_volume("data")).await.unwrap().containers, ["web"]);
+    let e = within(client.inspect_volume("my data")).await.unwrap_err();
+    assert_eq!((e.kind(), e.to_string().as_str()), (Some(ErrorKind::NoSuchVolume), "no such volume: my data"));
+    within(client.remove_volume("data", false)).await.unwrap();
+    within(client.remove_volume("gone", true)).await.unwrap();
+    let pruned = within(client.prune_volumes(true)).await.unwrap();
+    assert_eq!((pruned.deleted.as_slice(), pruned.space_reclaimed), (&["cache".to_owned()][..], 4096));
+    within(client.prune_volumes(false)).await.unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            format!("create {named:?}"),
+            format!("create {:?}", VolumeCreate::default()),
+            "rm data force=false".into(),
+            "rm gone force=true".into(),
+            "prune all=true".into(),
+            "prune all=false".into(),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -225,6 +367,8 @@ struct Received {
     stdin: Vec<u8>,
     resizes: Vec<(u16, u16)>,
     eof: bool,
+    /// The answer to the route's ping, which tungstenite sends by itself.
+    pong: bool,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -240,7 +384,10 @@ async fn websocket_sessions_carry_both_directions() {
         socket.send(Message::Ping(Bytes::from_static(b"are you there"))).await.unwrap();
         socket.send(data(stream::STDERR, b"err")).await.unwrap();
         let mut received = Received::default();
-        while !received.eof {
+        // The pong too, before the exit and the close: a pong still queued
+        // when the socket closes would fail the client's next read, the one
+        // that would have read the exit.
+        while !(received.eof && received.pong) {
             match socket.recv().await.unwrap().unwrap() {
                 Message::Binary(b) => {
                     let (id, d) = stream::parse_data_message(&b).unwrap();
@@ -252,7 +399,7 @@ async fn websocket_sessions_carry_both_directions() {
                     Control::StdinEof => received.eof = true,
                     other => panic!("{other:?}"),
                 },
-                Message::Pong(_) => {}
+                Message::Pong(_) => received.pong = true,
                 other => panic!("{other:?}"),
             }
         }
@@ -291,7 +438,9 @@ async fn websocket_sessions_carry_both_directions() {
         ]
     );
     let received = within(rx).await.unwrap();
-    assert_eq!(received, Received { stdin: b"hello world".to_vec(), resizes: vec![(24, 80), (50, 132)], eof: true });
+    let expected =
+        Received { stdin: b"hello world".to_vec(), resizes: vec![(24, 80), (50, 132)], eof: true, pong: true };
+    assert_eq!(received, expected);
 }
 
 #[tokio::test]

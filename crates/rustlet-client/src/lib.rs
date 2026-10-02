@@ -74,8 +74,10 @@ use rustlet_spec::image::{
     ImageDeleteQuery, ImageDeleteResponse, ImageInspect, ImageQuery, ImageSummary, PullEvent, PullPolicy, PullQuery,
 };
 use rustlet_spec::logs::{LogEntry, LogsQuery};
+use rustlet_spec::network::{Network, NetworkCreate, NetworkCreateResponse, PruneResponse};
 use rustlet_spec::stats::{StatsQuery, StatsSample};
 use rustlet_spec::system::{Info, Version};
+use rustlet_spec::volume::{Volume, VolumeCreate, VolumePruneQuery, VolumeRemoveQuery};
 use rustlet_spec::{ErrorBody, ErrorKind, routes};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -148,8 +150,9 @@ impl Client {
         self.get(routes::version()).await
     }
 
-    /// What the daemon manages (container and image counts) and how it is
-    /// set up (its directories, runtime, the host's CPUs and memory).
+    /// What the daemon manages (container, image, network and volume
+    /// counts) and how it is set up (its directories, runtime, the host's
+    /// CPUs and memory).
     pub async fn info(&self) -> Result<Info> {
         self.get(routes::info()).await
     }
@@ -178,13 +181,17 @@ impl Client {
         self.get(routes::container(&segment(id))).await
     }
 
-    /// With `force`, a live container is killed first.
+    /// With `force`, a live container is killed first. Its anonymous
+    /// volumes stay; [`remove_container_with`](Self::remove_container_with)
+    /// can take them too.
     pub async fn remove_container(&self, id: &str, force: bool) -> Result<()> {
-        self.call(
-            Method::DELETE,
-            with_query(routes::container(&segment(id)), &RemoveQuery { force, ..RemoveQuery::default() })?,
-        )
-        .await
+        self.remove_container_with(id, &RemoveQuery { force, ..RemoveQuery::default() }).await
+    }
+
+    /// `rm` with all its options: `force` kills a live container first,
+    /// `volumes` removes its anonymous volumes with it (`rm -v`).
+    pub async fn remove_container_with(&self, id: &str, query: &RemoveQuery) -> Result<()> {
+        self.call(Method::DELETE, with_query(routes::container(&segment(id)), query)?).await
     }
 
     /// Starts a created or exited container. A program that can't run fails
@@ -302,6 +309,65 @@ impl Client {
             PullEvent::Error { message } => Err(Error::Stream(message)),
             event => Ok(event),
         }))
+    }
+
+    // --- networks ---
+
+    /// Every network, the default `bridge` among them.
+    pub async fn list_networks(&self) -> Result<Vec<Network>> {
+        self.get(routes::networks()).await
+    }
+
+    /// Creates a bridge network; its subnet comes from the daemon's pool
+    /// unless `config` names one.
+    pub async fn create_network(&self, config: &NetworkCreate) -> Result<NetworkCreateResponse> {
+        self.send(Method::POST, routes::networks(), config).await
+    }
+
+    /// `id` is a network's id, a unique prefix of one, or its name.
+    pub async fn inspect_network(&self, id: &str) -> Result<Network> {
+        self.get(routes::network(&segment(id))).await
+    }
+
+    /// `id` as for [`inspect_network`](Self::inspect_network).
+    pub async fn remove_network(&self, id: &str) -> Result<()> {
+        self.call(Method::DELETE, routes::network(&segment(id))).await
+    }
+
+    /// Removes the user-defined networks no container uses; the answer
+    /// names them.
+    pub async fn prune_networks(&self) -> Result<PruneResponse> {
+        read_json(self.request(Method::POST, routes::network_prune(), None).await?).await
+    }
+
+    // --- volumes ---
+
+    /// Every volume, named and anonymous.
+    pub async fn list_volumes(&self) -> Result<Vec<Volume>> {
+        self.get(routes::volumes()).await
+    }
+
+    /// Creates a volume; without a name in `config`, an anonymous one with
+    /// a generated name.
+    pub async fn create_volume(&self, config: &VolumeCreate) -> Result<Volume> {
+        self.send(Method::POST, routes::volumes(), config).await
+    }
+
+    /// A volume, by its name.
+    pub async fn inspect_volume(&self, name: &str) -> Result<Volume> {
+        self.get(routes::volume(&segment(name))).await
+    }
+
+    /// With `force`, a volume that doesn't exist is no error.
+    pub async fn remove_volume(&self, name: &str, force: bool) -> Result<()> {
+        self.call(Method::DELETE, with_query(routes::volume(&segment(name)), &VolumeRemoveQuery { force })?).await
+    }
+
+    /// Removes the anonymous volumes no container uses, and with `all` the
+    /// named ones too; the answer names them, with the bytes freed.
+    pub async fn prune_volumes(&self, all: bool) -> Result<PruneResponse> {
+        let path = with_query(routes::volume_prune(), &VolumePruneQuery { all })?;
+        read_json(self.request(Method::POST, path, None).await?).await
     }
 
     // --- plumbing ---
@@ -453,7 +519,7 @@ fn kind_for_status(status: u16) -> ErrorKind {
     match status {
         400 => ErrorKind::Invalid,
         409 => ErrorKind::Conflict,
-        // 404 could be any of three kinds; `Error::is_not_found` looks at
+        // 404 could be any of five kinds; `Error::is_not_found` looks at
         // the status instead.
         _ => ErrorKind::Internal,
     }
@@ -488,6 +554,11 @@ mod tests {
             with_query("/p".into(), &pull).unwrap(),
             "/p?reference=docker.io%2Flibrary%2Falpine%3Alatest&policy=always"
         );
+        assert_eq!(
+            with_query("/p".into(), &RemoveQuery { force: false, volumes: true }).unwrap(),
+            "/p?force=false&volumes=true"
+        );
+        assert_eq!(with_query("/p".into(), &VolumePruneQuery { all: true }).unwrap(), "/p?all=true");
     }
 
     #[test]

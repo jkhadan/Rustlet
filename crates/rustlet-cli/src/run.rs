@@ -27,7 +27,7 @@ use anyhow::bail;
 use clap::ArgAction;
 use rustlet_client::Session;
 use rustlet_spec::ErrorKind;
-use rustlet_spec::container::{ContainerConfig, ContainerStatus, CreateResponse, WaitCondition};
+use rustlet_spec::container::{ContainerConfig, ContainerStatus, CreateResponse, RemoveQuery, WaitCondition};
 use rustlet_spec::exec::ExecConfig;
 use rustlet_spec::image::PullPolicy;
 
@@ -137,7 +137,7 @@ fn from_environment(key: &str) -> Option<String> {
 
 pub async fn run(ctx: &mut Ctx, args: RunArgs) -> anyhow::Result<i32> {
     let (image, cmd) = first_and_rest(args.args);
-    let mut config = args.flags.to_config(image, cmd, &from_environment)?;
+    let mut config = args.flags.to_config(image, cmd, &from_environment, &std::env::current_dir)?;
     let attach_stdin = args.flags.interactive && !args.detach;
     if args.detach {
         // Nobody attaches now whose input ending should close the
@@ -182,7 +182,7 @@ pub async fn run(ctx: &mut Ctx, args: RunArgs) -> anyhow::Result<i32> {
 
 pub async fn create(ctx: &mut Ctx, args: CreateArgs) -> anyhow::Result<i32> {
     let (image, cmd) = first_and_rest(args.args);
-    let config = args.flags.to_config(image, cmd, &from_environment)?;
+    let config = args.flags.to_config(image, cmd, &from_environment, &std::env::current_dir)?;
     let created = create_container(ctx, &config, args.flags.pull).await?;
     writeln!(ctx.console.stdout, "{}", created.id)?;
     Ok(0)
@@ -223,12 +223,13 @@ async fn pull_to_stderr(ctx: &mut Ctx, image: &str, policy: PullPolicy) -> anyho
 }
 
 /// After a failed start: a container that was to be removed when done is
-/// removed now, since it never ran and so never will be otherwise.
+/// removed now, since it never ran and so never will be otherwise; with
+/// its anonymous volumes, as the daemon removes a `--rm` container.
 async fn remove_unstarted(ctx: &mut Ctx, id: &str, auto_remove: bool) {
     if auto_remove {
         // Best effort: the daemon may have removed it already, and the
         // error to report is the start's.
-        let _ = ctx.client.remove_container(id, true).await;
+        let _ = ctx.client.remove_container_with(id, &RemoveQuery { force: true, volumes: true }).await;
     }
 }
 

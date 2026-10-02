@@ -3,6 +3,7 @@
 //! a temporary Unix socket that records the calls it gets and answers like
 //! rustletd would.
 
+use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,21 +13,26 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use futures::StreamExt;
 use rustlet_spec::container::{
-    AttachQuery, ContainerConfig, ContainerState, ContainerStatus, ContainerSummary, CreateResponse, KillQuery,
-    StopQuery, WaitQuery, WaitResponse,
+    AttachQuery, ContainerConfig, ContainerInspect, ContainerState, ContainerStatus, ContainerSummary, CreateResponse,
+    KillQuery, RemoveQuery, StopQuery, WaitQuery, WaitResponse,
 };
 use rustlet_spec::exec::{ExecConfig, ExecCreated};
-use rustlet_spec::image::{BlobKind, ImageSummary, PullEvent, PullQuery};
+use rustlet_spec::image::{BlobKind, ImageQuery, ImageSummary, PullEvent, PullQuery};
 use rustlet_spec::logs::{LogEntry, LogStream, LogsQuery};
+use rustlet_spec::network::{
+    Network, NetworkCreate, NetworkCreateResponse, NetworkMode, NetworkSettings, PortMapping, Protocol, PruneResponse,
+    PublishedPort,
+};
 use rustlet_spec::routes::pattern;
 use rustlet_spec::stats::{StatsQuery, StatsSample};
 use rustlet_spec::stream::{self, Control};
-use rustlet_spec::system::Info;
+use rustlet_spec::system::{Info, Version};
+use rustlet_spec::volume::{MountType, Volume, VolumeCreate, VolumePruneQuery, VolumeRemoveQuery};
 use rustlet_spec::{ErrorBody, ErrorKind};
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
@@ -90,6 +96,13 @@ struct Daemon {
     execs: Mutex<Vec<ExecConfig>>,
     /// What came in on stdin.
     stdin: Mutex<Vec<u8>>,
+    /// The options of each `rm`.
+    removals: Mutex<Vec<RemoveQuery>>,
+    network_creates: Mutex<Vec<NetworkCreate>>,
+    volume_creates: Mutex<Vec<VolumeCreate>>,
+    /// A prune has removed what there was.
+    networks_pruned: AtomicBool,
+    volumes_pruned: AtomicBool,
 }
 
 type Shared = State<Arc<Daemon>>;
@@ -208,9 +221,36 @@ async fn wait(State(d): Shared, Query(q): Query<WaitQuery>) -> Json<WaitResponse
     Json(WaitResponse { status_code: 3, ..WaitResponse::default() })
 }
 
-async fn remove(State(d): Shared, Path(id): Path<String>) -> StatusCode {
+async fn remove(State(d): Shared, Path(id): Path<String>, Query(q): Query<RemoveQuery>) -> StatusCode {
     d.call(format!("rm {}", rustlet_spec::short_id(&id)));
+    d.removals.lock().unwrap().push(q);
     StatusCode::NO_CONTENT
+}
+
+fn published(host_ip: [u8; 4], host_port: u16, container_port: u16, protocol: Protocol) -> PublishedPort {
+    PublishedPort { host_ip: Ipv4Addr::from(host_ip), host_port, container_port, protocol }
+}
+
+/// `web`, with four published ports (out of order); nothing else exists.
+async fn inspect_container(State(d): Shared, Path(id): Path<String>) -> Response {
+    d.call(format!("inspect container {id}"));
+    if id != "web" {
+        return error(ErrorKind::NoSuchContainer, &format!("no such container: {id}"));
+    }
+    let ports = vec![
+        published([127, 0, 0, 1], 8443, 443, Protocol::Tcp),
+        published([0, 0, 0, 0], 8080, 80, Protocol::Tcp),
+        published([0, 0, 0, 0], 5353, 53, Protocol::Udp),
+        published([127, 0, 0, 1], 9090, 80, Protocol::Tcp),
+    ];
+    let network = NetworkSettings { ports, ..NetworkSettings::default() };
+    Json(ContainerInspect { id: "b".repeat(64), name: id, network, ..ContainerInspect::default() }).into_response()
+}
+
+/// No image is there.
+async fn inspect_image(State(d): Shared, Query(q): Query<ImageQuery>) -> Response {
+    d.call(format!("inspect image {}", q.name));
+    error(ErrorKind::NoSuchImage, &format!("no such image: {}", q.name))
 }
 
 async fn stop(State(d): Shared, Path(id): Path<String>, Query(q): Query<StopQuery>) -> Response {
@@ -254,6 +294,10 @@ async fn list() -> Json<Vec<ContainerSummary>> {
                 started_at: Some(ago(5)),
                 ..ContainerState::default()
             },
+            ports: vec![
+                published([127, 0, 0, 1], 8443, 443, Protocol::Tcp),
+                published([0, 0, 0, 0], 8080, 80, Protocol::Tcp),
+            ],
             ..ContainerSummary::default()
         },
     ])
@@ -297,7 +341,129 @@ async fn exec_start_detached(State(d): Shared) -> Json<rustlet_spec::exec::ExecS
 }
 
 async fn info() -> Json<Info> {
-    Json(Info { memory: 2 << 30, ..Info::default() })
+    Json(Info { memory: 2 << 30, networks: 4, volumes: 4, ..Info::default() })
+}
+
+async fn version() -> Json<Version> {
+    Json(Version { version: "0.1.0".into(), api_version: "v1".into(), ..Version::default() })
+}
+
+/// The mock's networks, in no particular order; ids `bbbb…` to `eeee…`.
+fn networks() -> Vec<Network> {
+    let network = |id: &str, name: &str, subnet: &str| Network {
+        id: id.repeat(64),
+        name: name.into(),
+        driver: "bridge".into(),
+        subnet: subnet.into(),
+        ..Network::default()
+    };
+    vec![
+        network("b", "bridge", "10.89.0.0/24"),
+        network("d", "net10", "10.89.10.0/24"),
+        network("c", "backend", "10.89.1.0/24"),
+        network("e", "net2", "10.89.2.0/24"),
+    ]
+}
+
+/// A network by name or id prefix, as the daemon finds them.
+fn find_network(id: &str) -> Option<Network> {
+    networks().into_iter().find(|n| n.name == id || n.id.starts_with(id))
+}
+
+async fn network_list() -> Json<Vec<Network>> {
+    Json(networks())
+}
+
+async fn network_create(State(d): Shared, Json(config): Json<NetworkCreate>) -> Response {
+    d.network_creates.lock().unwrap().push(config.clone());
+    let created = NetworkCreateResponse { id: "f".repeat(64), name: config.name };
+    (StatusCode::CREATED, Json(created)).into_response()
+}
+
+async fn network_inspect(State(d): Shared, Path(id): Path<String>) -> Response {
+    d.call(format!("inspect network {id}"));
+    match find_network(&id) {
+        Some(network) => Json(network).into_response(),
+        None => error(ErrorKind::NoSuchNetwork, &format!("no such network: {id}")),
+    }
+}
+
+async fn network_remove(State(d): Shared, Path(id): Path<String>) -> Response {
+    d.call(format!("network rm {id}"));
+    match find_network(&id) {
+        Some(_) => StatusCode::NO_CONTENT.into_response(),
+        None => error(ErrorKind::NoSuchNetwork, &format!("no such network: {id}")),
+    }
+}
+
+/// The first prune removes two networks; the next finds nothing.
+async fn network_prune(State(d): Shared) -> Json<PruneResponse> {
+    d.call("network prune");
+    let deleted =
+        if d.networks_pruned.swap(true, Ordering::SeqCst) { vec![] } else { vec!["net10".into(), "net2".into()] };
+    Json(PruneResponse { deleted, space_reclaimed: 0 })
+}
+
+/// The name of the mock's anonymous volume.
+fn anonymous() -> String {
+    "9e".repeat(32)
+}
+
+/// The mock's volumes, in no particular order.
+fn volumes() -> Vec<Volume> {
+    let volume = |name: String, anonymous| Volume {
+        driver: "local".into(),
+        mountpoint: format!("/var/lib/rustlet/volumes/{name}/_data"),
+        anonymous,
+        name,
+        ..Volume::default()
+    };
+    vec![
+        volume("data".into(), false),
+        volume(anonymous(), true),
+        volume("cache10".into(), false),
+        volume("cache2".into(), false),
+    ]
+}
+
+async fn volume_list() -> Json<Vec<Volume>> {
+    Json(volumes())
+}
+
+async fn volume_create(State(d): Shared, Json(config): Json<VolumeCreate>) -> Response {
+    d.volume_creates.lock().unwrap().push(config.clone());
+    let volume = Volume { name: config.name.unwrap_or_else(anonymous), driver: "local".into(), ..Volume::default() };
+    (StatusCode::CREATED, Json(volume)).into_response()
+}
+
+async fn volume_inspect(State(d): Shared, Path(name): Path<String>) -> Response {
+    d.call(format!("inspect volume {name}"));
+    match volumes().into_iter().find(|v| v.name == name) {
+        Some(volume) => Json(volume).into_response(),
+        None => error(ErrorKind::NoSuchVolume, &format!("no such volume: {name}")),
+    }
+}
+
+async fn volume_remove(State(d): Shared, Path(name): Path<String>, Query(q): Query<VolumeRemoveQuery>) -> Response {
+    d.call(format!("volume rm {name} force={}", q.force));
+    if q.force || volumes().iter().any(|v| v.name == name) {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    error(ErrorKind::NoSuchVolume, &format!("no such volume: {name}"))
+}
+
+/// The first prune removes the anonymous volume (with `all`, the named ones
+/// too), 7.8 MB in all; the next finds nothing.
+async fn volume_prune(State(d): Shared, Query(q): Query<VolumePruneQuery>) -> Json<PruneResponse> {
+    d.call(format!("volume prune all={}", q.all));
+    if d.volumes_pruned.swap(true, Ordering::SeqCst) {
+        return Json(PruneResponse::default());
+    }
+    let mut deleted = vec![anonymous()];
+    if q.all {
+        deleted.extend(["cache10".into(), "cache2".into(), "data".into()]);
+    }
+    Json(PruneResponse { deleted, space_reclaimed: 7_812_345 })
 }
 
 /// Two samples a second apart (by their `read` times), then nothing more,
@@ -360,7 +526,7 @@ fn daemon() -> (Arc<Daemon>, String, tempfile::TempDir) {
     let d = Arc::new(Daemon::default());
     let app = Router::new()
         .route(pattern::CONTAINERS, post(create).get(list))
-        .route(pattern::CONTAINER, delete(remove))
+        .route(pattern::CONTAINER, get(inspect_container).delete(remove))
         .route(&pattern::container_action("start"), post(start))
         .route(&pattern::container_action("attach"), get(attach))
         .route(&pattern::container_action("wait"), post(wait))
@@ -372,7 +538,15 @@ fn daemon() -> (Arc<Daemon>, String, tempfile::TempDir) {
         .route(&pattern::container_action("stats"), get(stats))
         .route(pattern::IMAGE_PULL, post(pull))
         .route(pattern::IMAGES, get(images))
+        .route(pattern::IMAGE_INSPECT, get(inspect_image))
+        .route(pattern::NETWORKS, get(network_list).post(network_create))
+        .route(pattern::NETWORK, get(network_inspect).delete(network_remove))
+        .route(pattern::NETWORK_PRUNE, post(network_prune))
+        .route(pattern::VOLUMES, get(volume_list).post(volume_create))
+        .route(pattern::VOLUME, get(volume_inspect).delete(volume_remove))
+        .route(pattern::VOLUME_PRUNE, post(volume_prune))
         .route(pattern::INFO, get(info))
+        .route(pattern::VERSION, get(version))
         .with_state(d.clone());
     let (host, dir) = serve(app);
     (d, host, dir)
@@ -457,8 +631,10 @@ async fn a_start_that_fails_exits_with_its_kinds_code_and_cleans_up() {
     let (code, _, stderr) = rustlet(&host, &["run", "--rm", "alpine", "nope"], b"").await;
     assert_eq!(code, 127);
     assert_eq!(stderr.text(), "rustlet: error: exec: \"nope\": not found\n");
-    // With --rm, a container that never ran is removed right away.
+    // With --rm, a container that never ran is removed right away, and its
+    // anonymous volumes with it, as the daemon removes a --rm container.
     assert_eq!(d.calls().last().unwrap(), &format!("rm {}", rustlet_spec::short_id(ID)));
+    assert_eq!(*d.removals.lock().unwrap(), [RemoveQuery { force: true, volumes: true }]);
 }
 
 #[tokio::test]
@@ -637,14 +813,295 @@ async fn ps_draws_dockers_table() {
     let (_d, host, _dir) = daemon();
     let (code, stdout, _) = rustlet(&host, &["ps", "-a"], b"").await;
     assert_eq!(code, 0);
+    // Ports by container port, in Docker's place for them.
     let expected = "\
-CONTAINER ID   IMAGE        COMMAND                  CREATED          STATUS                     NAMES
-bbbbbbbbbbbb   nginx:1.27   \"/docker-entrypoint.…\"   10 minutes ago   Up 5 minutes               web
-aaaaaaaaaaaa   alpine       \"sleep 1000\"             2 hours ago      Exited (0) 3 minutes ago   old
+CONTAINER ID   IMAGE        COMMAND                  CREATED          STATUS                     PORTS                                           NAMES
+bbbbbbbbbbbb   nginx:1.27   \"/docker-entrypoint.…\"   10 minutes ago   Up 5 minutes               0.0.0.0:8080->80/tcp, 127.0.0.1:8443->443/tcp   web
+aaaaaaaaaaaa   alpine       \"sleep 1000\"             2 hours ago      Exited (0) 3 minutes ago                                                   old
 ";
     assert_eq!(stdout.text(), expected);
     let (_, stdout, _) = rustlet(&host, &["ps", "-q", "--no-trunc"], b"").await;
     assert_eq!(stdout.text(), format!("{}\n{}\n", "b".repeat(64), "a".repeat(64)));
+}
+
+#[tokio::test]
+async fn rm_takes_anonymous_volumes_only_with_v() {
+    let (d, host, _dir) = daemon();
+    let (code, stdout, _) = rustlet(&host, &["rm", "-v", "a"], b"").await;
+    assert_eq!((code, stdout.text().as_str()), (0, "a\n"));
+    rustlet(&host, &["rm", "--force", "--volumes", "b"], b"").await;
+    rustlet(&host, &["rm", "-f", "c"], b"").await;
+    assert_eq!(
+        *d.removals.lock().unwrap(),
+        [
+            RemoveQuery { force: false, volumes: true },
+            RemoveQuery { force: true, volumes: true },
+            RemoveQuery { force: true, volumes: false },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn port_shows_published_ports_like_docker() {
+    let (d, host, _dir) = daemon();
+    let (code, stdout, stderr) = rustlet(&host, &["port", "web"], b"").await;
+    assert_eq!(code, 0, "{}", stderr.text());
+    assert_eq!(
+        stdout.text(),
+        "53/udp -> 0.0.0.0:5353\n\
+         80/tcp -> 0.0.0.0:8080\n\
+         80/tcp -> 127.0.0.1:9090\n\
+         443/tcp -> 127.0.0.1:8443\n"
+    );
+    // One port: the host addresses it is published on.
+    let (code, stdout, _) = rustlet(&host, &["port", "web", "80"], b"").await;
+    assert_eq!((code, stdout.text().as_str()), (0, "0.0.0.0:8080\n127.0.0.1:9090\n"));
+    let (code, stdout, _) = rustlet(&host, &["port", "web", "53/udp"], b"").await;
+    assert_eq!((code, stdout.text().as_str()), (0, "0.0.0.0:5353\n"));
+    // 53 is published for UDP only, and a port without a protocol is TCP's.
+    let (code, stdout, stderr) = rustlet(&host, &["port", "web", "53"], b"").await;
+    assert_eq!(
+        (code, stdout.text().as_str(), stderr.text().as_str()),
+        (1, "", "rustlet: error: no public port '53' published for web\n")
+    );
+    let (code, _, stderr) = rustlet(&host, &["port", "web", "http"], b"").await;
+    assert_eq!(code, 125);
+    assert!(stderr.text().starts_with("rustlet: error: invalid port \"http\""), "{}", stderr.text());
+    let (code, _, stderr) = rustlet(&host, &["port", "gone"], b"").await;
+    assert_eq!((code, stderr.text().as_str()), (125, "rustlet: error: no such container: gone\n"));
+    // A bad port is refused before the daemon is asked.
+    assert_eq!(d.calls().iter().filter(|c| c.starts_with("inspect container")).count(), 5);
+}
+
+#[tokio::test]
+async fn run_sends_ports_networks_and_mounts() {
+    let (d, host, _dir) = daemon();
+    let args = [
+        "run",
+        "-d",
+        "-p",
+        "8080:80",
+        "--net",
+        "backend",
+        "--network-alias",
+        "api",
+        "-v",
+        "./site:/www:ro",
+        "--tmpfs",
+        "/run",
+        "nginx",
+    ];
+    let (code, _, stderr) = rustlet(&host, &args, b"").await;
+    assert_eq!(code, 0, "{}", stderr.text());
+    let config = d.configs.lock().unwrap()[0].clone();
+    assert_eq!((config.network, config.network_aliases), (NetworkMode::Network("backend".into()), vec!["api".into()]));
+    assert_eq!(config.ports, PortMapping::parse("8080:80").unwrap());
+    // A host path starting with `.` is the CLI's own directory's.
+    let site = std::env::current_dir().unwrap().join("site");
+    assert_eq!((config.mounts[0].kind, config.mounts[0].source.as_deref()), (MountType::Bind, site.to_str()));
+    assert!(config.mounts[0].read_only);
+    assert_eq!((config.mounts[1].kind, config.mounts[1].target.as_str()), (MountType::Tmpfs, "/run"));
+
+    // What can't work is refused before anything exists.
+    let (code, _, stderr) = rustlet(&host, &["create", "--network", "container:web", "-p", "80", "alpine"], b"").await;
+    assert_eq!(code, 125);
+    let stderr = stderr.text();
+    assert!(
+        stderr.starts_with("rustlet: error: conflicting options: --network container:web and --publish"),
+        "{stderr}"
+    );
+    assert_eq!(d.calls().iter().filter(|c| c.starts_with("create")).count(), 1);
+}
+
+#[tokio::test]
+async fn networks_are_created_listed_inspected_and_removed() {
+    let (d, host, _dir) = daemon();
+    let args = [
+        "network",
+        "create",
+        "--subnet",
+        "10.89.5.0/24",
+        "--gateway",
+        "10.89.5.1",
+        "--internal",
+        "--label",
+        "tier=db",
+        "--label",
+        "solo",
+        "store",
+    ];
+    let (code, stdout, stderr) = rustlet(&host, &args, b"").await;
+    assert_eq!(code, 0, "{}", stderr.text());
+    assert_eq!(stdout.text(), format!("{}\n", "f".repeat(64)));
+    let expected = NetworkCreate {
+        name: "store".into(),
+        subnet: Some("10.89.5.0/24".into()),
+        gateway: Some("10.89.5.1".into()),
+        internal: true,
+        labels: [("solo".to_owned(), String::new()), ("tier".to_owned(), "db".to_owned())].into(),
+    };
+    assert_eq!(*d.network_creates.lock().unwrap(), [expected]);
+    // As Docker's CLI: a gateway is in a subnet that is given too.
+    let (code, _, stderr) = rustlet(&host, &["network", "create", "--gateway", "10.89.5.1", "x"], b"").await;
+    assert_eq!((code, stderr.text().as_str()), (125, "rustlet: error: --gateway needs the --subnet it belongs to\n"));
+    assert_eq!(d.network_creates.lock().unwrap().len(), 1);
+
+    // By name, naturally: net2 before net10.
+    let (code, stdout, _) = rustlet(&host, &["network", "ls"], b"").await;
+    let expected = "\
+NETWORK ID     NAME      DRIVER    SUBNET
+cccccccccccc   backend   bridge    10.89.1.0/24
+bbbbbbbbbbbb   bridge    bridge    10.89.0.0/24
+eeeeeeeeeeee   net2      bridge    10.89.2.0/24
+dddddddddddd   net10     bridge    10.89.10.0/24
+";
+    assert_eq!((code, stdout.text().as_str()), (0, expected));
+    let (_, stdout, _) = rustlet(&host, &["network", "list", "-q"], b"").await;
+    assert_eq!(stdout.text(), "cccccccccccc\nbbbbbbbbbbbb\neeeeeeeeeeee\ndddddddddddd\n");
+    let (_, stdout, _) = rustlet(&host, &["network", "ls", "-q", "--no-trunc"], b"").await;
+    assert_eq!(stdout.text(), ["c", "b", "e", "d"].map(|c| c.repeat(64) + "\n").concat());
+
+    // A JSON array of those found; the rest on stderr, and exit 1.
+    let (code, stdout, stderr) = rustlet(&host, &["network", "inspect", "backend", "nope", "eeee"], b"").await;
+    assert_eq!((code, stderr.text().as_str()), (1, "rustlet: error: no such network: nope\n"));
+    let found: Vec<Network> = serde_json::from_str(&stdout.text()).unwrap();
+    assert_eq!(found, [find_network("backend").unwrap(), find_network("net2").unwrap()]);
+
+    // Each name once it is gone; failures on the way.
+    let (code, stdout, stderr) = rustlet(&host, &["network", "rm", "backend", "nope", "net2"], b"").await;
+    assert_eq!(
+        (code, stdout.text().as_str(), stderr.text().as_str()),
+        (1, "backend\nnet2\n", "rustlet: error: no such network: nope\n")
+    );
+    let removed: Vec<String> = d.calls().into_iter().filter(|c| c.starts_with("network rm")).collect();
+    assert_eq!(removed, ["network rm backend", "network rm nope", "network rm net2"]);
+}
+
+#[tokio::test]
+async fn network_prune_asks_first() {
+    let (d, host, _dir) = daemon();
+    let question = "WARNING! This will remove all custom networks not used by at least one container.\n\
+                    Are you sure you want to continue? [y/N] \n";
+    // Nobody to answer (a script without -f): refused, and said so.
+    let (code, stdout, stderr) = rustlet(&host, &["network", "prune"], b"").await;
+    assert_eq!((code, stdout.text().as_str()), (125, question));
+    assert!(stderr.text().starts_with("rustlet: error: no answer on stdin"), "{}", stderr.text());
+    // Anything but y is a no, as with Docker (an empty line, even "yes"):
+    // nothing happens, and that is no failure.
+    for no in [&b"N\n"[..], b"\n", b"yes\n"] {
+        let (code, stdout, stderr) = rustlet(&host, &["network", "prune"], no).await;
+        assert_eq!((code, stdout.text().as_str(), stderr.text().as_str()), (0, question, ""));
+    }
+    assert!(!d.calls().contains(&"network prune".to_owned()));
+    // A yes, typed or piped.
+    let (code, stdout, _) = rustlet(&host, &["network", "prune"], b"y\n").await;
+    assert_eq!((code, stdout.text()), (0, format!("{question}Deleted Networks:\nnet10\nnet2\n\n")));
+    // -f asks nothing; nothing left to remove, nothing printed.
+    let (code, stdout, _) = rustlet(&host, &["network", "prune", "-f"], b"").await;
+    assert_eq!((code, stdout.text().as_str()), (0, ""));
+    assert_eq!(d.calls().iter().filter(|c| *c == "network prune").count(), 2);
+}
+
+#[tokio::test]
+async fn volumes_are_created_listed_inspected_and_removed() {
+    let (d, host, _dir) = daemon();
+    let (code, stdout, _) = rustlet(&host, &["volume", "create", "--label", "tier=db", "store"], b"").await;
+    assert_eq!((code, stdout.text().as_str()), (0, "store\n"));
+    // Without a name, the daemon makes one up.
+    let (code, stdout, _) = rustlet(&host, &["volume", "create"], b"").await;
+    assert_eq!((code, stdout.text()), (0, format!("{}\n", anonymous())));
+    let named = VolumeCreate { name: Some("store".into()), labels: [("tier".to_owned(), "db".to_owned())].into() };
+    assert_eq!(*d.volume_creates.lock().unwrap(), [named, VolumeCreate::default()]);
+
+    let (code, stdout, _) = rustlet(&host, &["volume", "ls"], b"").await;
+    let expected = format!(
+        "DRIVER    VOLUME NAME\n\
+         local     {}\n\
+         local     cache2\n\
+         local     cache10\n\
+         local     data\n",
+        anonymous()
+    );
+    assert_eq!((code, stdout.text()), (0, expected));
+    let (_, stdout, _) = rustlet(&host, &["volume", "list", "-q"], b"").await;
+    assert_eq!(stdout.text(), format!("{}\ncache2\ncache10\ndata\n", anonymous()));
+
+    let (code, stdout, stderr) = rustlet(&host, &["volume", "inspect", "data", "nope"], b"").await;
+    assert_eq!((code, stderr.text().as_str()), (1, "rustlet: error: no such volume: nope\n"));
+    let found: Vec<Volume> = serde_json::from_str(&stdout.text()).unwrap();
+    assert_eq!(found, [volumes()[0].clone()]);
+
+    let (code, stdout, stderr) = rustlet(&host, &["volume", "rm", "data", "nope"], b"").await;
+    assert_eq!(
+        (code, stdout.text().as_str(), stderr.text().as_str()),
+        (1, "data\n", "rustlet: error: no such volume: nope\n")
+    );
+    // With -f, one that isn't there is no error.
+    let (code, stdout, _) = rustlet(&host, &["volume", "rm", "-f", "nope"], b"").await;
+    assert_eq!((code, stdout.text().as_str()), (0, "nope\n"));
+    let removed: Vec<String> = d.calls().into_iter().filter(|c| c.starts_with("volume rm")).collect();
+    assert_eq!(removed, ["volume rm data force=false", "volume rm nope force=false", "volume rm nope force=true"]);
+}
+
+#[tokio::test]
+async fn volume_prune_asks_first_and_counts_the_space() {
+    let (d, host, _dir) = daemon();
+    let question = |what| {
+        format!(
+            "WARNING! This will remove {what} local volumes not used by at least one container.\n\
+             Are you sure you want to continue? [y/N] \n"
+        )
+    };
+    let (code, stdout, _) = rustlet(&host, &["volume", "prune"], b"").await;
+    assert_eq!((code, stdout.text()), (125, question("anonymous")));
+    let (code, stdout, _) = rustlet(&host, &["volume", "prune", "--all"], b"n\n").await;
+    assert_eq!((code, stdout.text()), (0, question("all")));
+    assert!(!d.calls().iter().any(|c| c.starts_with("volume prune")));
+    // What went, and the space it took in Docker's four digits.
+    let (code, stdout, _) = rustlet(&host, &["volume", "prune", "-f"], b"").await;
+    let pruned = format!("Deleted Volumes:\n{}\n\nTotal reclaimed space: 7.812MB\n", anonymous());
+    assert_eq!((code, stdout.text()), (0, pruned));
+    // Nothing (left) to remove: only the total.
+    let (code, stdout, _) = rustlet(&host, &["volume", "prune", "-a"], b"y\n").await;
+    assert_eq!((code, stdout.text()), (0, question("all") + "Total reclaimed space: 0B\n"));
+    let pruned: Vec<String> = d.calls().into_iter().filter(|c| c.starts_with("volume prune")).collect();
+    assert_eq!(pruned, ["volume prune all=false", "volume prune all=true"]);
+}
+
+#[tokio::test]
+async fn inspect_finds_networks_and_volumes_too() {
+    let (d, host, _dir) = daemon();
+    let (code, stdout, stderr) = rustlet(&host, &["inspect", "web", "backend", "data", "nothing"], b"").await;
+    assert_eq!((code, stderr.text().as_str()), (1, "rustlet: error: no such object: nothing\n"));
+    let found: Vec<serde_json::Value> = serde_json::from_str(&stdout.text()).unwrap();
+    let names: Vec<&str> = found.iter().map(|o| o["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["web", "backend", "data"]);
+    // In Docker's order: container, image, network, volume; the first found wins.
+    let lookups = |name: &str| -> Vec<String> {
+        let calls = d.calls().into_iter().filter(|c| c.starts_with("inspect ") && c.ends_with(&format!(" {name}")));
+        calls.map(|c| c.split(' ').nth(1).unwrap().to_owned()).collect()
+    };
+    assert_eq!(lookups("web"), ["container"]);
+    assert_eq!(lookups("backend"), ["container", "image", "network"]);
+    assert_eq!(lookups("nothing"), ["container", "image", "network", "volume"]);
+
+    // With --type, only there, and the daemon's own word for a miss.
+    let (code, stdout, _) = rustlet(&host, &["inspect", "--type", "volume", "data"], b"").await;
+    assert_eq!(code, 0);
+    assert_eq!(serde_json::from_str::<Vec<Volume>>(&stdout.text()).unwrap(), [volumes()[0].clone()]);
+    let (code, stdout, stderr) = rustlet(&host, &["inspect", "--type", "network", "data"], b"").await;
+    assert_eq!((code, stdout.text().as_str()), (1, "[]\n"));
+    assert_eq!(stderr.text(), "rustlet: error: no such network: data\n");
+    assert_eq!(lookups("data"), ["container", "image", "network", "volume", "volume", "network"]);
+}
+
+#[tokio::test]
+async fn info_counts_networks_and_volumes() {
+    let (_d, host, _dir) = daemon();
+    let (code, stdout, stderr) = rustlet(&host, &["info"], b"").await;
+    assert_eq!(code, 0, "{}", stderr.text());
+    let stdout = stdout.text();
+    assert!(stdout.contains("\nImages: 0\nNetworks: 4\nVolumes: 4\nServer Version: 0.1.0\n"), "{stdout}");
 }
 
 #[tokio::test]

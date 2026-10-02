@@ -1,6 +1,6 @@
 //! The container commands that don't stay attached: `ps`, `stop`, `kill`,
 //! `restart`, `rm`, `pause`, `unpause`, `start` (detached), `wait`, `logs`
-//! and `inspect`.
+//! and `port`; and `inspect`, which finds images, networks and volumes too.
 //!
 //! The commands that take several containers act on each in turn, print
 //! each name as it was typed once done (scripts rely on that, as with
@@ -13,13 +13,14 @@ use std::io::Write;
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use rustlet_client::Error;
-use rustlet_spec::container::WaitCondition;
+use rustlet_client::{Client, Error};
+use rustlet_spec::container::{RemoveQuery, WaitCondition};
 use rustlet_spec::logs::{LogStream, LogsQuery};
+use rustlet_spec::network::Protocol;
 use rustlet_spec::short_id;
 
 use crate::Ctx;
-use crate::format::{Table, ago, command_text, parse_time_arg, status_text};
+use crate::format::{Table, ago, command_text, parse_time_arg, ports_text, status_text};
 
 /// `rustlet ps`.
 #[derive(clap::Args, Debug)]
@@ -47,7 +48,7 @@ pub async fn ps(ctx: &mut Ctx, args: PsArgs) -> anyhow::Result<i32> {
         return Ok(0);
     }
     let now = Utc::now();
-    let mut table = Table::new(&["CONTAINER ID", "IMAGE", "COMMAND", "CREATED", "STATUS", "NAMES"]);
+    let mut table = Table::new(&["CONTAINER ID", "IMAGE", "COMMAND", "CREATED", "STATUS", "PORTS", "NAMES"]);
     for c in &containers {
         table.row(vec![
             id(&c.id),
@@ -55,6 +56,7 @@ pub async fn ps(ctx: &mut Ctx, args: PsArgs) -> anyhow::Result<i32> {
             command_text(&c.command, args.no_trunc),
             ago(&c.created, now),
             status_text(&c.state, now),
+            ports_text(&c.ports),
             c.name.clone(),
         ]);
     }
@@ -73,7 +75,7 @@ pub enum Op {
     Stop(Option<u32>),
     Kill(String),
     Restart(Option<u32>),
-    Remove { force: bool },
+    Remove(RemoveQuery),
     Pause,
     Unpause,
 }
@@ -88,7 +90,7 @@ pub async fn each(ctx: &mut Ctx, names: &[String], op: Op) -> anyhow::Result<i32
             Op::Stop(timeout) => ctx.client.stop(name, *timeout).await,
             Op::Kill(signal) => ctx.client.kill(name, Some(signal)).await,
             Op::Restart(timeout) => ctx.client.restart(name, *timeout).await,
-            Op::Remove { force } => ctx.client.remove_container(name, *force).await,
+            Op::Remove(query) => ctx.client.remove_container_with(name, query).await,
             Op::Pause => ctx.client.pause(name).await,
             Op::Unpause => ctx.client.unpause(name).await,
         };
@@ -184,29 +186,91 @@ fn parse_tail(s: &str) -> anyhow::Result<Option<u64>> {
     }
 }
 
-/// `--type` of `inspect`.
+/// `rustlet port`: what a running container publishes, a line per host
+/// address (`80/tcp -> 0.0.0.0:8080`); with `PRIVATE_PORT[/PROTO]`, only
+/// that port's host addresses (`0.0.0.0:8080`), and exit 1 if it has none.
+pub async fn port(ctx: &mut Ctx, container: &str, private: Option<&str>) -> anyhow::Result<i32> {
+    let wanted = private.map(parse_private_port).transpose()?;
+    let mut ports = ctx.client.inspect_container(container).await?.network.ports;
+    // Docker sorts the lines naturally: by port, protocol, host address and
+    // host port.
+    ports.sort_by_key(|p| (p.container_port, p.protocol, p.host_ip, p.host_port));
+    let out = &mut ctx.console.stdout;
+    let Some((port, protocol)) = wanted else {
+        for p in &ports {
+            writeln!(out, "{}/{} -> {}:{}", p.container_port, p.protocol, p.host_ip, p.host_port)?;
+        }
+        return Ok(0);
+    };
+    let mut found = false;
+    for p in ports.iter().filter(|p| p.container_port == port && Some(p.protocol) == protocol) {
+        writeln!(out, "{}:{}", p.host_ip, p.host_port)?;
+        found = true;
+    }
+    if !found {
+        let private = private.unwrap_or_default();
+        writeln!(ctx.console.stderr, "rustlet: error: no public port '{private}' published for {container}")?;
+    }
+    Ok(i32::from(!found))
+}
+
+/// `80`, `80/tcp` or `53/udp`: the port and its protocol, `tcp` unless
+/// given. A protocol other than those two is `None`: nothing publishes on
+/// it, and Docker too just finds no mapping.
+fn parse_private_port(s: &str) -> anyhow::Result<(u16, Option<Protocol>)> {
+    let (port, protocol) = s.split_once('/').unwrap_or((s, ""));
+    let port = port.parse().map_err(|_| anyhow!("invalid port {port:?}: expected PRIVATE_PORT[/PROTO]"))?;
+    let protocol = if protocol.is_empty() { Some(Protocol::Tcp) } else { protocol.parse().ok() };
+    Ok((port, protocol))
+}
+
+/// What `inspect` looks for (`--type`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ObjectType {
     Container,
     Image,
+    Network,
+    Volume,
 }
 
-/// `rustlet inspect`: a JSON array, one object per name found; names that
-/// are neither (or not the `--type` asked for) are reported on stderr.
+impl ObjectType {
+    /// The object of this type named `name`, as JSON.
+    async fn inspect(self, client: &Client, name: &str) -> rustlet_client::Result<serde_json::Value> {
+        let value = match self {
+            ObjectType::Container => serde_json::to_value(client.inspect_container(name).await?),
+            ObjectType::Image => serde_json::to_value(client.inspect_image(name).await?),
+            ObjectType::Network => serde_json::to_value(client.inspect_network(name).await?),
+            ObjectType::Volume => serde_json::to_value(client.inspect_volume(name).await?),
+        };
+        Ok(value?)
+    }
+}
+
+/// The first object named `name`, of whichever type: containers first,
+/// then images, networks and volumes, the order Docker looks in.
+async fn find(client: &Client, name: &str) -> rustlet_client::Result<serde_json::Value> {
+    for kind in [ObjectType::Container, ObjectType::Image, ObjectType::Network] {
+        match kind.inspect(client, name).await {
+            Err(e) if e.is_not_found() => continue,
+            found => return found,
+        }
+    }
+    ObjectType::Volume.inspect(client, name).await
+}
+
+/// `rustlet inspect` (and `network inspect`, `volume inspect`, which give
+/// a type): a JSON array, one object per name found; names that are
+/// nothing (or not of the type asked for) are reported on stderr.
 pub async fn inspect(ctx: &mut Ctx, kind: Option<ObjectType>, names: &[String]) -> anyhow::Result<i32> {
     let mut found = Vec::new();
     let mut failed = false;
     for name in names {
         let object = match kind {
-            Some(ObjectType::Container) => ctx.client.inspect_container(name).await.map(serde_json::to_value),
-            Some(ObjectType::Image) => ctx.client.inspect_image(name).await.map(serde_json::to_value),
-            None => match ctx.client.inspect_container(name).await {
-                Err(e) if e.is_not_found() => ctx.client.inspect_image(name).await.map(serde_json::to_value),
-                container => container.map(serde_json::to_value),
-            },
+            Some(kind) => kind.inspect(&ctx.client, name).await,
+            None => find(&ctx.client, name).await,
         };
         match object {
-            Ok(value) => found.push(value?),
+            Ok(value) => found.push(value),
             Err(e @ Error::Connect { .. }) => return Err(e.into()),
             Err(e) if e.is_not_found() && kind.is_none() => {
                 writeln!(ctx.console.stderr, "rustlet: error: no such object: {name}")?;
@@ -234,5 +298,17 @@ mod tests {
         assert_eq!(parse_tail("0").unwrap(), Some(0));
         assert_eq!(parse_tail("25").unwrap(), Some(25));
         assert!(parse_tail("some").is_err());
+    }
+
+    #[test]
+    fn private_ports() {
+        assert_eq!(parse_private_port("80").unwrap(), (80, Some(Protocol::Tcp)));
+        assert_eq!(parse_private_port("80/").unwrap(), (80, Some(Protocol::Tcp)));
+        assert_eq!(parse_private_port("53/udp").unwrap(), (53, Some(Protocol::Udp)));
+        assert_eq!(parse_private_port("53/UDP").unwrap(), (53, Some(Protocol::Udp)));
+        assert_eq!(parse_private_port("9/sctp").unwrap(), (9, None));
+        for bad in ["", "http", "65536", "-1", "/tcp"] {
+            assert!(parse_private_port(bad).is_err(), "{bad}");
+        }
     }
 }

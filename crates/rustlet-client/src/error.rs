@@ -81,8 +81,8 @@ impl Error {
         }
     }
 
-    /// A 404: no such container, image or exec. (An older daemon may not
-    /// say which kind; the status still does.)
+    /// A 404: no such container, image, exec, network or volume. (An older
+    /// daemon may not say which kind; the status still does.)
     pub fn is_not_found(&self) -> bool {
         self.status() == Some(404)
     }

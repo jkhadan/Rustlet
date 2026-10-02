@@ -7,6 +7,8 @@
 //! rustlet exec -it web sh                 # another process in it
 //! rustlet stats                           # live resource use
 //! rustlet stop web && rustlet rm web
+//! rustlet network create backend          # a network whose containers find each other by name
+//! rustlet run -d --network backend -p 8080:80 -v site:/usr/share/nginx/html nginx
 //! ```
 //!
 //! Every command is a few calls to the daemon's API through
@@ -21,8 +23,10 @@
 //!   wasn't found (as a shell would);
 //! - otherwise the container's (or exec'd process's) own status, for the
 //!   commands that wait for one: `run`, `start -a`, `attach`, `exec`;
-//! - **1** when a command acting on several containers or images failed
-//!   for some of them (`stop a b`, `rm`, `rmi`, `wait`, `inspect`).
+//! - **1** when a command acting on several containers, images, networks
+//!   or volumes failed for some of them (`stop a b`, `rm`, `rmi`, `wait`,
+//!   `inspect`, `network rm`, `volume rm`), and when `port` finds no
+//!   mapping for the port asked about.
 //!
 //! The daemon's socket is `/run/rustlet/rustlet.sock`, or what `--host` /
 //! `RUSTLET_HOST` says (`unix:///path` or a path).
@@ -33,11 +37,13 @@ mod console;
 mod containers;
 mod format;
 mod images;
+mod networks;
 mod pull;
 mod relay;
 mod run;
 mod stats;
 mod system;
+mod volumes;
 
 #[cfg(test)]
 mod tests;
@@ -47,6 +53,7 @@ use std::io::{self, Write};
 
 use clap::{Parser, Subcommand};
 use rustlet_client::Client;
+use rustlet_spec::container::RemoveQuery;
 
 use crate::console::Console;
 use crate::containers::{ObjectType, Op};
@@ -110,6 +117,9 @@ enum Command {
         /// Kill a running container first
         #[arg(short, long)]
         force: bool,
+        /// Remove the containers' anonymous volumes too
+        #[arg(short, long)]
+        volumes: bool,
         #[arg(value_name = "CONTAINER", required = true)]
         containers: Vec<String>,
     },
@@ -132,10 +142,17 @@ enum Command {
     Ps(containers::PsArgs),
     /// Show a container's output
     Logs(containers::LogsArgs),
+    /// List a container's published ports, or the host addresses of one
+    Port {
+        container: String,
+        /// The container's port: 80, 80/tcp, 53/udp
+        #[arg(value_name = "PRIVATE_PORT[/PROTO]")]
+        port: Option<String>,
+    },
     /// Run a command in a running container
     #[command(override_usage = "rustlet exec [OPTIONS] CONTAINER COMMAND [ARG...]")]
     Exec(run::ExecArgs),
-    /// Show low-level information on containers or images, as JSON
+    /// Show low-level information on containers, images, networks or volumes, as JSON
     Inspect {
         /// Only look for this type of object
         #[arg(long = "type", value_enum, value_name = "TYPE")]
@@ -171,6 +188,12 @@ enum Command {
         #[arg(value_name = "IMAGE", required = true)]
         images: Vec<String>,
     },
+    /// Manage networks
+    #[command(subcommand)]
+    Network(networks::NetworkCommand),
+    /// Manage volumes
+    #[command(subcommand)]
+    Volume(volumes::VolumeCommand),
     /// Show what happens in the daemon, as it happens
     Events(system::EventsArgs),
     /// Show the client's and the daemon's versions
@@ -252,12 +275,15 @@ async fn dispatch(ctx: &mut Ctx, command: Command) -> anyhow::Result<i32> {
         Command::Stop { timeout, containers } => containers::each(ctx, &containers, Op::Stop(timeout)).await,
         Command::Kill { signal, containers } => containers::each(ctx, &containers, Op::Kill(signal)).await,
         Command::Restart { timeout, containers } => containers::each(ctx, &containers, Op::Restart(timeout)).await,
-        Command::Rm { force, containers } => containers::each(ctx, &containers, Op::Remove { force }).await,
+        Command::Rm { force, volumes, containers } => {
+            containers::each(ctx, &containers, Op::Remove(RemoveQuery { force, volumes })).await
+        }
         Command::Pause { containers } => containers::each(ctx, &containers, Op::Pause).await,
         Command::Unpause { containers } => containers::each(ctx, &containers, Op::Unpause).await,
         Command::Wait { containers } => containers::wait(ctx, &containers).await,
         Command::Ps(args) => containers::ps(ctx, args).await,
         Command::Logs(args) => containers::logs(ctx, args).await,
+        Command::Port { container, port } => containers::port(ctx, &container, port.as_deref()).await,
         Command::Exec(args) => run::exec(ctx, args).await,
         Command::Inspect { kind, names } => containers::inspect(ctx, kind, &names).await,
         Command::Stats(args) => stats::stats(ctx, args).await,
@@ -265,6 +291,8 @@ async fn dispatch(ctx: &mut Ctx, command: Command) -> anyhow::Result<i32> {
         Command::Pull { quiet, image } => images::pull(ctx, quiet, &image).await,
         Command::Images { quiet, no_trunc } => images::images(ctx, quiet, no_trunc).await,
         Command::Rmi { force, images } => images::rmi(ctx, force, &images).await,
+        Command::Network(command) => networks::network(ctx, command).await,
+        Command::Volume(command) => volumes::volume(ctx, command).await,
         Command::Events(args) => system::events(ctx, args).await,
         Command::Version => system::version(ctx).await,
         Command::Info => system::info(ctx).await,
