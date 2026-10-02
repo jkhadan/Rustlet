@@ -38,15 +38,17 @@ impl LogWriter {
     }
 
     /// Writes one entry, as one line, with one `write` call (a reader never
-    /// sees half an entry, except while the call is in progress).
+    /// sees half an entry, except while the call is in progress). An entry
+    /// that would take the file past `max_size` starts the next one, so
+    /// truncating (`max_files` 1) drops older entries, never the newest.
     pub fn write(&mut self, entry: &LogEntry) -> io::Result<()> {
         let mut line = serde_json::to_vec(entry).map_err(io::Error::other)?;
         line.push(b'\n');
-        self.file.write_all(&line)?;
-        self.size += line.len() as u64;
-        if self.size >= self.max_size {
+        if self.size > 0 && self.size + line.len() as u64 > self.max_size {
             self.rotate()?;
         }
+        self.file.write_all(&line)?;
+        self.size += line.len() as u64;
         Ok(())
     }
 
@@ -60,13 +62,13 @@ impl LogWriter {
         // container.log.(keep-1) → .keep, …, container.log → .1; the oldest
         // one beyond `keep` is replaced by the rename onto it.
         for n in (1..keep).rev() {
-            match std::fs::rename(rotated(&self.path, n), rotated(&self.path, n + 1)) {
+            match std::fs::rename(numbered(&self.path, n), numbered(&self.path, n + 1)) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
         }
-        std::fs::rename(&self.path, rotated(&self.path, 1))?;
+        std::fs::rename(&self.path, numbered(&self.path, 1))?;
         self.file = open_append(&self.path)?;
         self.size = 0;
         Ok(())
@@ -77,15 +79,18 @@ fn open_append(path: &Path) -> io::Result<File> {
     OpenOptions::new().create(true).append(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)
 }
 
-/// `container.log.N`.
-fn rotated(path: &Path, n: u32) -> PathBuf {
+/// `container.log.N`; `N` = 0 is `container.log` itself.
+pub fn numbered(path: &Path, n: u32) -> PathBuf {
+    if n == 0 {
+        return path.to_owned();
+    }
     let mut s = path.as_os_str().to_owned();
     s.push(format!(".{n}"));
     PathBuf::from(s)
 }
 
-/// The log's files that exist, oldest first (the order to read them in).
-pub fn log_files(path: &Path) -> Vec<PathBuf> {
+/// The log's rotated files that exist, with their numbers, oldest first.
+fn rotated_files(path: &Path) -> Vec<(u32, PathBuf)> {
     let mut old: Vec<(u32, PathBuf)> = Vec::new();
     if let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) {
         let prefix = format!("{name}.");
@@ -98,11 +103,21 @@ pub fn log_files(path: &Path) -> Vec<PathBuf> {
         }
     }
     old.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
-    let mut files: Vec<PathBuf> = old.into_iter().map(|(_, p)| p).collect();
+    old
+}
+
+/// The log's files that exist, oldest first (the order to read them in).
+pub fn log_files(path: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = rotated_files(path).into_iter().map(|(_, p)| p).collect();
     if path.exists() {
         files.push(path.to_owned());
     }
     files
+}
+
+/// The highest `N` of a `container.log.N` that exists (0: none).
+pub fn highest_number(path: &Path) -> u32 {
+    rotated_files(path).first().map_or(0, |(n, _)| *n)
 }
 
 /// Cuts one stream's output into lines: an entry per `\n`-terminated line,
@@ -201,7 +216,7 @@ mod tests {
             w.write(&entry(LogStream::Stdout, format!("line {i}\n").as_bytes())).unwrap();
         }
         let files = log_files(&path);
-        assert_eq!(files, [rotated(&path, 2), rotated(&path, 1), path.clone()]);
+        assert_eq!(files, [numbered(&path, 2), numbered(&path, 1), path.clone()]);
         // Read back in order: the newest entries, contiguous, ending with the last.
         let mut logged = Vec::new();
         for f in &files {
@@ -242,5 +257,38 @@ mod tests {
         let e = entry(LogStream::Stdout, b"a\xffb\n");
         assert_eq!(e.log, "a\u{fffd}b\n");
         assert!(e.ts.ends_with('Z') && e.ts.len() == "2026-10-01T00:00:00.000000000Z".len());
+    }
+
+    #[test]
+    fn truncation_keeps_the_newest_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("container.log");
+        let mut w = LogWriter::open(&path, 100, 1).unwrap();
+        for i in 0..10 {
+            w.write(&entry(LogStream::Stdout, format!("{i}\n").as_bytes())).unwrap();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""log":"9\n""#), "the log is {text:?}");
+    }
+
+    #[test]
+    fn rotation_order_with_five_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("container.log");
+        let mut w = LogWriter::open(&path, 200, 5).unwrap();
+        for i in 0..40 {
+            w.write(&entry(LogStream::Stdout, format!("line {i}\n").as_bytes())).unwrap();
+        }
+        let files = log_files(&path);
+        assert_eq!(files.len(), 5);
+        let logged: Vec<String> = files
+            .iter()
+            .flat_map(|f| {
+                let text = std::fs::read_to_string(f).unwrap();
+                text.lines().map(|l| serde_json::from_str::<LogEntry>(l).unwrap().log).collect::<Vec<_>>()
+            })
+            .collect();
+        let first: usize = logged[0].trim_start_matches("line ").trim().parse().unwrap();
+        assert_eq!(logged, (first..40).map(|i| format!("line {i}\n")).collect::<Vec<_>>());
     }
 }

@@ -5,10 +5,19 @@
 //! Following polls: every 200 ms, or at once when the container's state
 //! changes, the current file is read to its end. The shim only ever appends
 //! whole lines and rotates by renaming, so an open file keeps being the one
-//! we were reading; once it ends and `container.log` is a different file
-//! (another inode), the new one is opened from its start. When the container
-//! stops, the shim has written its last output already (it reports the exit
-//! only after that), so one last read finishes the stream.
+//! we were reading. Once `container.log` is a different file (another
+//! inode), ours is read to its end once more (the shim may have added a
+//! last entry just before renaming it), then every file newer than ours,
+//! oldest first: a slow reader may be more than one rotation behind. When
+//! the container stops, the shim has written its last output already (it
+//! reports the exit only after that), so one last read finishes the stream.
+//!
+//! Files are told apart by inode, never by name: a name may stand for
+//! another file by the time it is opened. To find the files newer than
+//! ours, the names are opened from the newest (`container.log`) to the
+//! oldest; rotation moves files the same way (`container.log` → `.1` →
+//! `.2`), so the walk may meet a file twice but never misses one, unless
+//! it was deleted meanwhile (`log_max_files`).
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -92,7 +101,7 @@ pub struct Position {
 /// The entries already written (the last `tail`, if given), and where the
 /// current file ends.
 pub fn existing(path: &Path, filter: &Filter, tail: Option<u64>) -> ApiResult<(Vec<LogEntry>, Position)> {
-    let files = rustlet_shim::logfile::log_files(path);
+    let files = open_newest_first(path, None)?;
     let mut out: VecDeque<LogEntry> = VecDeque::new();
     let keep = |out: &mut VecDeque<LogEntry>, e: LogEntry| {
         if tail == Some(0) {
@@ -106,12 +115,8 @@ pub fn existing(path: &Path, filter: &Filter, tail: Option<u64>) -> ApiResult<(V
         }
     };
     let mut pos = Position { file: None, ino: 0, partial: Vec::new() };
-    for f in &files {
-        let mut file = match File::open(f) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(ApiError::internal(format!("open {}: {e}", f.display()))),
-        };
+    // Oldest first; the newest is where a follower goes on.
+    for (mut file, ino) in files.into_iter().rev() {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         let partial = parse_lines(&bytes, |e| {
@@ -119,13 +124,33 @@ pub fn existing(path: &Path, filter: &Filter, tail: Option<u64>) -> ApiResult<(V
                 keep(&mut out, e);
             }
         });
-        if f == path {
-            pos.ino = file.metadata()?.ino();
-            pos.partial = partial.to_vec();
-            pos.file = Some(file);
-        }
+        pos = Position { file: Some(file), ino, partial: partial.to_vec() };
     }
     Ok((out.into(), pos))
+}
+
+/// The log's files, opened, newest first, each once, back to the one whose
+/// inode is `stop` (not included) or to the oldest.
+fn open_newest_first(path: &Path, stop: Option<u64>) -> std::io::Result<Vec<(File, u64)>> {
+    // A rotation during the walk shifts the names up by one.
+    let last = rustlet_shim::logfile::highest_number(path) + 2;
+    let mut out: Vec<(File, u64)> = Vec::new();
+    for n in 0..=last {
+        let file = match File::open(rustlet_shim::logfile::numbered(path, n)) {
+            Ok(f) => f,
+            // A gap while a rotation renames, or no such file.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let ino = file.metadata()?.ino();
+        if Some(ino) == stop {
+            break;
+        }
+        if !out.iter().any(|(_, i)| *i == ino) {
+            out.push((file, ino));
+        }
+    }
+    Ok(out)
 }
 
 /// Calls `each` for every complete line; returns the incomplete rest.
@@ -183,35 +208,56 @@ pub async fn follow(
     }
 }
 
-/// Whatever was appended since the last read, including a switch to a new
-/// file after a rotation.
+/// Whatever was appended since the last read, including the files that
+/// rotations started meanwhile.
 fn read_new(path: &Path, pos: &mut Position, filter: &Filter) -> std::io::Result<Vec<LogEntry>> {
     let mut out = Vec::new();
-    loop {
-        if let Some(f) = pos.file.as_mut() {
-            let mut bytes = std::mem::take(&mut pos.partial);
-            f.read_to_end(&mut bytes)?;
-            let rest = parse_lines(&bytes, |e| {
-                if filter.passes(&e) {
-                    out.push(e);
-                }
-            })
-            .to_vec();
-            pos.partial = rest;
-        }
-        // A new file under the name: the one we read was rotated away.
-        match std::fs::metadata(path) {
-            Ok(m) if m.ino() != pos.ino => {
-                let mut f = File::open(path)?;
-                f.seek(SeekFrom::Start(0))?;
-                pos.ino = m.ino();
-                pos.file = Some(f);
-                pos.partial.clear();
-                continue;
-            }
-            _ => return Ok(out),
-        }
+    drain(pos, filter, &mut out)?;
+    after_rotation(path, pos, filter, &mut out)?;
+    Ok(out)
+}
+
+/// If `container.log` is no longer our file: the rest of ours, then every
+/// newer file, the current one last (where we go on from).
+fn after_rotation(path: &Path, pos: &mut Position, filter: &Filter, out: &mut Vec<LogEntry>) -> std::io::Result<()> {
+    let current = match std::fs::metadata(path) {
+        Ok(m) => m.ino(),
+        // Between a rotation's rename and the new file: next time.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if pos.file.is_some() && current == pos.ino {
+        return Ok(());
     }
+    // The shim may have written to ours after it was last read, and then
+    // renamed it.
+    drain(pos, filter, out)?;
+    let newer = open_newest_first(path, pos.file.is_some().then_some(pos.ino))?;
+    for (file, ino) in newer.into_iter().rev() {
+        *pos = Position { file: Some(file), ino, partial: Vec::new() };
+        drain(pos, filter, out)?;
+    }
+    Ok(())
+}
+
+/// Reads the position's file from where it stands to its end.
+fn drain(pos: &mut Position, filter: &Filter, out: &mut Vec<LogEntry>) -> std::io::Result<()> {
+    let Some(f) = pos.file.as_mut() else { return Ok(()) };
+    // Shorter than where we are: truncated (`log_max_files` 1). Its start
+    // has what came since (or some of it, if it grew back past us).
+    if f.metadata()?.len() < f.stream_position()? {
+        f.seek(SeekFrom::Start(0))?;
+        pos.partial.clear();
+    }
+    let mut bytes = std::mem::take(&mut pos.partial);
+    f.read_to_end(&mut bytes)?;
+    pos.partial = parse_lines(&bytes, |e| {
+        if filter.passes(&e) {
+            out.push(e);
+        }
+    })
+    .to_vec();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -272,5 +318,136 @@ mod tests {
         let at = |ts: &str| LogEntry { ts: ts.into(), stream: LogStream::Stdout, log: String::new() };
         assert!(f.passes(&at("2026-10-01T00:00:00.000000001Z")));
         assert!(!f.passes(&at("2026-09-30T23:59:59Z")));
+    }
+
+    #[test]
+    fn a_follower_two_rotations_behind_reads_every_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("container.log");
+        let mut w = LogWriter::open(&path, 250, 3).unwrap();
+        write(&mut w, LogStream::Stdout, "before\n");
+        let filter = Filter::new(&LogsQuery::default()).unwrap();
+        let (_, mut pos) = existing(&path, &filter, None).unwrap();
+        // Three rotations before the next read: our file is gone, and the
+        // one after it is container.log.2 by now.
+        for i in 0..10 {
+            write(&mut w, LogStream::Stdout, &format!("after {i}\n"));
+        }
+        let seen: Vec<String> = read_new(&path, &mut pos, &filter).unwrap().into_iter().map(|e| e.log).collect();
+        assert_eq!(seen, (0..10).map(|i| format!("after {i}\n")).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn an_entry_written_just_before_its_file_is_renamed_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("container.log");
+        let mut w = LogWriter::open(&path, 100, 3).unwrap();
+        let filter = Filter::new(&LogsQuery::default()).unwrap();
+        let (_, mut pos) = existing(&path, &filter, None).unwrap();
+        let mut out = Vec::new();
+        // The reader has read its file to the end...
+        drain(&mut pos, &filter, &mut out).unwrap();
+        // ...when the shim appends one more entry, and the next one
+        // rotates the file away before the reader looks at the name.
+        write(&mut w, LogStream::Stdout, "last in the old file\n");
+        write(&mut w, LogStream::Stdout, "first in the new one\n");
+        after_rotation(&path, &mut pos, &filter, &mut out).unwrap();
+        let seen: Vec<&str> = out.iter().map(|e| e.log.as_str()).collect();
+        assert_eq!(seen, ["last in the old file\n", "first in the new one\n"]);
+    }
+
+    #[test]
+    fn rotations_racing_the_reader_lose_nothing() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("container.log");
+        let filter = Filter::new(&LogsQuery::default()).unwrap();
+        // Every entry starts a file of its own.
+        let mut w = LogWriter::open(&path, 1, 3).unwrap();
+        let (_, pos) = existing(&path, &filter, None).unwrap();
+        let (seen, done) = (AtomicUsize::new(0), AtomicBool::new(false));
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut pos = pos;
+                while !done.load(SeqCst) {
+                    seen.fetch_add(read_new(&path, &mut pos, &filter).unwrap().len(), SeqCst);
+                }
+            });
+            // Two at a time: the first can land in a file just before the
+            // second renames it away.
+            for i in (0..5000).step_by(2) {
+                write(&mut w, LogStream::Stdout, "x\n");
+                write(&mut w, LogStream::Stdout, "y\n");
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while seen.load(SeqCst) < i + 2 {
+                    if std::time::Instant::now() > deadline {
+                        done.store(true, SeqCst);
+                        panic!("entry {i} was never read");
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+            done.store(true, SeqCst);
+        });
+        assert_eq!(seen.load(SeqCst), 5000, "each entry once");
+    }
+
+    #[test]
+    fn every_file_is_read_once_gaps_and_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("container.log");
+        // Two entries a file: [0, 1] [2, 3] [4, 5].
+        let mut w = LogWriter::open(&path, 200, 4).unwrap();
+        for i in 0..6 {
+            write(&mut w, LogStream::Stdout, &format!("{i}\n"));
+        }
+        let filter = Filter::new(&LogsQuery::default()).unwrap();
+        let all = |path: &Path| -> Vec<String> {
+            existing(path, &filter, None).unwrap().0.into_iter().map(|e| e.log.trim().to_owned()).collect()
+        };
+        let before = all(&path);
+        assert_eq!(before, ["0", "1", "2", "3", "4", "5"]);
+        // A gap in the names, as while a rotation renames: the older files
+        // still count.
+        let one = rustlet_shim::logfile::numbered(&path, 1);
+        std::fs::rename(&one, dir.path().join("aside")).unwrap();
+        assert_eq!(all(&path), ["0", "1", "4", "5"]);
+        // One file under two names, as a rotation may show it to the walk:
+        // read once.
+        std::fs::hard_link(&path, &one).unwrap();
+        assert_eq!(all(&path), ["0", "1", "4", "5"]);
+    }
+
+    #[test]
+    fn a_follower_starts_over_after_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("container.log");
+        let mut w = LogWriter::open(&path, 300, 1).unwrap();
+        let filter = Filter::new(&LogsQuery::default()).unwrap();
+        let (_, mut pos) = existing(&path, &filter, None).unwrap();
+        let mut seen = Vec::new();
+        for i in 0..12 {
+            write(&mut w, LogStream::Stdout, &format!("after {i}\n"));
+            seen.extend(read_new(&path, &mut pos, &filter).unwrap().into_iter().map(|e| e.log));
+        }
+        assert_eq!(seen, (0..12).map(|i| format!("after {i}\n")).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_line_written_in_two_parts_is_read_once() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("container.log");
+        let line = serde_json::to_vec(&entry(LogStream::Stdout, b"split\n")).unwrap();
+        let (a, b) = line.split_at(20);
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        f.write_all(a).unwrap();
+        let filter = Filter::new(&LogsQuery::default()).unwrap();
+        let (got, mut pos) = existing(&path, &filter, None).unwrap();
+        assert!(got.is_empty());
+        f.write_all(b).unwrap();
+        f.write_all(b"\n").unwrap();
+        let got = read_new(&path, &mut pos, &filter).unwrap();
+        assert_eq!(got.iter().map(|e| e.log.as_str()).collect::<Vec<_>>(), ["split\n"]);
     }
 }
