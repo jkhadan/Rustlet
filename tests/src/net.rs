@@ -6,14 +6,16 @@
 //! ```text
 //!  "lan" netns                      "host" netns (the test daemon's)
 //!   lan0 192.0.2.1/24 ═══ veth ═══  lan0 192.0.2.2/24, default via 192.0.2.1
+//!        2001:db8::1/64                  2001:db8::2/64, default via 2001:db8::1
 //!                                   rustlet0 10.89.0.1/24 … containers
 //! ```
 //!
-//! 192.0.2.0/24 is TEST-NET-1 (RFC 5737), reserved for documentation, so it
-//! can't collide with anything real. The namespaces are held by fds, not
-//! pinned: they vanish with the test.
+//! 192.0.2.0/24 is TEST-NET-1 (RFC 5737) and 2001:db8::/32 the IPv6
+//! documentation prefix (RFC 3849), so neither can collide with anything
+//! real. The namespaces are held by fds, not pinned: they vanish with the
+//! test.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -80,8 +82,22 @@ impl TestNetns {
         });
     }
 
-    /// `ip route add dst/len via gateway`.
-    pub fn route(&self, dst: Ipv4Addr, len: u8, gateway: Ipv4Addr) {
+    /// Adds the IPv6 addresses `ip/prefix_len` here and `peer_ip/prefix_len`
+    /// there to the veth `name` that [`TestNetns::connect`] made (usable at
+    /// once: no duplicate address detection).
+    pub fn connect6(&self, other: &TestNetns, name: &str, ip: Ipv6Addr, peer_ip: Ipv6Addr, prefix_len: u8) {
+        for (ns, addr) in [(self, ip), (other, peer_ip)] {
+            ns.run(|| {
+                let mut nl = RtNetlink::open().unwrap();
+                let link = nl.link_by_name(name).unwrap().unwrap();
+                nl.add_address6(link.index, addr, prefix_len, true).unwrap();
+            });
+        }
+    }
+
+    /// `ip route add dst/len via gateway` (IPv4 or IPv6).
+    pub fn route(&self, dst: impl Into<IpAddr>, len: u8, gateway: impl Into<IpAddr>) {
+        let (dst, gateway) = (dst.into(), gateway.into());
         self.run(|| RtNetlink::open().unwrap().add_route(dst, len, Some(gateway), None).unwrap());
     }
 
@@ -112,11 +128,17 @@ impl TestLan {
     pub const HOST_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
     /// The LAN's other machine (also the host's default gateway).
     pub const LAN_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+    /// The host's IPv6 address on the LAN.
+    pub const HOST_IP6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+    /// The LAN machine's (the host's IPv6 default gateway).
+    pub const LAN_IP6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
 
     pub fn new() -> TestLan {
         let (host, lan) = (TestNetns::new(), TestNetns::new());
         host.connect(&lan, "lan0", Self::HOST_IP, Self::LAN_IP, 24);
+        host.connect6(&lan, "lan0", Self::HOST_IP6, Self::LAN_IP6, 64);
         host.route(Ipv4Addr::UNSPECIFIED, 0, Self::LAN_IP);
+        host.route(Ipv6Addr::UNSPECIFIED, 0, Self::LAN_IP6);
         TestLan { host, lan }
     }
 }

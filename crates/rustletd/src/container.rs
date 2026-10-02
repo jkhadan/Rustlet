@@ -20,11 +20,11 @@ use rustlet_shim::client::ShimStream;
 use rustlet_spec::container::{
     ContainerInspect, ContainerState, ContainerStatus, ContainerSummary, RestartPolicy, RestartPolicyName,
 };
-use rustlet_spec::network::NetworkSettings;
+use rustlet_spec::network::{EndpointSettings, NetworkSettings};
 use rustlet_spec::volume::MountPoint;
 use tokio::sync::{oneshot, watch};
 
-use crate::db::{Db, Persisted, Record};
+use crate::db::{Db, EndpointConfig, Persisted, Record};
 use crate::error::{ApiError, ApiResult};
 
 /// What the watch channel carries.
@@ -77,6 +77,12 @@ impl Container {
 
     pub fn status(&self) -> ContainerStatus {
         self.shared.borrow().persisted.state.status
+    }
+
+    /// The networks it is connected to, in order: what its row says, or for
+    /// a row from before `network connect`, what its `--network` says.
+    pub fn endpoint_configs(&self) -> Vec<EndpointConfig> {
+        self.persisted().networks.unwrap_or_else(|| EndpointConfig::from_config(&self.record.config))
     }
 
     pub fn subscribe(&self) -> watch::Receiver<Shared> {
@@ -158,19 +164,52 @@ impl Container {
         let cgroup = self.cgroup(cgroup_parent);
         let persisted = self.persisted();
         let state = persisted.state;
-        let run = persisted.network.unwrap_or_default();
+        let run = persisted.network.clone().unwrap_or_default();
+        let configs = persisted.networks.clone().unwrap_or_else(|| EndpointConfig::from_config(&r.config));
+        let (route4, route6) = (run.route_v4(), run.route_v6());
+        let networks = configs
+            .iter()
+            .map(|cfg| {
+                let e = run.endpoints.iter().find(|e| e.network_name == cfg.network);
+                EndpointSettings {
+                    network: cfg.network.clone(),
+                    aliases: cfg.aliases.clone(),
+                    ipv4_requested: cfg.ipv4,
+                    ipv6_requested: cfg.ipv6,
+                    network_id: e.map(|e| e.network_id.clone()),
+                    interface: e.map(|e| e.ifname.clone()),
+                    host_interface: e.map(|e| e.veth.clone()),
+                    ip_address: e.and_then(|e| e.ip).map(|ip| ip.to_string()),
+                    ip_prefix_len: e.map(|e| e.prefix_len),
+                    gateway: e.and_then(|e| e.gateway).map(|g| g.to_string()),
+                    ipv6_address: e.and_then(|e| e.ip6).map(|ip| ip.to_string()),
+                    ipv6_prefix_len: e.and_then(|e| e.prefix6),
+                    ipv6_gateway: e.and_then(|e| e.gateway6).map(|g| g.to_string()),
+                    mac_address: e.map(|e| e.mac.clone()),
+                    dns_names: e.map(|e| e.dns_names.clone()).unwrap_or_default(),
+                    default_route: e.is_some_and(|e| route4.is_some_and(|r| r.network_id == e.network_id)),
+                    default_route6: e.is_some_and(|e| route6.is_some_and(|r| r.network_id == e.network_id)),
+                }
+            })
+            .collect();
+        // Its primary network: the one its ports and IPv4 default route go
+        // through, else its first.
+        let primary = route4.or(run.endpoints.first());
         let network = NetworkSettings {
             mode: r.config.network.clone(),
-            network: run.network_name.clone().or_else(|| r.config.network.network_name().map(str::to_owned)),
-            network_id: run.network_id.clone(),
-            ip_address: run.ip.map(|ip| ip.to_string()),
-            ip_prefix_len: run.prefix_len,
-            gateway: run.gateway.map(|g| g.to_string()),
-            mac_address: run.mac.clone(),
-            dns_names: run.dns_names.clone(),
+            network: primary.map(|e| e.network_name.clone()).or_else(|| configs.first().map(|c| c.network.clone())),
+            network_id: primary.map(|e| e.network_id.clone()),
+            ip_address: primary.and_then(|e| e.ip).map(|ip| ip.to_string()),
+            ip_prefix_len: primary.map(|e| e.prefix_len),
+            gateway: primary.and_then(|e| e.gateway).map(|g| g.to_string()),
+            ipv6_address: primary.and_then(|e| e.ip6).map(|ip| ip.to_string()),
+            ipv6_prefix_len: primary.and_then(|e| e.prefix6),
+            ipv6_gateway: primary.and_then(|e| e.gateway6).map(|g| g.to_string()),
+            mac_address: primary.map(|e| e.mac.clone()),
+            dns_names: primary.map(|e| e.dns_names.clone()).unwrap_or_default(),
             sandbox: run.netns.as_ref().map(|p| p.display().to_string()),
             ports: run.ports.clone(),
-            ..NetworkSettings::default()
+            networks,
         };
         let dir = paths.container_dir(&r.id);
         ContainerInspect {

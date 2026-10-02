@@ -13,9 +13,11 @@
 //! worker_memory_max = 1073741824  # pulls and unpacks run in a child limited to this
 //! default_subnet = "10.89.0.0/24" # the `bridge` network, on default_bridge
 //! network_pool = "10.89.0.0/16"   # user-defined networks get /24s from here
+//! network_pool_v6 = "fd52:…::/48" # IPv6 networks get /64s; default: a ULA /48 from the machine id
 //! default_bridge = "rustlet0"
 //! nft_table = "rustlet"           # inet rustlet
 //! resolv_conf = "/etc/resolv.conf" # the host's (systemd-resolved's real list replaces its stub)
+//! manage_ufw = true               # keep ufw's route rules for the bridges, if ufw is installed
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -55,12 +57,20 @@ pub struct Config {
     pub default_subnet: String,
     /// Where user-defined networks get a subnet when not given one.
     pub network_pool: String,
+    /// Where networks created with `--ipv6` get an IPv6 subnet (a `/64`)
+    /// when not given one; default: a `/48` of unique local addresses
+    /// derived from the host's machine id (`rustlet_net::ipam::Subnet6::ula`).
+    pub network_pool_v6: Option<String>,
     /// The default network's bridge.
     pub default_bridge: String,
     /// The nftables table (`inet <name>`).
     pub nft_table: String,
     /// The host's resolver configuration, for containers' `resolv.conf`.
     pub resolv_conf: PathBuf,
+    /// Keep ufw's `route allow in/out on <bridge>` rules for every network,
+    /// if ufw is installed and the daemon runs in the host's network
+    /// namespace (`rustlet_net::ufw`).
+    pub manage_ufw: bool,
 }
 
 impl Default for Config {
@@ -81,9 +91,11 @@ impl Default for Config {
             private_containers_mount: true,
             default_subnet: "10.89.0.0/24".into(),
             network_pool: "10.89.0.0/16".into(),
+            network_pool_v6: None,
             default_bridge: "rustlet0".into(),
             nft_table: rustlet_net::firewall::TABLE.into(),
             resolv_conf: "/etc/resolv.conf".into(),
+            manage_ufw: true,
         }
     }
 }

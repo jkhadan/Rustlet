@@ -1,6 +1,5 @@
 ---
 source: crates/rustlet-net/src/firewall.rs
-assertion_line: 334
 expression: sample().to_json()
 ---
 {
@@ -191,6 +190,114 @@ expression: sample().to_json()
                 },
                 "op": "!=",
                 "right": "rlb0123456789ab"
+              }
+            },
+            {
+              "drop": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "raw_prerouting",
+          "comment": "10.89.2.0/24 is only reachable through rlbfedcba987654",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "op": "==",
+                "right": "ipv4"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "daddr",
+                    "protocol": "ip"
+                  }
+                },
+                "op": "==",
+                "right": {
+                  "prefix": {
+                    "addr": "10.89.2.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "!=",
+                "right": "rlbfedcba987654"
+              }
+            },
+            {
+              "drop": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "raw_prerouting",
+          "comment": "fd00:89:0:2::/64 is only reachable through rlbfedcba987654",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "op": "==",
+                "right": "ipv6"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "daddr",
+                    "protocol": "ip6"
+                  }
+                },
+                "op": "==",
+                "right": {
+                  "prefix": {
+                    "addr": "fd00:89:0:2::",
+                    "len": 64
+                  }
+                }
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "!=",
+                "right": "rlbfedcba987654"
               }
             },
             {
@@ -464,6 +571,141 @@ expression: sample().to_json()
     {
       "add": {
         "rule": {
+          "chain": "prerouting",
+          "comment": "web6 8443/tcp -> [fd00:89:0:2::2]:443",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "op": "==",
+                "right": "ipv6"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "!=",
+                "right": "rlbfedcba987654"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "fib": {
+                    "flags": [
+                      "daddr"
+                    ],
+                    "result": "type"
+                  }
+                },
+                "op": "==",
+                "right": "local"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "dport",
+                    "protocol": "tcp"
+                  }
+                },
+                "op": "==",
+                "right": 8443
+              }
+            },
+            {
+              "dnat": {
+                "addr": "fd00:89:0:2::2",
+                "family": "ip6",
+                "port": 443
+              }
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "output",
+          "comment": "web6 8443/tcp -> [fd00:89:0:2::2]:443",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "op": "==",
+                "right": "ipv6"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "fib": {
+                    "flags": [
+                      "daddr"
+                    ],
+                    "result": "type"
+                  }
+                },
+                "op": "==",
+                "right": "local"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "daddr",
+                    "protocol": "ip6"
+                  }
+                },
+                "op": "!=",
+                "right": "::1"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "dport",
+                    "protocol": "tcp"
+                  }
+                },
+                "op": "==",
+                "right": 8443
+              }
+            },
+            {
+              "dnat": {
+                "addr": "fd00:89:0:2::2",
+                "family": "ip6",
+                "port": 443
+              }
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
           "chain": "postrouting",
           "comment": "10.89.0.0/24 out",
           "expr": [
@@ -504,6 +746,114 @@ expression: sample().to_json()
                 },
                 "op": "!=",
                 "right": "rustlet0"
+              }
+            },
+            {
+              "masquerade": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "postrouting",
+          "comment": "10.89.2.0/24 out",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "op": "==",
+                "right": "ipv4"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "saddr",
+                    "protocol": "ip"
+                  }
+                },
+                "op": "==",
+                "right": {
+                  "prefix": {
+                    "addr": "10.89.2.0",
+                    "len": 24
+                  }
+                }
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "op": "!=",
+                "right": "rlbfedcba987654"
+              }
+            },
+            {
+              "masquerade": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "postrouting",
+          "comment": "fd00:89:0:2::/64 out",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "op": "==",
+                "right": "ipv6"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "field": "saddr",
+                    "protocol": "ip6"
+                  }
+                },
+                "op": "==",
+                "right": {
+                  "prefix": {
+                    "addr": "fd00:89:0:2::",
+                    "len": 64
+                  }
+                }
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "op": "!=",
+                "right": "rlbfedcba987654"
               }
             },
             {
@@ -762,6 +1112,146 @@ expression: sample().to_json()
       "add": {
         "rule": {
           "chain": "forward",
+          "comment": "replies to rlbfedcba987654",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "op": "==",
+                "right": "rlbfedcba987654"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "op": "in",
+                "right": [
+                  "established",
+                  "related"
+                ]
+              }
+            },
+            {
+              "accept": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "forward",
+          "comment": "published ports on rlbfedcba987654",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "op": "==",
+                "right": "rlbfedcba987654"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "ct": {
+                    "key": "status"
+                  }
+                },
+                "op": "in",
+                "right": "dnat"
+              }
+            },
+            {
+              "accept": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "forward",
+          "comment": "within rlbfedcba987654",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "==",
+                "right": "rlbfedcba987654"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "op": "==",
+                "right": "rlbfedcba987654"
+              }
+            },
+            {
+              "accept": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "forward",
+          "comment": "nothing else into rlbfedcba987654",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "op": "==",
+                "right": "rlbfedcba987654"
+              }
+            },
+            {
+              "drop": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "forward",
           "comment": "rustlet0 out",
           "expr": [
             {
@@ -814,8 +1304,71 @@ expression: sample().to_json()
       "add": {
         "rule": {
           "chain": "forward",
-          "comment": "Rustlets turned forwarding on: nothing but its own bridges is forwarded",
+          "comment": "rlbfedcba987654 out",
           "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "==",
+                "right": "rlbfedcba987654"
+              }
+            },
+            {
+              "accept": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "forward",
+          "comment": "Rustlets turned IPv4 forwarding on: nothing but its own bridges is forwarded",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "op": "==",
+                "right": "ipv4"
+              }
+            },
+            {
+              "drop": null
+            }
+          ],
+          "family": "inet",
+          "table": "rustlet"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "forward",
+          "comment": "Rustlets turned IPv6 forwarding on: nothing but its own bridges is forwarded",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "nfproto"
+                  }
+                },
+                "op": "==",
+                "right": "ipv6"
+              }
+            },
             {
               "drop": null
             }

@@ -3,7 +3,8 @@
 //! parent (inside the itest scope) and network: it runs in a "host" network
 //! namespace of its own, beside a "LAN" one (`crate::net::TestLan`), so its
 //! bridges, firewall table and `ip_forward` never touch the real host's.
-//! Its containers' resolver is the LAN machine, 192.0.2.1. Dropping it
+//! Its containers' resolver is the LAN machine, 192.0.2.1; IPv6 networks
+//! get their subnets from `fd00:89::/48`. Dropping it
 //! kills everything the daemon started, unmounts what it mounted and
 //! removes its directories.
 
@@ -47,7 +48,10 @@ impl TestDaemon {
         let resolv = dir.path().join("resolv.conf");
         std::fs::write(&resolv, format!("nameserver {}\nsearch test.lan\n", TestLan::LAN_IP)).unwrap();
         let config = dir.path().join("daemon.toml");
-        std::fs::write(&config, format!("resolv_conf = {:?}\n", resolv.display().to_string())).unwrap();
+        // A fixed IPv6 pool, so that tests know the addresses: networks get
+        // fd00:89:0:0::/64, fd00:89:0:1::/64, …
+        let toml = format!("resolv_conf = {:?}\nnetwork_pool_v6 = \"fd00:89::/48\"\n", resolv.display().to_string());
+        std::fs::write(&config, toml).unwrap();
         let mut d = TestDaemon {
             data: dir.path().join("data"),
             socket: run.join("rustlet.sock"),

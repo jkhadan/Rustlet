@@ -12,8 +12,14 @@
 //! Then the servers the stub forwards to are read from
 //! `/run/systemd/resolve/resolv.conf` instead (Docker does the same), and if
 //! nothing usable is left, Google's public servers are the fallback
-//! (Docker's too). A container in the host's network namespace shares its
-//! loopback and gets a plain copy.
+//! (Docker's too). A container without an IPv6 address can't reach an IPv6
+//! server, so those are left out of its file (Docker does the same). A
+//! container in the host's network namespace shares its loopback and gets a
+//! plain copy.
+//!
+//! The daemon rewrites `hosts` and `resolv.conf` in place (the same inode,
+//! which the bind mount shows) when the container is connected to a
+//! network or disconnected from one while it runs.
 
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr};
@@ -73,9 +79,11 @@ impl ResolvConf {
     }
 
     /// The servers a container can reach from its own network namespace:
-    /// no loopback ones; [`DEFAULT_DNS`] if that leaves none.
-    pub fn reachable_servers(&self) -> Vec<IpAddr> {
-        let servers: Vec<IpAddr> = self.nameservers.iter().copied().filter(|ip| !ip.is_loopback()).collect();
+    /// no loopback ones, and no IPv6 ones unless it has IPv6;
+    /// [`DEFAULT_DNS`] if that leaves none.
+    pub fn reachable_servers(&self, ipv6: bool) -> Vec<IpAddr> {
+        let servers: Vec<IpAddr> =
+            self.nameservers.iter().copied().filter(|ip| !ip.is_loopback() && (ipv6 || ip.is_ipv4())).collect();
         if servers.is_empty() { DEFAULT_DNS.to_vec() } else { servers }
     }
 
@@ -116,18 +124,19 @@ pub enum Resolver {
 /// The container's `resolv.conf`, from the host's at `path`: as it is for a
 /// container in the host's namespace (its loopback is the host's: a stub
 /// at `127.0.0.53` answers there), otherwise as [`ResolvConf::host`] has
-/// it.
-pub fn container_resolv_conf(path: &Path, dns: &DnsOptions, resolver: Resolver) -> String {
+/// it. `ipv6`: the container has an IPv6 address (servers it couldn't
+/// reach otherwise are left out).
+pub fn container_resolv_conf(path: &Path, dns: &DnsOptions, resolver: Resolver, ipv6: bool) -> String {
     let host = match resolver {
         Resolver::Host => ResolvConf::read(path),
         Resolver::Embedded | Resolver::Direct => ResolvConf::host(path),
     };
-    resolv_conf(&host, dns, resolver)
+    resolv_conf(&host, dns, resolver, ipv6)
 }
 
 /// The container's `resolv.conf`, from the host's configuration as
 /// [`container_resolv_conf`] picks it.
-pub fn resolv_conf(host: &ResolvConf, dns: &DnsOptions, resolver: Resolver) -> String {
+pub fn resolv_conf(host: &ResolvConf, dns: &DnsOptions, resolver: Resolver, ipv6: bool) -> String {
     let pick = |given: &[String], host: &[String]| if given.is_empty() { host.to_vec() } else { given.to_vec() };
     let conf = match resolver {
         Resolver::Embedded => {
@@ -144,7 +153,7 @@ pub fn resolv_conf(host: &ResolvConf, dns: &DnsOptions, resolver: Resolver) -> S
             }
         }
         Resolver::Direct => ResolvConf {
-            nameservers: if dns.servers.is_empty() { host.reachable_servers() } else { dns.servers.clone() },
+            nameservers: if dns.servers.is_empty() { host.reachable_servers(ipv6) } else { dns.servers.clone() },
             search: pick(&dns.search, &host.search),
             options: pick(&dns.options, &host.options),
         },
@@ -167,17 +176,18 @@ ff02::2\tip6-allrouters
 ";
 
 /// The container's `/etc/hosts`: localhost, the `--add-host` entries
-/// (`(name, address)`), then its own address and names, if it has an
-/// address of its own.
-pub fn hosts(own: Option<(Ipv4Addr, &[String])>, extra: &[(String, String)]) -> String {
+/// (`(name, address)`), then a line with `names` for each of its own
+/// addresses (on every network it is on, IPv4 then IPv6, its first network
+/// first, which is what a lookup of its own name gets).
+pub fn hosts(own: &[IpAddr], names: &[String], extra: &[(String, String)]) -> String {
     let mut out = String::from(LOCALHOST);
     for (name, ip) in extra {
         let _ = writeln!(out, "{ip}\t{name}");
     }
-    if let Some((ip, names)) = own
-        && !names.is_empty()
-    {
-        let _ = writeln!(out, "{ip}\t{}", names.join(" "));
+    if !names.is_empty() {
+        for ip in own {
+            let _ = writeln!(out, "{ip}\t{}", names.join(" "));
+        }
     }
     out
 }
@@ -214,7 +224,12 @@ mod tests {
         );
         assert_eq!(r.nameservers.len(), 2);
         assert_eq!(r.search, ["example.org"]);
-        assert_eq!(ResolvConf::parse(STUB).reachable_servers(), DEFAULT_DNS, "only loopback: the fallback");
+        assert_eq!(ResolvConf::parse(STUB).reachable_servers(true), DEFAULT_DNS, "only loopback: the fallback");
+        let both = ResolvConf::parse("nameserver fd00::53\nnameserver 192.0.2.53\n");
+        assert_eq!(both.reachable_servers(true).len(), 2);
+        assert_eq!(both.reachable_servers(false), ["192.0.2.53".parse::<IpAddr>().unwrap()], "no IPv6 without IPv6");
+        let only6 = ResolvConf::parse("nameserver fd00::53\n");
+        assert_eq!(only6.reachable_servers(false), DEFAULT_DNS);
     }
 
     #[test]
@@ -231,11 +246,11 @@ mod tests {
         let host = ResolvConf::parse("nameserver 192.168.50.1\nsearch lastgateway.lan\noptions edns0\n");
         let none = DnsOptions::default();
         assert_eq!(
-            resolv_conf(&host, &none, Resolver::Embedded),
+            resolv_conf(&host, &none, Resolver::Embedded, false),
             "# Generated by rustletd: this container's resolver.\nnameserver 127.0.0.11\nsearch lastgateway.lan\noptions edns0 ndots:0\n"
         );
         assert_eq!(
-            resolv_conf(&host, &none, Resolver::Direct),
+            resolv_conf(&host, &none, Resolver::Direct, false),
             "# Generated by rustletd: this container's resolver.\nnameserver 192.168.50.1\nsearch lastgateway.lan\noptions edns0\n"
         );
         let given = DnsOptions {
@@ -243,13 +258,15 @@ mod tests {
             search: vec!["corp".into()],
             options: vec!["ndots:2".into()],
         };
-        let direct = resolv_conf(&host, &given, Resolver::Direct);
+        let direct = resolv_conf(&host, &given, Resolver::Direct, false);
         assert!(direct.contains("nameserver 9.9.9.9\nsearch corp\noptions ndots:2\n") && !direct.contains("192.168"));
-        let embedded = resolv_conf(&host, &given, Resolver::Embedded);
+        let embedded = resolv_conf(&host, &given, Resolver::Embedded, false);
         assert!(embedded.contains("nameserver 127.0.0.11\nsearch corp\noptions ndots:2\n"), "{embedded}");
         let stub = ResolvConf::parse(STUB);
-        assert!(resolv_conf(&stub, &none, Resolver::Host).contains("nameserver 127.0.0.53"));
-        assert!(resolv_conf(&stub, &none, Resolver::Direct).contains("nameserver 8.8.8.8\nnameserver 8.8.4.4\n"));
+        assert!(resolv_conf(&stub, &none, Resolver::Host, false).contains("nameserver 127.0.0.53"));
+        assert!(
+            resolv_conf(&stub, &none, Resolver::Direct, false).contains("nameserver 8.8.8.8\nnameserver 8.8.4.4\n")
+        );
     }
 
     #[test]
@@ -258,11 +275,11 @@ mod tests {
         let stub = dir.path().join("resolv.conf");
         std::fs::write(&stub, STUB).unwrap();
         let none = DnsOptions::default();
-        let host = container_resolv_conf(&stub, &none, Resolver::Host);
+        let host = container_resolv_conf(&stub, &none, Resolver::Host, false);
         assert!(host.contains("nameserver 127.0.0.53\n"), "{host}");
         // In a namespace of its own, never the stub: resolved's list where
         // there is one, else the fallback.
-        let direct = container_resolv_conf(&stub, &none, Resolver::Direct);
+        let direct = container_resolv_conf(&stub, &none, Resolver::Direct, false);
         assert!(!direct.contains("127.0.0.53"), "{direct}");
     }
 
@@ -270,10 +287,15 @@ mod tests {
     fn hosts_files() {
         let names = ["abc123def456".to_owned()];
         let extra = [("db".to_owned(), "10.0.0.5".to_owned())];
-        let h = hosts(Some((Ipv4Addr::new(10, 89, 0, 2), &names)), &extra);
+        let h = hosts(&[Ipv4Addr::new(10, 89, 0, 2).into()], &names, &extra);
         assert!(h.starts_with("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n"));
         assert!(h.ends_with("10.0.0.5\tdb\n10.89.0.2\tabc123def456\n"), "{h}");
-        assert!(!hosts(None, &[]).contains("10.89"));
+        assert!(!hosts(&[], &names, &[]).contains("10.89"));
+        // Several networks, IPv6: a line each, in order.
+        let own: [IpAddr; 3] =
+            [Ipv4Addr::new(10, 89, 1, 2).into(), "fd00:89:0:1::2".parse().unwrap(), Ipv4Addr::new(10, 89, 2, 2).into()];
+        let h = hosts(&own, &names, &[]);
+        assert!(h.ends_with("10.89.1.2\tabc123def456\nfd00:89:0:1::2\tabc123def456\n10.89.2.2\tabc123def456\n"), "{h}");
         assert_eq!(host_network_hosts("127.0.0.1 localhost", &extra), "127.0.0.1 localhost\n10.0.0.5\tdb\n");
     }
 }

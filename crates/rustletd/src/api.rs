@@ -19,7 +19,9 @@ use rustlet_spec::event::{EventKind, EventsQuery};
 use rustlet_spec::exec::ExecConfig;
 use rustlet_spec::image::{ImageDeleteQuery, ImageQuery, PullEvent, PullQuery};
 use rustlet_spec::logs::LogsQuery;
-use rustlet_spec::network::{Network, NetworkCreate, NetworkCreateResponse, PruneResponse};
+use rustlet_spec::network::{
+    Network, NetworkConnect, NetworkCreate, NetworkCreateResponse, NetworkDisconnect, PruneResponse,
+};
 use rustlet_spec::routes::{action, pattern};
 use rustlet_spec::stats::StatsQuery;
 use rustlet_spec::system::{Info, Version};
@@ -62,6 +64,8 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
         .route(pattern::IMAGE_INSPECT, get(image_inspect))
         .route(pattern::NETWORKS, get(networks).post(network_create))
         .route(pattern::NETWORK_PRUNE, post(network_prune))
+        .route(pattern::NETWORK_CONNECT, post(network_connect))
+        .route(pattern::NETWORK_DISCONNECT, post(network_disconnect))
         .route(pattern::NETWORK, get(network_inspect).delete(network_remove))
         .route(pattern::VOLUMES, get(volumes).post(volume_create))
         .route(pattern::VOLUME_PRUNE, post(volume_prune))
@@ -410,6 +414,20 @@ async fn network_remove(State(d): D, Path(id): Path<String>) -> ApiResult<Respon
 
 async fn network_prune(State(d): D) -> ApiResult<Json<PruneResponse>> {
     Ok(Json(to_the_end(async move { d.prune_networks().await }).await?))
+}
+
+async fn network_connect(State(d): D, Path(id): Path<String>, Json(req): Json<NetworkConnect>) -> ApiResult<Response> {
+    to_the_end(async move { d.connect_network(&id, req).await }).await?;
+    Ok(no_content())
+}
+
+async fn network_disconnect(
+    State(d): D,
+    Path(id): Path<String>,
+    Json(req): Json<NetworkDisconnect>,
+) -> ApiResult<Response> {
+    to_the_end(async move { d.disconnect_network(&id, req).await }).await?;
+    Ok(no_content())
 }
 
 // ── volumes ────────────────────────────────────────────────────────────────

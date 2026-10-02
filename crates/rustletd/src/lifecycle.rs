@@ -114,7 +114,7 @@ impl Daemon {
             mounts,
         };
         let dir = self.paths.container_dir(&id);
-        let persisted = Persisted::default();
+        let persisted = Persisted { networks: Some(network.endpoints), ..Persisted::default() };
         let created = match blocking(move || ContainerRootfs::create(&dir).map(drop).map_err(ApiError::from)).await {
             Ok(()) => self.db.insert(&record, &persisted),
             Err(e) => Err(e),
@@ -253,47 +253,11 @@ impl Daemon {
             plan.etc_files = files.iter().map(|f| (format!("/etc/{f}"), dir.join(f))).collect();
             return Ok(plan);
         }
-        let mode = &r.config.network;
-        let gateway =
-            net.gateway.or_else(|| self.networks.find(rustlet_spec::network::DEFAULT_NETWORK).ok().map(|n| n.gateway));
-        let extra: Vec<(String, String)> = r
-            .config
-            .extra_hosts
-            .iter()
-            .filter_map(|h| rustlet_spec::network::parse_extra_host(h).ok())
-            .map(|(name, ip)| {
-                let ip = if ip == rustlet_spec::network::HOST_GATEWAY {
-                    gateway.map(|g| g.to_string()).unwrap_or(ip)
-                } else {
-                    ip
-                };
-                (name, ip)
-            })
-            .collect();
-        let hosts = match (mode, net.ip) {
-            (rustlet_spec::network::NetworkMode::Host, _) => rustlet_net::files::host_network_hosts(
-                &std::fs::read_to_string("/etc/hosts").unwrap_or_default(),
-                &extra,
-            ),
-            (_, Some(ip)) => rustlet_net::files::hosts(Some((ip, std::slice::from_ref(&r.hostname))), &extra),
-            (_, None) => rustlet_net::files::hosts(None, &extra),
-        };
-        let resolver = match mode {
-            rustlet_spec::network::NetworkMode::Host => rustlet_net::files::Resolver::Host,
-            rustlet_spec::network::NetworkMode::Network(_) => rustlet_net::files::Resolver::Embedded,
-            _ => rustlet_net::files::Resolver::Direct,
-        };
-        let dns = rustlet_net::files::DnsOptions {
-            servers: r.config.dns.iter().filter_map(|d| d.parse().ok()).collect(),
-            search: r.config.dns_search.clone(),
-            options: r.config.dns_options.clone(),
-        };
-        let resolv = rustlet_net::files::container_resolv_conf(self.networks.resolv_conf_path(), &dns, resolver);
         let dir = self.paths.container_dir(&r.id);
-        let contents = [hosts, format!("{}\n", plan.hostname), resolv];
+        let contents = self.etc_files(c, net);
         // Container root (host uid 1000000 under --userns=remap) may edit
         // them, as in Docker.
-        let owner = (r.config.userns == UsernsMode::Remap).then_some(rustlet_runtime::spec::REMAP_HOST_ID);
+        let owner = self.etc_owner(c);
         for (name, text) in files.iter().zip(contents) {
             let path = dir.join(name);
             std::fs::write(&path, text).map_err(|e| ApiError::internal(format!("write {}: {e}", path.display())))?;

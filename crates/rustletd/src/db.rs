@@ -11,6 +11,12 @@
 //! are in use is derived from the containers' rows; so are the addresses
 //! in use (each running container's [`NetRun`]) and the volumes in use.
 //!
+//! A record that gained fields is read with them at their defaults; one
+//! whose *shape* changed is read through a wire type that knows both
+//! shapes: a run on one network (Phase 5's first [`NetRun`]) becomes a run
+//! with one endpoint, and a container from before `network connect` has
+//! its networks derived from its `--network`.
+//!
 //! Schema versions (`PRAGMA user_version`): 1, containers (Phase 4); 2,
 //! networks and volumes too (Phase 5). A version-1 database gains the two
 //! tables in one transaction.
@@ -23,14 +29,14 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
 use rusqlite::{Connection, ErrorCode, params};
 use serde::{Deserialize, Serialize};
 
 use rustlet_spec::container::{ContainerConfig, ContainerState};
-use rustlet_spec::network::{PortMapping, PublishedPort};
+use rustlet_spec::network::{DEFAULT_NETWORK, NetworkMode, PortMapping, PublishedPort};
 use rustlet_spec::volume::MountSpec;
 
 use crate::error::{ApiError, ApiResult};
@@ -100,29 +106,166 @@ pub struct Persisted {
     /// Recorded before the shim starts, so a daemon that dies mid-start
     /// leaves the next one enough to clean up (and the addresses in use).
     pub network: Option<NetRun>,
+    /// The networks it is connected to, in order: its `--network`s, then
+    /// what `network connect` added, less what `network disconnect` took.
+    /// `None` in a row from before `network connect`: what its `--network`
+    /// says ([`EndpointConfig::from_config`]).
+    pub networks: Option<Vec<EndpointConfig>>,
 }
 
-/// A run's network: its namespace, its place on a network, its published
-/// ports.
+/// A network a container is connected to, and what it asked for there.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct EndpointConfig {
+    /// The network's name, looked up at each start (a network removed and
+    /// created again under the same name is the one it joins).
+    pub network: String,
+    /// More names for the embedded DNS server, on this network.
+    pub aliases: Vec<String>,
+    /// The addresses it asked for (`--ip`, `--ip6`, `network connect
+    /// --ip/--ip6`); otherwise the next free ones.
+    pub ipv4: Option<Ipv4Addr>,
+    pub ipv6: Option<Ipv6Addr>,
+}
+
+impl EndpointConfig {
+    /// The networks a new container with `config` is connected to: its
+    /// first `--network` (with `--network-alias`, `--ip`, `--ip6`), then
+    /// the others; none for `none`, `host` and `container:<x>`.
+    pub fn from_config(config: &ContainerConfig) -> Vec<EndpointConfig> {
+        let first = match &config.network {
+            NetworkMode::Bridge => EndpointConfig { network: DEFAULT_NETWORK.into(), ..EndpointConfig::default() },
+            NetworkMode::Network(n) => EndpointConfig {
+                network: n.clone(),
+                aliases: config.network_aliases.clone(),
+                ipv4: config.ip,
+                ipv6: config.ip6,
+            },
+            NetworkMode::None | NetworkMode::Host | NetworkMode::Container(_) => return Vec::new(),
+        };
+        std::iter::once(first)
+            .chain(
+                config
+                    .extra_networks
+                    .iter()
+                    .map(|n| EndpointConfig { network: n.clone(), ..EndpointConfig::default() }),
+            )
+            .collect()
+    }
+}
+
+/// A run's network: its namespace, its places on networks, its published
+/// ports.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "NetRunWire")]
 pub struct NetRun {
     /// The pinned network namespace, if the run has one of its own.
     pub netns: Option<PathBuf>,
     /// `--network container:<id>`: whose namespace it shares.
     pub joined: Option<String>,
-    /// The bridge network it is on.
-    pub network_id: Option<String>,
-    pub network_name: Option<String>,
-    pub ip: Option<Ipv4Addr>,
-    pub prefix_len: Option<u8>,
-    pub gateway: Option<Ipv4Addr>,
-    pub mac: Option<String>,
-    /// The host's end of its veth pair.
-    pub veth: Option<String>,
+    /// Its networks, in the order of its interfaces' creation.
+    pub endpoints: Vec<EndpointRun>,
     pub ports: Vec<PublishedPort>,
-    /// What the embedded DNS server answers for it (user-defined networks).
+}
+
+impl NetRun {
+    /// The network its IPv4 default route goes through, which its published
+    /// ports lead to: the first that isn't internal.
+    pub fn route_v4(&self) -> Option<&EndpointRun> {
+        route_v4(&self.endpoints)
+    }
+
+    /// The network its IPv6 default route goes through: the first that
+    /// isn't internal and has IPv6.
+    pub fn route_v6(&self) -> Option<&EndpointRun> {
+        route_v6(&self.endpoints)
+    }
+}
+
+/// See [`NetRun::route_v4`].
+pub fn route_v4(endpoints: &[EndpointRun]) -> Option<&EndpointRun> {
+    endpoints.iter().find(|e| !e.internal)
+}
+
+/// See [`NetRun::route_v6`].
+pub fn route_v6(endpoints: &[EndpointRun]) -> Option<&EndpointRun> {
+    endpoints.iter().find(|e| !e.internal && e.ip6.is_some())
+}
+
+/// A run's place on one network.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EndpointRun {
+    pub network_id: String,
+    pub network_name: String,
+    /// The network's bridge.
+    pub bridge: String,
+    /// No way out there: never its default route.
+    pub internal: bool,
+    /// Its interface inside (`eth0`).
+    pub ifname: String,
+    /// The host's end of its veth pair.
+    pub veth: String,
+    pub mac: String,
+    pub ip: Option<Ipv4Addr>,
+    pub prefix_len: u8,
+    /// The network's gateway (its default route, if this network carries
+    /// it).
+    pub gateway: Option<Ipv4Addr>,
+    /// On a network with IPv6.
+    pub ip6: Option<Ipv6Addr>,
+    pub prefix6: Option<u8>,
+    pub gateway6: Option<Ipv6Addr>,
+    /// What the embedded DNS server answers for it there (user-defined
+    /// networks).
     pub dns_names: Vec<String>,
+}
+
+/// [`NetRun`] as stored, in either shape.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct NetRunWire {
+    netns: Option<PathBuf>,
+    joined: Option<String>,
+    endpoints: Vec<EndpointRun>,
+    ports: Vec<PublishedPort>,
+    // A run on one network, as Phase 5 first stored it.
+    network_id: Option<String>,
+    network_name: Option<String>,
+    ip: Option<Ipv4Addr>,
+    prefix_len: Option<u8>,
+    gateway: Option<Ipv4Addr>,
+    mac: Option<String>,
+    veth: Option<String>,
+    dns_names: Vec<String>,
+}
+
+impl From<NetRunWire> for NetRun {
+    fn from(w: NetRunWire) -> NetRun {
+        let mut endpoints = w.endpoints;
+        if endpoints.is_empty()
+            && let (Some(network_id), Some(network_name), Some(ip)) = (w.network_id, w.network_name, w.ip)
+        {
+            endpoints.push(EndpointRun {
+                network_id,
+                network_name,
+                // Filled in from the network when the run is restored.
+                bridge: String::new(),
+                internal: false,
+                ifname: "eth0".into(),
+                veth: w.veth.unwrap_or_default(),
+                mac: w.mac.unwrap_or_default(),
+                ip: Some(ip),
+                prefix_len: w.prefix_len.unwrap_or(24),
+                gateway: w.gateway,
+                ip6: None,
+                prefix6: None,
+                gateway6: None,
+                dns_names: w.dns_names,
+            });
+        }
+        NetRun { netns: w.netns, joined: w.joined, endpoints, ports: w.ports }
+    }
 }
 
 /// A network.
@@ -135,6 +278,9 @@ pub struct NetworkRecord {
     /// `10.89.0.0/24`.
     pub subnet: String,
     pub gateway: Ipv4Addr,
+    /// On a network with IPv6: `fd52:…:1::/64`.
+    pub subnet6: Option<String>,
+    pub gateway6: Option<Ipv6Addr>,
     pub bridge: String,
     pub internal: bool,
     pub labels: BTreeMap<String, String>,
@@ -148,6 +294,8 @@ impl Default for NetworkRecord {
             created: String::new(),
             subnet: String::new(),
             gateway: Ipv4Addr::UNSPECIFIED,
+            subnet6: None,
+            gateway6: None,
             bridge: String::new(),
             internal: false,
             labels: BTreeMap::new(),
@@ -403,6 +551,47 @@ mod tests {
         assert!(db.networks().unwrap().is_empty() && db.volumes().unwrap().is_empty());
         let v: i64 = db.conn().pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
         assert_eq!(v, SCHEMA);
+    }
+
+    #[test]
+    fn a_run_on_one_network_reads_as_one_endpoint() {
+        // A running container's state as Phase 5 first stored it.
+        let old = r#"{"state":{"status":"running"},"network":{"netns":"/run/rustlet/netns/abc","network_id":"n1",
+            "network_name":"backend","ip":"10.89.1.2","prefix_len":24,"gateway":"10.89.1.1",
+            "mac":"02:52:0a:59:01:02","veth":"rlvabc","ports":[],"dns_names":["web","abc"]}}"#;
+        let p: Persisted = serde_json::from_str(old).unwrap();
+        let run = p.network.unwrap();
+        assert_eq!(run.endpoints.len(), 1);
+        let e = &run.endpoints[0];
+        assert_eq!((e.network_name.as_str(), e.ifname.as_str(), e.veth.as_str()), ("backend", "eth0", "rlvabc"));
+        assert_eq!((e.ip, e.gateway), (Some(Ipv4Addr::new(10, 89, 1, 2)), Some(Ipv4Addr::new(10, 89, 1, 1))));
+        assert_eq!(e.dns_names, ["web", "abc"]);
+        assert_eq!(p.networks, None, "derived from its --network");
+        // Written back in the new shape only, and read the same.
+        let json = serde_json::to_string(&run).unwrap();
+        assert!(!json.contains("network_name\":\"backend\",\"ip\"") && json.contains("endpoints"), "{json}");
+        assert_eq!(serde_json::from_str::<NetRun>(&json).unwrap(), run);
+        // A run with no network of its own stays without endpoints.
+        let none: NetRun = serde_json::from_str(r#"{"netns":"/x"}"#).unwrap();
+        assert!(none.endpoints.is_empty());
+    }
+
+    #[test]
+    fn networks_come_from_the_config() {
+        let config = ContainerConfig {
+            network: NetworkMode::Network("backend".into()),
+            network_aliases: vec!["api".into()],
+            ip: Some(Ipv4Addr::new(10, 89, 1, 50)),
+            extra_networks: vec!["frontend".into(), "bridge".into()],
+            ..Default::default()
+        };
+        let eps = EndpointConfig::from_config(&config);
+        assert_eq!(eps.iter().map(|e| e.network.as_str()).collect::<Vec<_>>(), ["backend", "frontend", "bridge"]);
+        assert_eq!((eps[0].aliases.len(), eps[0].ipv4.is_some()), (1, true));
+        assert!(eps[1].aliases.is_empty() && eps[1].ipv4.is_none(), "the others ask for nothing");
+        assert_eq!(EndpointConfig::from_config(&ContainerConfig::default())[0].network, DEFAULT_NETWORK);
+        let host = ContainerConfig { network: NetworkMode::Host, ..Default::default() };
+        assert!(EndpointConfig::from_config(&host).is_empty());
     }
 
     #[test]

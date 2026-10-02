@@ -106,9 +106,9 @@ impl Daemon {
         let networks = Networks::new(&config, &paths)?;
         networks.load(&db)?;
         let mut containers = BTreeMap::new();
-        for (record, persisted) in db.all()? {
+        for (record, mut persisted) in db.all()? {
             if let Some(run) = &persisted.network {
-                networks.restore(&record.id, &record.name, run);
+                persisted.network = Some(networks.restore(&record.id, &record.name, run));
             }
             containers.insert(record.id.clone(), Arc::new(Container::new(record, persisted)));
         }

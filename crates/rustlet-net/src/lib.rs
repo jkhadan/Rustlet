@@ -5,9 +5,10 @@
 //!   ┌────────────────────────────────────────┐     ┌──────────────────────────────┐
 //!   │ ens18 192.168.50.143                   │     │ lo 127.0.0.1                 │
 //!   │   ▲ nft table inet rustlet:            │     │ eth0 10.89.0.2/24 ─┐         │
-//!   │   │  masquerade out, DNAT -p, guards   │     │ default via 10.89.0.1        │
+//!   │   │  masquerade out, DNAT -p, guards   │     │ (eth1, … on more networks)   │
+//!   │   │  (IPv4, and IPv6 on IPv6 networks) │     │ default via 10.89.0.1        │
 //!   │ rustlet0 10.89.0.1/24 (bridge)         │     │ 127.0.0.11: DNS (user nets)  │
-//!   │   └─ rlv<short id> ◄── veth pair ──────┼─────┼────────────────────┘         │
+//!   │   └─ rlv<hash> ◄── veth pair ──────────┼─────┼────────────────────┘         │
 //!   │ the daemon: proxy for -p, DNS server   │     └──────────────────────────────┘
 //!   └────────────────────────────────────────┘
 //! ```
@@ -31,7 +32,7 @@
 //! | [`files`] | the containers' `hosts`, `hostname` and `resolv.conf` |
 //! | [`dns`] | the embedded DNS server at `127.0.0.11` |
 //! | [`proxy`] | the userland proxy for published ports |
-//! | [`ufw`] | asking an active ufw to route the bridges |
+//! | [`ufw`] | keeping ufw's route rules for the bridges, if ufw is installed |
 
 #![forbid(unsafe_code)]
 
