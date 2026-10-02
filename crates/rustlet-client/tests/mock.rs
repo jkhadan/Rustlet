@@ -175,6 +175,7 @@ async fn network_routes() {
         gateway: Some("10.89.1.1".into()),
         internal: true,
         labels: [("tier".to_owned(), "db".to_owned())].into(),
+        ..Default::default()
     };
     let created = within(client.create_network(&config)).await.unwrap();
     assert_eq!((created.id, created.name.as_str()), ("1d".repeat(32), "backend"));

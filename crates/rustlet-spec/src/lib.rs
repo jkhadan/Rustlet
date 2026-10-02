@@ -46,6 +46,8 @@
 //! | POST | `/networks` | [`network::NetworkCreate`] → 201 [`network::NetworkCreateResponse`] |
 //! | GET | `/networks/{id}` | → [`network::Network`] (id, unique id prefix, or name) |
 //! | DELETE | `/networks/{id}` | → 204 |
+//! | POST | `/networks/{id}/connect` | [`network::NetworkConnect`] → 204 (a running container at once, otherwise from its next start) |
+//! | POST | `/networks/{id}/disconnect` | [`network::NetworkDisconnect`] → 204 |
 //! | POST | `/networks/prune` | → [`network::PruneResponse`] (the user-defined networks no container uses) |
 //! | GET | `/volumes` | → `[`[`volume::Volume`]`]` |
 //! | POST | `/volumes` | [`volume::VolumeCreate`] → 201 [`volume::Volume`] |

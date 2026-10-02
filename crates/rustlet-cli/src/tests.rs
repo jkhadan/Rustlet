@@ -228,7 +228,7 @@ async fn remove(State(d): Shared, Path(id): Path<String>, Query(q): Query<Remove
 }
 
 fn published(host_ip: [u8; 4], host_port: u16, container_port: u16, protocol: Protocol) -> PublishedPort {
-    PublishedPort { host_ip: Ipv4Addr::from(host_ip), host_port, container_port, protocol }
+    PublishedPort { host_ip: Ipv4Addr::from(host_ip).into(), host_port, container_port, protocol }
 }
 
 /// `web`, with four published ports (out of order); nothing else exists.
@@ -939,6 +939,7 @@ async fn networks_are_created_listed_inspected_and_removed() {
         gateway: Some("10.89.5.1".into()),
         internal: true,
         labels: [("solo".to_owned(), String::new()), ("tier".to_owned(), "db".to_owned())].into(),
+        ..Default::default()
     };
     assert_eq!(*d.network_creates.lock().unwrap(), [expected]);
     // As Docker's CLI: a gateway is in a subnet that is given too.

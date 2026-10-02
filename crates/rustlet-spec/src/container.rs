@@ -1,6 +1,7 @@
 //! Containers: what `create` takes, what `ps` and `inspect` show.
 
 use std::collections::BTreeMap;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
 
@@ -71,8 +72,17 @@ pub struct ContainerConfig {
     /// `--network`: the default network unless given.
     pub network: NetworkMode,
     /// `--network-alias`: more names the embedded DNS server answers for
-    /// it, on a user-defined network.
+    /// it, on its (first, user-defined) network.
     pub network_aliases: Vec<String>,
+    /// `--ip`: its IPv4 address on its first network (a user-defined one);
+    /// default: the next free.
+    pub ip: Option<Ipv4Addr>,
+    /// `--ip6`: its IPv6 address there (a network with IPv6).
+    pub ip6: Option<Ipv6Addr>,
+    /// `--network` given again: more networks to connect it to, in order
+    /// after the first, with no aliases or addresses of their own (`network
+    /// connect` gives those). Only with a bridge network as the first.
+    pub extra_networks: Vec<String>,
     /// `-p`: container ports to publish on the host.
     pub ports: Vec<PortMapping>,
     /// `-P`: publish every port the image exposes, each on a free host

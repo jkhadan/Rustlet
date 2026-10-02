@@ -78,7 +78,8 @@ pub async fn network(ctx: &mut Ctx, command: NetworkCommand) -> anyhow::Result<i
             if gateway.is_some() && subnet.is_none() {
                 bail!("--gateway needs the --subnet it belongs to");
             }
-            let config = NetworkCreate { name, subnet, gateway, internal, labels: parse_labels(&label)? };
+            let config =
+                NetworkCreate { name, subnet, gateway, internal, labels: parse_labels(&label)?, ..Default::default() };
             let created = ctx.client.create_network(&config).await?;
             writeln!(ctx.console.stdout, "{}", created.id)?;
             Ok(0)

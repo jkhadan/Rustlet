@@ -262,9 +262,14 @@ impl Networks {
                         l.ports
                             .iter()
                             .filter(|p| !p.host_ip.is_loopback())
-                            .map(|p| PortRule {
+                            .filter_map(|p| match p.host_ip {
+                                IpAddr::V4(host_ip) => Some((p, host_ip)),
+                                // The proxy's alone: the containers have no IPv6.
+                                IpAddr::V6(_) => None,
+                            })
+                            .map(|(p, host_ip)| PortRule {
                                 protocol: p.protocol.to_string(),
-                                host_ip: Some(p.host_ip).filter(|ip| !ip.is_unspecified()),
+                                host_ip: Some(host_ip).filter(|ip| !ip.is_unspecified()),
                                 host_port: p.host_port,
                                 container_ip: ip,
                                 container_port: p.container_port,
@@ -315,6 +320,7 @@ impl Networks {
                     container_id: id.clone(),
                     container_name: l.name.clone(),
                     ip_address: format!("{ip}/{prefix}"),
+                    ipv6_address: None,
                     mac_address: ipam::format_mac(&ipam::mac_for(*ip)),
                     dns_names: l.dns_names.clone(),
                 })
@@ -327,6 +333,9 @@ impl Networks {
             created: n.created.clone(),
             subnet: n.subnet.clone(),
             gateway: n.gateway.to_string(),
+            ipv6: false,
+            subnet6: None,
+            gateway6: None,
             bridge: n.bridge.clone(),
             internal: n.internal,
             dns: n.name != DEFAULT_NETWORK,
@@ -867,7 +876,7 @@ fn publish(ports: &[PortMapping], ip: Ipv4Addr) -> ApiResult<(Vec<PublishedPort>
     let mut published = Vec::new();
     let mut proxies = Vec::new();
     for m in ports {
-        let host_ip = m.host_ip.unwrap_or(Ipv4Addr::UNSPECIFIED);
+        let host_ip = m.host_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let backend = SocketAddr::new(IpAddr::V4(ip), m.container_port);
         let (port, mut started) = proxy_pair(host_ip, m.host_port.unwrap_or(0), m.protocol, backend).map_err(|e| {
             let what = match m.host_port {
@@ -905,15 +914,14 @@ fn rebind(ports: &[PublishedPort], ip: Ipv4Addr) -> std::io::Result<Vec<Proxy>> 
 /// kernel picks), and for every address (`0.0.0.0`) also `[::]` on the same
 /// port, IPv6 only, if the host can (an IPv6 failure only loses IPv6).
 fn proxy_pair(
-    host_ip: Ipv4Addr,
+    host_ip: IpAddr,
     port: u16,
     protocol: Protocol,
     backend: SocketAddr,
 ) -> std::io::Result<(u16, Vec<Proxy>)> {
-    let v4 = SocketAddr::new(IpAddr::V4(host_ip), port);
-    let (port, first) = proxy_on(v4, protocol, backend)?;
+    let (port, first) = proxy_on(SocketAddr::new(host_ip, port), protocol, backend)?;
     let mut proxies = vec![first];
-    if host_ip.is_unspecified() {
+    if host_ip == IpAddr::V4(Ipv4Addr::UNSPECIFIED) {
         match proxy_on(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port), protocol, backend) {
             Ok((_, p)) => proxies.push(p),
             Err(e) => tracing::debug!("no IPv6 proxy for port {port}/{protocol}: {e}"),
@@ -971,7 +979,7 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let m = PortMapping {
-                host_ip: Some(Ipv4Addr::LOCALHOST),
+                host_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                 host_port: None,
                 container_port: 80,
                 protocol: Protocol::Tcp,

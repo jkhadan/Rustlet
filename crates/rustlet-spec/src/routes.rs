@@ -80,6 +80,14 @@ pub fn network(id: &str) -> String {
 pub fn network_prune() -> String {
     v1("/networks/prune")
 }
+/// `POST`: [`crate::network::NetworkConnect`].
+pub fn network_connect(id: &str) -> String {
+    v1(&format!("/networks/{id}/connect"))
+}
+/// `POST`: [`crate::network::NetworkDisconnect`].
+pub fn network_disconnect(id: &str) -> String {
+    v1(&format!("/networks/{id}/disconnect"))
+}
 
 /// `GET` (list) and `POST` (create).
 pub fn volumes() -> String {
@@ -113,6 +121,8 @@ pub mod pattern {
     pub const NETWORKS: &str = "/v1/networks";
     pub const NETWORK: &str = "/v1/networks/{id}";
     pub const NETWORK_PRUNE: &str = "/v1/networks/prune";
+    pub const NETWORK_CONNECT: &str = "/v1/networks/{id}/connect";
+    pub const NETWORK_DISCONNECT: &str = "/v1/networks/{id}/disconnect";
     pub const VOLUMES: &str = "/v1/volumes";
     pub const VOLUME: &str = "/v1/volumes/{name}";
     pub const VOLUME_PRUNE: &str = "/v1/volumes/prune";
@@ -134,6 +144,8 @@ mod tests {
         assert_eq!(ping(), pattern::PING);
         assert_eq!(network("n1"), pattern::NETWORK.replace("{id}", "n1"));
         assert_eq!(network_prune(), pattern::NETWORK_PRUNE);
+        assert_eq!(network_connect("n1"), pattern::NETWORK_CONNECT.replace("{id}", "n1"));
+        assert_eq!(network_disconnect("n1"), pattern::NETWORK_DISCONNECT.replace("{id}", "n1"));
         assert_eq!(volume("v"), pattern::VOLUME.replace("{name}", "v"));
         assert_eq!(
             (networks(), volumes(), volume_prune()),

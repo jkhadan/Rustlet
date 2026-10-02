@@ -170,6 +170,7 @@ impl Container {
             dns_names: run.dns_names.clone(),
             sandbox: run.netns.as_ref().map(|p| p.display().to_string()),
             ports: run.ports.clone(),
+            ..NetworkSettings::default()
         };
         let dir = paths.container_dir(&r.id);
         ContainerInspect {

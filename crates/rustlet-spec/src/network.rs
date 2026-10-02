@@ -1,16 +1,20 @@
-//! Networks: how a container is connected (`--network`), what it publishes
-//! (`-p`), and the networks themselves (`rustlet network …`).
+//! Networks: how a container is connected (`--network`, `network
+//! connect`), what it publishes (`-p`), and the networks themselves
+//! (`rustlet network …`).
 //!
-//! Every container with a network of its own sits on a **bridge network**:
-//! a Linux bridge on the host with a subnet, one veth pair per container,
-//! NAT to the outside. `bridge` is the default one (no DNS between its
-//! containers, as with Docker's); a network you create gets its own bridge
-//! and subnet, and an embedded DNS server at `127.0.0.11` that answers the
-//! names of the containers on it.
+//! Every container with a network namespace of its own sits on **bridge
+//! networks**: a Linux bridge on the host per network, with an IPv4 subnet
+//! (and an IPv6 one, for a network created with `--ipv6`), one veth pair per
+//! container and network, NAT to the outside. `bridge` is the default one
+//! (no DNS between its containers, as with Docker's); a network you create
+//! gets its own bridge and subnets, and an embedded DNS server at
+//! `127.0.0.11` that answers the names of the containers on it. A container
+//! can be on several networks at once (`--network a --network b`, `network
+//! connect`), with an interface on each (`eth0`, `eth1`, …).
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -134,9 +138,9 @@ impl FromStr for Protocol {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PortMapping {
-    /// The host address to listen on; `None` is every address (IPv4
-    /// `0.0.0.0`, and IPv6 `[::]` through the proxy).
-    pub host_ip: Option<Ipv4Addr>,
+    /// The host address to listen on; `None` is every address, IPv4
+    /// (`0.0.0.0`) and IPv6 (`[::]`). `[::]` alone is every IPv6 address.
+    pub host_ip: Option<IpAddr>,
     /// `None`: a free port the kernel picks.
     pub host_port: Option<u16>,
     pub container_port: u16,
@@ -147,7 +151,8 @@ impl PortMapping {
     /// Parses Docker's `-p` syntax:
     /// `[[HOST_IP:][HOST_PORT]:]CONTAINER_PORT[/PROTOCOL]`, where either
     /// port may be a range `A-B` (host and container ranges of the same
-    /// length, or a container range alone). A range gives one mapping per
+    /// length, or a container range alone), and an IPv6 host address is
+    /// written in brackets (`[::1]:8080:80`). A range gives one mapping per
     /// port.
     ///
     /// ```
@@ -155,6 +160,7 @@ impl PortMapping {
     /// let m = PortMapping::parse("127.0.0.1:8080:80/udp").unwrap();
     /// assert_eq!((m[0].host_port, m[0].container_port, m[0].protocol), (Some(8080), 80, Protocol::Udp));
     /// assert_eq!(PortMapping::parse("8000-8002:80-82").unwrap().len(), 3);
+    /// assert!(PortMapping::parse("[::1]:8080:80").unwrap()[0].host_ip.unwrap().is_ipv6());
     /// ```
     pub fn parse(s: &str) -> Result<Vec<PortMapping>, String> {
         let bad = |why: &str| format!("-p {s:?}: {why} (expected [[HOST_IP:][HOST_PORT]:]CONTAINER_PORT[/tcp|udp])");
@@ -162,18 +168,27 @@ impl PortMapping {
             Some((p, proto)) => (p, proto.parse::<Protocol>().map_err(|e| bad(&e))?),
             None => (s, Protocol::Tcp),
         };
-        if ports.starts_with('[') {
-            return Err(bad("IPv6 host addresses aren't supported"));
-        }
-        let parts: Vec<&str> = ports.split(':').collect();
-        let (host_ip, host_ports, container_ports) = match parts.as_slice() {
-            [c] => (None, "", *c),
-            [h, c] => (None, *h, *c),
-            [ip, h, c] => {
-                let ip = ip.parse::<Ipv4Addr>().map_err(|_| bad(&format!("{ip:?} is not an IPv4 address")))?;
-                (Some(ip).filter(|ip| !ip.is_unspecified()), *h, *c)
+        let (host_ip, host_ports, container_ports) = if let Some(after) = ports.strip_prefix('[') {
+            let (ip, rest) = after.split_once(']').ok_or_else(|| bad("an IPv6 address needs its closing ]"))?;
+            let ip = ip.parse::<Ipv6Addr>().map_err(|_| bad(&format!("{ip:?} is not an IPv6 address")))?;
+            let rest = rest.strip_prefix(':').ok_or_else(|| bad("a host address needs the ports after it"))?;
+            match rest.split(':').collect::<Vec<_>>().as_slice() {
+                [h, c] => (Some(IpAddr::V6(ip)), *h, *c),
+                _ => return Err(bad("expected [HOST_IP]:[HOST_PORT]:CONTAINER_PORT")),
             }
-            _ => return Err(bad("too many colons")),
+        } else {
+            match ports.split(':').collect::<Vec<_>>().as_slice() {
+                [c] => (None, "", *c),
+                [h, c] => (None, *h, *c),
+                [ip, h, c] => {
+                    let ip = ip.parse::<Ipv4Addr>().map_err(|_| {
+                        bad(&format!("{ip:?} is not an IPv4 address (an IPv6 one goes in brackets: [::1])"))
+                    })?;
+                    // 0.0.0.0: every address, IPv6 too, as without one.
+                    (Some(IpAddr::V4(ip)).filter(|ip| !ip.is_unspecified()), *h, *c)
+                }
+                _ => return Err(bad("too many colons (an IPv6 host address goes in brackets: [::1])")),
+            }
         };
         let container = port_range(container_ports).map_err(|e| bad(&e))?;
         let host = if host_ports.is_empty() { None } else { Some(port_range(host_ports).map_err(|e| bad(&e))?) };
@@ -212,10 +227,18 @@ fn port_range(s: &str) -> Result<(u16, u16), String> {
     }
 }
 
+/// A host address as `-p` and `ps` write it: IPv6 in brackets.
+fn host_ip_text(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    }
+}
+
 impl fmt::Display for PortMapping {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(ip) = self.host_ip {
-            write!(f, "{ip}:")?;
+            write!(f, "{}:", host_ip_text(ip))?;
         }
         match self.host_port {
             Some(p) => write!(f, "{p}:")?,
@@ -229,17 +252,24 @@ impl fmt::Display for PortMapping {
 /// A published port as a run set it up: the host port is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PublishedPort {
-    /// `0.0.0.0`: every address.
-    pub host_ip: Ipv4Addr,
+    /// `0.0.0.0`: every address, IPv4 and IPv6; `::`: every IPv6 address.
+    pub host_ip: IpAddr,
     pub host_port: u16,
     pub container_port: u16,
     pub protocol: Protocol,
 }
 
+impl PublishedPort {
+    /// Where it listens, as a socket address (`[::1]:8080` for IPv6).
+    pub fn host_addr(&self) -> std::net::SocketAddr {
+        std::net::SocketAddr::new(self.host_ip, self.host_port)
+    }
+}
+
 impl fmt::Display for PublishedPort {
-    /// As `docker ps` shows it: `0.0.0.0:8080->80/tcp`.
+    /// As `docker ps` shows it: `0.0.0.0:8080->80/tcp`, `[::1]:8080->80/tcp`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}->{}/{}", self.host_ip, self.host_port, self.container_port, self.protocol)
+        write!(f, "{}:{}->{}/{}", host_ip_text(self.host_ip), self.host_port, self.container_port, self.protocol)
     }
 }
 
@@ -287,6 +317,14 @@ pub struct NetworkCreate {
     pub subnet: Option<String>,
     /// Default: the subnet's first address.
     pub gateway: Option<String>,
+    /// IPv6 too (dual stack): its bridge and containers get IPv6 addresses
+    /// as well as IPv4 ones.
+    pub ipv6: bool,
+    /// With `ipv6`: `fd00:89:0:5::/64`; default: the next free /64 of the
+    /// daemon's IPv6 pool (unique local addresses).
+    pub subnet6: Option<String>,
+    /// Default: the IPv6 subnet's first address after its own (`…::1`).
+    pub gateway6: Option<String>,
     /// No route out: containers reach each other, not the outside.
     pub internal: bool,
     pub labels: BTreeMap<String, String>,
@@ -315,6 +353,11 @@ pub struct Network {
     pub subnet: String,
     /// `10.89.0.1`: the bridge's address, the containers' default route.
     pub gateway: String,
+    /// It has IPv6 as well (`subnet6`, `gateway6`).
+    pub ipv6: bool,
+    /// `fd00:89:0:1::/64`.
+    pub subnet6: Option<String>,
+    pub gateway6: Option<String>,
     /// The bridge's interface name on the host (`rustlet0`, `rlb…`).
     pub bridge: String,
     pub internal: bool,
@@ -334,24 +377,35 @@ pub struct NetworkEndpoint {
     pub container_name: String,
     /// `10.89.0.2/24`.
     pub ip_address: String,
+    /// `fd00:89:0:1::2/64`, on an IPv6 network.
+    pub ipv6_address: Option<String>,
     pub mac_address: String,
     /// The names the embedded DNS server answers for it here.
     pub dns_names: Vec<String>,
 }
 
 /// A container's network, as `inspect` shows it.
+///
+/// The top-level addresses are those of its **primary** network: the one
+/// its IPv4 default route goes through (else its first), which is also
+/// where its published ports lead. `networks` has every network.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NetworkSettings {
-    /// `--network`, as given.
+    /// `--network`, as given (the first, if it was given more than once).
     pub mode: NetworkMode,
-    /// The network it is (or was last) attached to.
+    /// The primary network (or, while it doesn't run, the first it is
+    /// connected to).
     pub network: Option<String>,
     pub network_id: Option<String>,
     /// While it runs: `10.89.0.2`.
     pub ip_address: Option<String>,
     pub ip_prefix_len: Option<u8>,
     pub gateway: Option<String>,
+    /// While it runs, on an IPv6 network: `fd00:89:0:1::2`.
+    pub ipv6_address: Option<String>,
+    pub ipv6_prefix_len: Option<u8>,
+    pub ipv6_gateway: Option<String>,
     pub mac_address: Option<String>,
     /// Its names on a user-defined network (container name, aliases, short
     /// id, hostname).
@@ -361,6 +415,69 @@ pub struct NetworkSettings {
     pub sandbox: Option<String>,
     /// While it runs: what is published, with the host ports chosen.
     pub ports: Vec<PublishedPort>,
+    /// Every network it is connected to, in order: what `--network` and
+    /// `network connect` asked for, and while it runs, its place there.
+    pub networks: Vec<EndpointSettings>,
+}
+
+/// A container on one of its networks, as `inspect` shows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EndpointSettings {
+    /// The network's name.
+    pub network: String,
+    /// `--network-alias`, `network connect --alias`: more names for the
+    /// embedded DNS server.
+    pub aliases: Vec<String>,
+    /// `--ip`, `--ip6`, `network connect --ip/--ip6`: the addresses asked
+    /// for (otherwise the next free ones).
+    pub ipv4_requested: Option<Ipv4Addr>,
+    pub ipv6_requested: Option<Ipv6Addr>,
+    /// The rest only while it runs: the network's id,
+    pub network_id: Option<String>,
+    /// its interface inside (`eth0`) and the host's end of its veth pair
+    /// (`rlv…`),
+    pub interface: Option<String>,
+    pub host_interface: Option<String>,
+    /// its addresses there,
+    pub ip_address: Option<String>,
+    pub ip_prefix_len: Option<u8>,
+    pub gateway: Option<String>,
+    pub ipv6_address: Option<String>,
+    pub ipv6_prefix_len: Option<u8>,
+    pub ipv6_gateway: Option<String>,
+    pub mac_address: Option<String>,
+    /// the names the embedded DNS server answers for it there,
+    pub dns_names: Vec<String>,
+    /// and whether its IPv4 (IPv6) default route goes through this network.
+    pub default_route: bool,
+    pub default_route6: bool,
+}
+
+/// `POST /v1/networks/{id}/connect`: connects a container to the network,
+/// at once if it runs, otherwise from its next start.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkConnect {
+    /// Its name, id, or a unique prefix of its id.
+    pub container: String,
+    /// More names for it on this network (a user-defined one).
+    pub aliases: Vec<String>,
+    /// Its address there (a user-defined network); default: the next free.
+    pub ipv4_address: Option<Ipv4Addr>,
+    /// Its IPv6 address there (an IPv6 network); default: the next free.
+    pub ipv6_address: Option<Ipv6Addr>,
+}
+
+/// `POST /v1/networks/{id}/disconnect`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkDisconnect {
+    /// Its name, id, or a unique prefix of its id.
+    pub container: String,
+    /// Also when the network itself is gone: the container's own record of
+    /// it is removed.
+    pub force: bool,
 }
 
 /// The answer of the prune routes (networks, volumes).
@@ -412,31 +529,56 @@ mod tests {
         assert_eq!(one("8080:80/udp").protocol, Protocol::Udp);
         assert_eq!(one("8080:80/UDP").protocol, Protocol::Udp);
         let local = one("127.0.0.1:8080:80");
-        assert_eq!((local.host_ip, local.host_port), (Some(Ipv4Addr::LOCALHOST), Some(8080)));
+        assert_eq!((local.host_ip, local.host_port), (Some(IpAddr::V4(Ipv4Addr::LOCALHOST)), Some(8080)));
         let any = one("127.0.0.1::80");
-        assert_eq!((any.host_ip, any.host_port), (Some(Ipv4Addr::LOCALHOST), None));
+        assert_eq!((any.host_ip, any.host_port), (Some(IpAddr::V4(Ipv4Addr::LOCALHOST)), None));
         assert_eq!(one("0.0.0.0:8080:80").host_ip, None, "0.0.0.0 is every address");
+        let v6 = one("[::1]:8080:80/udp");
+        assert_eq!((v6.host_ip, v6.host_port), (Some(IpAddr::V6(Ipv6Addr::LOCALHOST)), Some(8080)));
+        assert_eq!(v6.protocol, Protocol::Udp);
+        let v6 = one("[2001:db8::1]::80");
+        assert_eq!((v6.host_ip, v6.host_port), (Some("2001:db8::1".parse().unwrap()), None));
+        assert_eq!(one("[::]:8080:80").host_ip, Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)), "[::] is IPv6's only");
         let range = PortMapping::parse("8000-8002:80-82/udp").unwrap();
         assert_eq!(
             range.iter().map(|m| (m.host_port.unwrap(), m.container_port)).collect::<Vec<_>>(),
             [(8000, 80), (8001, 81), (8002, 82)]
         );
         assert_eq!(PortMapping::parse("80-81").unwrap().iter().map(|m| m.host_port).collect::<Vec<_>>(), [None; 2]);
-        for bad in
-            ["", "0", "65536", "x", "80/sctp", "1:2:3:4", "8000-8001:80", "90-80", "[::1]:80:80", "300.0.0.1:1:2"]
-        {
+        for bad in [
+            "",
+            "0",
+            "65536",
+            "x",
+            "80/sctp",
+            "1:2:3:4",
+            "8000-8001:80",
+            "90-80",
+            "300.0.0.1:1:2",
+            "::1:80:80",
+            "[::1]",
+            "[::1]:80",
+            "[::1:80:80",
+            "[10.0.0.1]:80:80",
+            "[::1]x:80:80",
+        ] {
             assert!(PortMapping::parse(bad).is_err(), "{bad}");
         }
-        for s in ["80/tcp", "8080:80/tcp", "127.0.0.1:8080:80/udp", "127.0.0.1::80/tcp"] {
+        for s in
+            ["80/tcp", "8080:80/tcp", "127.0.0.1:8080:80/udp", "127.0.0.1::80/tcp", "[::1]:8080:80/tcp", "[::]::80/udp"]
+        {
             assert_eq!(one(s).to_string(), s);
         }
-        let p = PublishedPort {
-            host_ip: Ipv4Addr::UNSPECIFIED,
+        let mut p = PublishedPort {
+            host_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             host_port: 8080,
             container_port: 80,
             protocol: Protocol::Tcp,
         };
         assert_eq!(p.to_string(), "0.0.0.0:8080->80/tcp");
+        p.host_ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert_eq!(p.to_string(), "[::1]:8080->80/tcp");
+        assert_eq!(p.host_addr().to_string(), "[::1]:8080");
     }
 
     #[test]
