@@ -315,11 +315,14 @@ One per container *start*, started by the daemon with plain `Command::spawn` (th
   - **No** `PrivateTmp`, `ProtectSystem`, `ProtectHome` or `PrivateMounts`. Overlay mounts and netns pins must land in the host mount namespace, where the host and `cleanup.sh` can see them. No `DevicePolicy=`/`DeviceAllow=` (§2.2.2).
 
 ### 2.7 `rustlet` — the CLI (clap)
-Docker-like UX, for example: `rustlet run -it --rm --name web -p 8080:80 -v data:/data --memory 512m --cpus 1.5 --pids-limit 100 --cap-drop ALL --net host --security-opt seccomp=unconfined alpine sh`.
+Docker-like UX, for example: `rustlet run -it --rm --name web -p 8080:80 -v data:/data --memory 512m --cpus 1.5 --pids-limit 100 --cap-drop ALL --net host --security-opt seccomp=unconfined alpine sh` (`-p`, `-v` and `--net` arrive with Phase 5).
 
-Commands: `ps`, `images`, `pull`, `logs -f`, `exec -it`, `stop`, `rm`, `rmi`, `inspect`, `stats`, `network …`, `volume …`, `build`, `compose up/down/ps/logs`, `save/load`, `commit`.
+Commands so far (Phase 4): `run`, `create`, `start [-a -i]`, `stop`, `kill`, `restart`, `rm`, `pause`, `unpause`, `wait`, `ps`, `logs [-f --tail -t --since --until]`, `exec [-i -t -d -u -w -e]`, `inspect`, `stats`, `attach`, `pull`, `images`, `rmi`, `events`, `version`, `info`. Later: `network …`, `volume …`, `build`, `compose up/down/ps/logs`, `save/load`, `commit`.
 
-Raw terminal mode and SIGWINCH → resize are handled with `crossterm`.
+- `run` = create (pulling on `no_such_image`, progress on stderr) → **attach before start**, so nothing printed early is lost → the terminal size before the start → start → relay until the `exit` control → its code; `--rm` then waits for the removal.
+- The terminal: raw mode behind a guard (and a panic hook that restores the terminal first), SIGWINCH → resize, Ctrl-P Ctrl-Q to detach, signal proxying through `kill` without a terminal (`crossterm`, tokio signals).
+- Exit codes as Docker's: 125 for Rustlets' failures, 126/127 from the error kind of a program that can't run, otherwise the container's or process's own status.
+- `--host`/`RUSTLET_HOST` (`unix:///path` or a path); default `/run/rustlet/rustlet.sock`, which is root's unless the `rustlet` group exists (§2.6).
 
 ### 2.8 Rustlets Desktop (Tauri v2 + React/TS)
 - **Rust side (`desktop/src-tauri`):** holds a `rustlet-client`. Tauri commands handle request/response calls; **`tauri::ipc::Channel`** carries streams (logs, stats, pull progress, events, terminal I/O). Tauri capabilities restrict the frontend to our own commands.
@@ -386,14 +389,14 @@ Rustlet/
 ├─ profiles/seccomp-default.json
 ├─ packaging/                 # rustletd.service/.socket, NM unmanaged conf, deb metadata
 ├─ scripts/cleanup.sh         # one-command host restore (see §4)
-├─ xtask/                     # cargo xtask itest | rootfs | demo | image-run | images | gen-ts | dev-storage
+├─ xtask/                     # cargo xtask itest | rootfs | demo | image-run | images | daemon | gen-ts | dev-storage
 ├─ tests/                     # privileged integration tests
 └─ docs/architecture.md, docs/learn/NN-*.md
 ```
 
 Host resources, all prefixed so they're easy to find and remove:
 - data: `/var/lib/rustlet/{content,ingest,snapshots,containers,volumes,state.db,build-cache,store.lock}`
-- runtime: `/run/rustlet/{rustlet.sock,runtime,shims,netns}`
+- runtime: `/run/rustlet/{rustlet.sock,rustletd.lock,runtime,shims,netns}`
 - cgroups: `system.slice/rustletd.service/…`
 - firewall: nft table `inet rustlet`
 - network devices: `rustlet0`, `rlv*`
@@ -448,7 +451,19 @@ Host resources, all prefixed so they're easy to find and remove:
 
 ## 5. Roadmap. Each phase ends with a demo, a `docs/learn` chapter, and a walkthrough.
 
-**Status (2026-10-01):** Phases 0 to 2c are built, and Phase 3 (images) is built: `cargo xtask image-run` pulls `alpine`, `nginx` and `python:3-slim` from Docker Hub and runs them, rootful and with `--userns`. `cargo xtask itest` passes all 243 checks (240 privileged tests plus 3 harness unit tests); `cargo nextest run --workspace` passes 306 unit tests. Phase 3's independent review is done (below). Phase 2c part 2's independent review is also done; its one P1 filesystem finding is fixed, with regression tests (below). [Chapter 08](learn/08-runtime-cves.md) has been checked against its sources and the current code, edited for accuracy and clarity, and describes the finding and its fix.
+**Status (2026-10-01):** Phases 0 to 4 are built. Phase 4 (daemon, shim, client, CLI): `rustlet run -it --rm alpine sh`, `run -d`, `logs -f`, `exec -it` and `stats` work against the installed `rustletd.service`, and containers survive `systemctl restart rustletd`. `cargo xtask itest` passes all 270 checks (267 privileged tests plus 3 harness unit tests); `cargo nextest run --workspace` passes 411 unit tests. Phase 4's independent review is still to come, in a fresh session. Phase 3's independent review is done (below). Phase 2c part 2's independent review is also done; its one P1 filesystem finding is fixed, with regression tests (below). [Chapter 08](learn/08-runtime-cves.md) has been checked against its sources and the current code, edited for accuracy and clarity, and describes the finding and its fix.
+
+Phase 4, as built (daemon, shim, client, CLI; [chapter 13](learn/13-daemon-shim-architecture.md)):
+- **Crates:** `rustlet-spec` (the API as types: routes, bodies, NDJSON records, WebSocket framing, error kinds), `rustlet-shim` (a library for the daemon: the shim protocol, paths, client, log file; the shim binary), `rustletd`, `rustlet-client`, `rustlet-cli` (`rustlet`). §2.3, §2.6 and §2.7 describe them.
+- **Shim:** `setsid`, child subreaper, its own cgroup leaf, one stdout handshake; one `waitid(P_ALL)` loop reaps init, exec'd processes and every `rustlet-runc` (single-threaded, so no status is missed). Pipes owned by the process user's host ids; the PTY master over a console socket; JSON-lines logs with rotation; attach broadcast, stdin-once; exec through `rustlet-runc exec -d --process`; exit status with the OOM flag in `exit.json`; serving until `Delete` + `Shutdown`.
+- **Daemon:** state in SQLite plus a `watch` channel per container; an op lock per container and an exit monitor that publishes only after cleanup; Docker's restart policies and backoff; attach before start; reconciliation with surviving shims at startup; image work in memory-limited `rustletd worker` children; `rmi` with garbage collection; a private bind mount of `containers/`; `Type=notify`.
+- **Deviations:** `/events` is NDJSON, not a WebSocket; image names stay in `index.json`, not SQLite; the overlay is mounted per run (at start, unmounted at exit), not from create to remove; shim directories are named by the short id (`sun_path`), so the daemon keeps short ids unique.
+- **Phase 3's inputs, done:** the shim chowns stdio pipes (to the process user's host ids, rootful too); the daemon's rows say which images are in use, and collection follows them; `containers/` is private; pulls and unpacks run in a child with `memory.max` 1 GiB, no swap, `pids.max` 256; unpacks of one chain ID take turns under an OFD lock; `image-run` says "1 layer" and names layers by blob digest.
+- **Found while testing, fixed:** an attached client heard of an exit before the daemon had cleaned up after it (an `rm` right after saw "running"); an image whose names were all removed while in use was never collected; after a forced delete, the shim could refuse `Shutdown` until init was reaped, leaving it orphaned; a shim that never hand-shook was left running. The tests' own race: PID 1 ignores `TERM` until its `trap` is set.
+- **Tooling:** `cargo xtask daemon install [--release] [--enable] | uninstall | status`; `cargo xtask itest` builds the shim, daemon and CLI too.
+- **Milestone:** on the installed service, `run -it --rm alpine sh` (its exit status passed through), `run -d --name web nginx`, `ps`, `logs`, `exec`, `exec -it`, `logs -f`, `stats`, then `systemctl restart rustletd`: `web` still up with the same init pid, the journal saying the new daemon took it over, `exec` working. A container that exited while the daemon was stopped was reported with its own status (42), from the shim's `exit.json`. A pull from Docker Hub went through a worker.
+- **Tests:** 8 `sh_` (the shim alone), 14 `dm_` (a daemon per test), 5 `cl_` (the CLI binary); unit tests for the shim's log and protocol, the daemon's config, database, names, events, spec options, logs and restart arithmetic, the client against a mock daemon, and the CLI (60 between them). Host mountinfo stays at 24 lines across the suite; a running daemon adds one, its private bind of `containers/`.
+- **Not yet:** networking, ports and volumes (Phase 5: containers have only `lo`, and no generated `/etc/hostname`, `hosts` or `resolv.conf`); healthchecks (Phase 7); `--format` and filters in the CLI; an `image prune`; a systemd cgroup driver (containers sit below the daemon's unit, so systemd reports "left-over" processes when it restarts). Without a `rustlet` group the socket is root's, and the CLI needs sudo.
 
 Phase 3, as built (images; [chapter 11](learn/11-oci-images.md), [chapter 12](learn/12-overlayfs.md)):
 - **Crate:** `rustlet-image` (§2.4): `reference` → `pull` → `content` → `unpack`/`snapshot` → `rootfs` → `runspec`/`user`, plus `import` (local tars into the store). Pulling needs only write access to the store; unpacking and mounting need root.
@@ -594,6 +609,8 @@ Differential check: the same bundle under `runc` 1.3.4 gives identical namespace
   - unpacking without root: names with `..` refused, symlinked parents and hard links kept inside the layer, whiteout and opaque conversion, replacement rules (a directory listed twice keeps the later entry's metadata), old-style (V7) directories, overlay xattrs dropped, both digests over every byte for gzip, zstd and plain tar
   - the stdio relay: input and EOF still reach a process that has closed its outputs, and unread input never stalls output
   - the content store: verified ingest, names in `index.json`, concurrent writers, byte-stable rewrites
+  - the shim's log file (line splitting, 16 KiB pieces, rotation, appending after a restart), its frame protocol and the runtime-log error parser; the daemon's config, database (round trips, unique names, newer schemas refused), names and ids, restart policies and backoff, spec options (Docker's capability rules, security options, devices, resources), log reading (tail, streams, since/until, following across rotation), events replay
+  - the client against an in-process axum daemon on a temporary socket (JSON, error kinds, NDJSON split across chunks, WebSocket sessions both ways); the CLI's flags, tables, sizes, durations, detach keys, CPU and memory arithmetic, and its whole `run` flow in-process against a mock daemon
   - IPAM, Containerfile and compose parsers, DTO round-trips
 - **Privileged integration tests** (`cargo xtask itest`, inside the limited systemd scope), probes run inside containers:
   - namespace inodes differ from the host by default and match under `--net=host`/`--pid=host`
@@ -616,6 +633,9 @@ Differential check: the same bundle under `runc` 1.3.4 gives identical namespace
   - image layers unpacked as root (owners, setuid bits, file capabilities, symlink owners, skipped devices), confined writes, whiteouts/opaque/copy-up through a real overlay, digest mismatches leaving no snapshot, shared and concurrent snapshots
   - imported Alpine images run rootful and with `--userns` (idmapped layers: image owners inside, mapped owners for the container's writes), USER/WorkingDir from the image, `-u` overrides
   - user-namespace stdio: `/dev/stdout`/`/dev/stderr` reopenable in `run` and `exec`, including as non-root; unread input never stalls the relay; input still arrives after the process has closed its outputs
+  - the shim on its own over `shim.sock` (`sh_`): output to attach clients and the log, exit statuses, stdin-once, a terminal with its size, exec (pipes, input, terminal, another user), a failed create's handshake, pipe ownership rootful and remapped, an OOM kill, shutdown right after a forced delete
+  - the daemon through its API (`dm_`, a daemon per test with its own directories and cgroup parent): run/wait/logs/rm, attach before start, terminal sessions, logs -f, exec, stop/restart/pause/kill, restart policies, `--rm`, containers that outlive a crashed daemon (and one that exits while there is none), stats, events, `--userns`, OOM, error kinds, worker unpacks and garbage collection
+  - the `rustlet` binary (`cl_`): output and exit codes, Docker's 125/126/127, a detached container's life, `run -it` and `exec -it` on a terminal, `logs -f`, images, stats
   - the host mount table is unchanged after each test (diff of `/proc/self/mountinfo`)
 - **Differential testing:** the same bundle under `runc` and `rustlet-runc`, with a probe binary that dumps namespaces, caps, mounts, cgroup, and rlimits. The outputs are diffed.
 - **Conformance:** youki's `contest` suite run against `rustlet-runc`. It is maintained and cgroup-v2-aware; OCI `runtime-tools` is stale and cgroup-v1-oriented.
