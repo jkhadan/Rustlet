@@ -9,17 +9,19 @@ the resolver inside a container and the `resolv.conf` the daemon writes
 for it, why the default network has no names, the embedded DNS server at
 `127.0.0.11` (sockets made inside each container's namespace and served by
 the daemon, with port 53 redirected to them), what it answers and what it
-forwards, and what a daemon restart does to it.
+forwards, what a daemon restart does to it, and how it follows a container
+on several networks, some of them with IPv6.
 
-Code: [`dns.rs`](../../crates/rustlet-net/src/dns.rs) (`Zone`, `View`, `DnsServer`, `answer_locally`;
-`serve_udp`, `serve_tcp`, `Shared::forward`, `exchange_udp`, `exchange_tcp`, `fit_udp`),
+Code: [`dns.rs`](../../crates/rustlet-net/src/dns.rs) (`Zone`, `View`, `Scope`, `DnsServer`, `answer_locally`,
+`local_records`; `serve_udp`, `serve_tcp`, `Shared::forward`, `exchange_udp`, `exchange_tcp`, `fit_udp`),
 [`files.rs`](../../crates/rustlet-net/src/files.rs) (`ResolvConf`, `resolv_conf`, `hosts`), the redirect
-[`firewall::dns_redirect`](../../crates/rustlet-net/src/firewall.rs); in the daemon,
-[`network.rs`](../../crates/rustletd/src/network.rs) (`start_dns`, `dns_names`, `upstreams`, `resume_network`)
-and [`lifecycle.rs`](../../crates/rustletd/src/lifecycle.rs) (`run_plan`: the generated files). Tests: the
-DNS server's 30 unit tests in `dns.rs` (end to end over loopback against fake upstreams),
+[`firewall::dns_redirect`](../../crates/rustlet-net/src/firewall.rs) and `remove_dns_redirect`; in the daemon,
+[`network.rs`](../../crates/rustletd/src/network.rs) (`start_dns`, `refresh_dns`, `dns_scope`, `dns_names`,
+`upstreams`, `etc_files`, `resume_network`) and [`lifecycle.rs`](../../crates/rustletd/src/lifecycle.rs) (`run_plan`).
+Tests: the DNS server's 42 unit tests in `dns.rs` (end to end over loopback against fake upstreams),
 `net_dns_port_53_is_redirected_to_the_servers_socket` in [`network.rs`](../../tests/tests/network.rs), and
-`dn_user_defined_networks_resolve_their_containers` and `dn_internal_networks_stay_inside` in
+`dn_user_defined_networks_resolve_their_containers`, `dn_internal_networks_stay_inside`,
+`dn_connect_and_disconnect`, `dn_ipv6_networks` and `dn_several_networks_survive_a_daemon_restart` in
 [`daemon_network.rs`](../../tests/tests/daemon_network.rs). Design:
 [architecture.md §2.5](../architecture.md#25-rustlet-net--host-side-networking) (Files, Embedded DNS).
 
@@ -27,7 +29,9 @@ The transcripts were recorded on 2026-10-02 against the installed service,
 kernel 7.0.0-34-generic. The host's resolver is systemd-resolved, whose
 upstream is the LAN's router, 192.168.50.1, with the search domain
 `lastgateway.lan`. `rustlet` is `sudo target/debug/rustlet`; commands that
-need root ran through `sudo systemd-run --pipe --wait`.
+need root ran through `sudo systemd-run --pipe --wait`. The transcripts of
+§5's several networks and IPv6 were recorded later the same day, once a
+container could be on several networks.
 
 ## 1. The resolver in a container
 
@@ -89,7 +93,8 @@ The container's name, its alias, its name qualified by the network's
 (any case), a reverse lookup of its address, and a name from the outside
 world: all answered. The outside name came back with an IPv6 address
 first, which the upstream had as well as IPv4 ones; a program that
-connects falls back to IPv4, since the container has no IPv6 route.
+connects falls back to IPv4, since this container, on an IPv4-only
+network, has no IPv6 route.
 
 The container's resolver configuration on this network:
 
@@ -247,26 +252,40 @@ everything else in [`dns.rs`](../../crates/rustlet-net/src/dns.rs) is ours.
 
 ## 5. What the server answers
 
-One [`Zone`](../../crates/rustlet-net/src/dns.rs) holds every network's names; the daemon adds a
-container's when its network is set up and removes them when it is
-undone. Each container's server sees it through a [`View`](../../crates/rustlet-net/src/dns.rs): its
-network's name and the upstream servers to forward to. The names a
-container gets ([`dns_names`](../../crates/rustletd/src/network.rs)): its name, its 12-digit short id,
-its hostname and its `--network-alias`es, lowercased, each once.
+One [`Zone`](../../crates/rustlet-net/src/dns.rs) holds every network's names and their addresses,
+IPv4 and IPv6; the daemon adds a container's when it joins a network and
+removes them when it leaves. Each container's server sees the zone
+through a [`View`](../../crates/rustlet-net/src/dns.rs), whose [`Scope`](../../crates/rustlet-net/src/dns.rs) lists the
+user-defined networks the container is on, in the order it was connected
+to them, and the upstream servers to forward to. The names a container
+gets on a network ([`dns_names`](../../crates/rustletd/src/network.rs)): its name, its 12-digit short
+id, its hostname and its aliases there, lowercased, each once.
 [`answer_locally`](../../crates/rustlet-net/src/dns.rs) is the whole decision as a pure function, and
-the server calls it for every message:
+the server calls it for every message, with the scope as it is when the
+message arrives:
 
-- **`A` for a name on the network**, bare (`db`) or qualified by the
-  network's name (`db.backend`), any case, with or without a trailing
-  dot: every address registered under that name, in random order (several
-  containers can share an alias: a round-robin), TTL 600, authoritative.
-- **Any other type for such a name** (`AAAA`, `MX`, …): `NOERROR` with no
-  records. The container has no IPv6 address, and an empty answer, unlike
+- **`A` and `AAAA` for a name on the container's networks**, bare (`db`)
+  or qualified by a network's name (`db.backend`), any case, with or
+  without a trailing dot: the networks are searched in order, and the
+  first that has the name *with an address of the asked family* answers,
+  with every such address it has under that name, in random order
+  (several containers can share an alias: a round-robin), TTL 600,
+  authoritative. A network the container isn't on is never searched, not
+  even for a name qualified by it: a container learns nothing of the
+  networks it isn't on.
+- **Any other type for such a name** (`MX`, `TXT`, …), **or a family none
+  of its networks has an address of** (`AAAA` for a container only on
+  IPv4-only networks): `NOERROR` with no records. An empty answer, unlike
   `NXDOMAIN`, tells the client the name exists, so it doesn't go looking
   for it elsewhere.
-- **`PTR` for an address on the network** (`2.1.89.10.in-addr.arpa`):
-  `db.backend.`, the first name the address was registered under,
-  qualified, as Docker's resolver answers.
+- **`PTR` for an address on the container's networks**: `db.backend.`,
+  the first name the address was registered under, qualified by its
+  network, as Docker's resolver answers. An IPv4 address is asked as
+  `2.1.89.10.in-addr.arpa`; an IPv6 one as its 32 hexadecimal digits,
+  least significant first, each a label of its own, under `ip6.arpa`
+  (`2.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.9.9.e.7.b.7.0.0.a.9.d.f.ip6.arpa`
+  for `fd9a:7b:7e99::2`). A name that is almost that shape (31 digits, a
+  label `02`) isn't an address, and is forwarded like any other.
 - **Not a query**: another opcode gets `NOTIMP`; not exactly one question,
   or a body that doesn't parse, `FORMERR`. A **response** gets nothing at
   all. The first version answered responses with `FORMERR`, as its
@@ -286,6 +305,52 @@ size its EDNS record offers) is cut to the records that fit, with the
 otherwise be too big for some clients). And a datagram that claims to come
 from the server's own address is ignored: only a forged one can, and the
 server has no business talking to itself.
+
+**Several networks, and IPv6.** A container connected to more than one
+user-defined network has one server, whose scope lists them all
+([chapter 14](14-veth-bridges-netlink.md) §10). `web` here was on `six` (with IPv6) and is then
+connected to `back` (IPv4 only), where `db` is; the daemon rescopes its
+server ([`refresh_dns`](../../crates/rustletd/src/network.rs)), and `web` finds `db` at once:
+
+```text
+$ rustlet exec web getent hosts db || echo "no db"     # web is on six only
+no db
+$ rustlet network connect back web; rustlet exec web getent hosts db
+10.89.1.3       db
+```
+
+From a container on `six`, `web` has both families, and its IPv6 address
+a name in `ip6.arpa`; from one on `back`, IPv4 only:
+
+```text
+$ rustlet run --rm --network six alpine sh -c 'getent ahostsv6 web; getent ahostsv4 web; getent hosts fd9a:7b:7e99::2'
+fd9a:7b:7e99::2 STREAM web
+fd9a:7b:7e99::2 DGRAM  web
+10.89.2.2       STREAM web
+10.89.2.2       DGRAM  web
+fd9a:7b:7e99::2   web.six  web.six
+$ rustlet run --rm --network back alpine sh -c 'getent ahostsv4 web; getent ahostsv6 web'
+10.89.1.4       STREAM web
+10.89.1.4       DGRAM  web
+::ffff:10.89.1.4 STREAM web
+::ffff:10.89.1.4 DGRAM  web
+```
+
+The last lines are musl, not the server: asked for IPv6 addresses with
+`AI_V4MAPPED`, as `getent ahostsv6` asks, and given an empty `AAAA`
+answer (`back` has no IPv6), `getaddrinfo` maps the IPv4 address into
+IPv6.
+
+"The first network with an address of the asked family" was not the
+first rule. The first was "the first network that has the name answers,
+every type", so that a client asking for `A` and `AAAA` would get the
+addresses of the same containers. `dn_several_networks_survive_a_daemon_restart`
+found what it costs: a container on an IPv4-only network first and an
+IPv6 one second was never found over IPv6, by itself or anyone, since its
+first network answered `AAAA` with nothing. Now the search goes on past a
+network that has the name but no address of the family; the price is that
+`A` and `AAAA` may come from different networks, which for one container's
+own names are its own addresses either way.
 
 ## 6. Forwarding
 
@@ -329,7 +394,15 @@ test's LAN machine (192.0.2.1), which knows only names under `example.`;
 A container's `DnsServer` is two tokio tasks, one per socket, each owning
 the tasks of its forwards or connections. It is started with the
 container's network ([chapter 14](14-veth-bridges-netlink.md) §8), after its names are in the zone,
-and before the container's program runs. When the network is undone,
+and before the container's program runs, if the container is on at least
+one user-defined network. Connected to another one while it runs, its
+server is rescoped (`View::set_scope`; queries already on their way keep
+the scope they started with); connected to its *first* user-defined
+network, it gets a server and its `resolv.conf` is rewritten in place to
+name `127.0.0.11`; disconnected from its last, the server is closed, the
+redirect table removed (`firewall::remove_dns_redirect`) and `resolv.conf`
+rewritten to the host's servers again. Upstream servers are none only when
+none of its networks has a way out. When the network is undone,
 `DnsServer::close` aborts the tasks and waits for them to go, and with them
 the sockets (they hold the container's namespace open, too).
 
@@ -345,8 +418,11 @@ still resolve after `systemctl restart rustletd`.
 ## 8. `/etc/hosts` and `--add-host`
 
 The generated `hosts` ([`files::hosts`](../../crates/rustlet-net/src/files.rs)) starts with Docker's
-localhost lines, then the `--add-host NAME:IP` entries, then the
-container's own address and hostname:
+localhost lines, then the `--add-host NAME:IP` entries, then a line with
+the container's hostname for each of its own addresses: every network's
+IPv4 address and, on a network with IPv6, its IPv6 one, in the order of
+its networks (so a lookup of its own name gets its first network's). A
+container on one network:
 
 ```text
 127.0.0.1	localhost
@@ -358,9 +434,19 @@ ff02::2	ip6-allrouters
 10.89.0.2	1c250f9bdbc9
 ```
 
+`web` above, on `six` and then `back`, rewritten in place as it was
+connected:
+
+```text
+$ rustlet exec web cat /etc/hosts | tail -3
+10.89.2.2	93f30e034002
+fd9a:7b:7e99::2	93f30e034002
+10.89.1.4	93f30e034002
+```
+
 `--add-host host.internal:host-gateway` maps a name to the container's
-gateway, the host's address on the container's bridge: the way to reach a
-service on the host from a container. A container in the host's
+gateway, the host's address on the bridge its default route goes through:
+the way to reach a service on the host from a container. A container in the host's
 namespace gets the host's own `hosts` file plus its `--add-host` entries;
 one sharing another container's namespace (`--network container:web`)
 gets that container's files. Under `--userns=remap` the files belong to the
@@ -379,8 +465,9 @@ rewrites them.
   created inside the containers' namespaces, at the price of a host port
   per network, firewall rules to let the queries in, and a check that a
   query comes from the network it was sent to.
-- Docker answers `AAAA` for containers with IPv6 addresses; Rustlets'
-  networks are IPv4 only.
+- Both answer `AAAA` for containers with IPv6 addresses, and `PTR` under
+  `ip6.arpa`. A container's `resolv.conf` leaves out the host's IPv6 name
+  servers when the container has no IPv6 address, as Docker's does.
 - Neither Docker's local answers nor Rustlets' carry an EDNS record, which
   RFC 6891 asks a server that understands EDNS to echo; forwarded answers
   keep whatever the upstream put in them.
@@ -400,8 +487,11 @@ sudo nsenter -t $PID -n nft list table ip rustlet_dns
 sudo nsenter -t $PID -n ss -ulnp                         # rustletd's socket, in db's namespace
 sudo systemctl restart rustletd
 sudo nsenter -t $PID -n nft list table ip rustlet_dns   # new ports
-$R rm -f db && $R network rm backend
-cargo xtask itest -- dn_user dn_internal net_dns         # the tests behind this chapter
+$R network create --ipv6 six && $R network connect six db
+$R run --rm --network six alpine getent ahostsv6 db      # AAAA
+$R run --rm --network six alpine getent hosts $($R inspect db | sed -n 's/.*"ipv6_address": "\([0-9a-f:]*\)".*/\1/p' | head -1)
+$R rm -f db && $R network rm backend six
+cargo xtask itest -- dn_user dn_internal dn_ipv6 dn_connect net_dns   # the tests behind this chapter
 ```
 
 ## Check yourself
@@ -419,8 +509,8 @@ cargo xtask itest -- dn_user dn_internal net_dns         # the tests behind this
    container's namespace, and not by the daemon's usual firewall code?
 6. In the answer of §4, what do the bytes `c0 0c` mean? Why is the answer
    authoritative?
-7. Why does an `AAAA` question for `db` get `NOERROR` with no records
-   rather than `NXDOMAIN`?
+7. Why does an `AAAA` question for `db`, on a network without IPv6, get
+   `NOERROR` with no records rather than `NXDOMAIN`?
 8. Why must a DNS server never answer a response, not even with an error?
 9. Why does the server forward a query's bytes rather than re-encoding the
    parsed message, and why with a new ID over a connected socket of its
@@ -428,6 +518,13 @@ cargo xtask itest -- dn_user dn_internal net_dns         # the tests behind this
 10. The daemon restarts while `db` runs. What happens to a query `db`
     makes in between, and what does the new daemon do to make names work
     again?
+11. A container is on `back` (IPv4 only) and `six` (IPv6), in that order,
+    and so is `web`. Which network answers its `A` question for `web`, and
+    which its `AAAA`? What did the first rule answer, and why was it
+    changed?
+12. A container on `back` alone runs `getent ahostsv6 web` and gets
+    `::ffff:10.89.1.4`. Who made that address, and what did the server
+    answer?
 
 ## Experiments
 
@@ -442,6 +539,11 @@ cargo xtask itest -- dn_user dn_internal net_dns         # the tests behind this
 - **Round-robin.** Start three containers with the same `--network-alias
   web` and run `getent hosts web` a few times, then `nslookup -type=a
   web.` Which addresses come back, and in which order?
+- **Follow a connection.** Run `getent hosts db` in a container on its
+  own network every second (`while :; do getent hosts db; sleep 1; done`)
+  while you `network connect` and `disconnect` it to and from `db`'s
+  network, and watch its `/etc/resolv.conf` (`rustlet exec`). When does the
+  name start and stop resolving, and when does the file change?
 - **No way out.** `rustlet network create --internal inner`, then
   `getent hosts example.org` and `getent hosts <a container on inner>`
   from a container on it. What does the server answer for each, and why?

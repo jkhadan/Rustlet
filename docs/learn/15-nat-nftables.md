@@ -11,26 +11,32 @@ and `ens18` at all, IP forwarding has to be on, which, left unguarded,
 makes the host a router onto `10.89.0.0/24` for anyone on the LAN who adds
 a route to it. This chapter is about the nftables table that does the
 first two and prevents the third, the order in which the daemon sets it
-up, and the userland proxy that handles the traffic NAT can't reach.
+up, the userland proxy that handles the traffic NAT can't reach, the same
+for IPv6 on networks that have it, and how all of it lives with ufw,
+which this host now runs.
 
 Code: [`firewall.rs`](../../crates/rustlet-net/src/firewall.rs) (`Ruleset::to_json`, `Ruleset::apply`,
 `run_nft`, `dns_redirect`) and its snapshots in
 [`snapshots/`](../../crates/rustlet-net/src/snapshots/), [`sysctl.rs`](../../crates/rustlet-net/src/sysctl.rs) (`enable_forwarding`,
-`recorded`), [`proxy.rs`](../../crates/rustlet-net/src/proxy.rs) (`Proxy::tcp`, `Proxy::udp`, `Proxy::close`),
-[`ufw.rs`](../../crates/rustlet-net/src/ufw.rs); the daemon's [`network.rs`](../../crates/rustletd/src/network.rs)
-(`Networks::setup_host`, `apply_firewall`, `publish`, `proxy_pair`, `bound_socket`,
-`resume_network`). Tests: `net_bridge_nat_published_ports_and_guards` in
-[`network.rs`](../../tests/tests/network.rs), `dn_published_ports`, `dn_publish_all_and_host_networking` and
-`dn_networking_survives_a_daemon_restart` in [`daemon_network.rs`](../../tests/tests/daemon_network.rs), the
-proxy's 15 unit tests, and step 3 of [`scripts/smoke.sh`](../../scripts/smoke.sh) on the real host.
-Design: [architecture.md §2.5](../architecture.md#25-rustlet-net--host-side-networking) (Firewall, Published ports).
+`enable_forwarding6`, `recorded`), [`proxy.rs`](../../crates/rustlet-net/src/proxy.rs) (`Proxy::tcp`, `Proxy::udp`,
+`Proxy::close`, `Backend`), [`ufw.rs`](../../crates/rustlet-net/src/ufw.rs) (`manages_host`, `added`, `allow`, `forget`); the
+daemon's [`network.rs`](../../crates/rustletd/src/network.rs) (`Networks::setup_host`, `apply_firewall`, `port_rules`,
+`sync_ufw`, `publish`, `proxy_pair`, `backend_for`, `retarget`, `bound_socket`, `resume_network`).
+Tests: `net_bridge_nat_published_ports_and_guards` and `net_ipv6_bridge_nat66_published_ports_and_guards`
+in [`network.rs`](../../tests/tests/network.rs); `dn_published_ports`, `dn_publish_all_and_host_networking`,
+`dn_ipv6_networks`, `dn_connect_and_disconnect` and `dn_networking_survives_a_daemon_restart` in
+[`daemon_network.rs`](../../tests/tests/daemon_network.rs); the proxy's 19 unit tests; and steps 3, 6 and 9
+of [`scripts/smoke.sh`](../../scripts/smoke.sh) on the real host. Design:
+[architecture.md §2.5](../architecture.md#25-rustlet-net--host-side-networking) (Firewall, Published ports, ufw).
 
 The transcripts were recorded on 2026-10-02 against the installed service,
 kernel 7.0.0-34-generic, nftables 1.0.9, with one container running:
 `rustlet run -d --name web -p 8080:80 nginx`, at 10.89.0.2. The host is
 192.168.50.143 on `ens18`. `rustlet` is `sudo target/debug/rustlet`;
 commands that need root ran through `sudo` or `sudo systemd-run --pipe
---wait`.
+--wait`. ufw was enabled on this host later that day (§8); the table of §2,
+the hairpin request of §5 and everything about IPv6 and ufw were recorded
+after that, with the rules as they are now.
 
 ## 1. Netfilter in one picture
 
@@ -68,6 +74,12 @@ LAN → host:8080:       ens18 ─ PREROUTING (dnat to 10.89.0.2:80) ─ routing
 LAN → 10.89.0.2:80:    ens18 ─ PREROUTING (raw: drop)
 ```
 
+and a fourth, once §5 has explained it:
+
+```text
+container → host:8080: rustlet0 ─ PREROUTING (dnat) ─ routing ─ FORWARD ─ POSTROUTING (masquerade: hairpin) ─► rustlet0
+```
+
 ## 2. One table of our own
 
 nftables organises rules into **tables** (each of a family: `ip`, `ip6`,
@@ -95,7 +107,7 @@ table inet rustlet {
 
 	chain prerouting {
 		type nat hook prerouting priority dstnat; policy accept;
-		meta nfproto ipv4 iifname != "rustlet0" fib daddr type local tcp dport 8080 dnat ip to 10.89.0.2:80 comment "web 8080/tcp -> 10.89.0.2:80"
+		meta nfproto ipv4 fib daddr type local tcp dport 8080 dnat ip to 10.89.0.2:80 comment "web 8080/tcp -> 10.89.0.2:80"
 	}
 
 	chain output {
@@ -106,6 +118,7 @@ table inet rustlet {
 	chain postrouting {
 		type nat hook postrouting priority srcnat; policy accept;
 		ip saddr 10.89.0.0/24 oifname != "rustlet0" masquerade comment "10.89.0.0/24 out"
+		ip saddr 10.89.0.0/24 oifname "rustlet0" ct status dnat masquerade comment "10.89.0.0/24 hairpin"
 	}
 
 	chain forward {
@@ -115,13 +128,16 @@ table inet rustlet {
 		iifname "rustlet0" oifname "rustlet0" accept comment "within rustlet0"
 		oifname "rustlet0" drop comment "nothing else into rustlet0"
 		iifname "rustlet0" accept comment "rustlet0 out"
-		drop comment "Rustlets turned forwarding on: nothing but its own bridges is forwarded"
+		meta nfproto ipv4 drop comment "Rustlets turned IPv4 forwarding on: nothing but its own bridges is forwarded"
+		meta nfproto ipv6 drop comment "Rustlets turned IPv6 forwarding on: nothing but its own bridges is forwarded"
 	}
 }
 ```
 
-The sections below go through it chain by chain. Two things about how it
-gets there first.
+(The last rule is there because a network with IPv6 had existed on this
+host, and Rustlets turned IPv6 forwarding on for it: §6 and §7.) The
+sections below go through the table chain by chain. Two things about how
+it gets there first.
 
 **It is generated as JSON, never as text.** `nft -j -f -` reads the JSON
 form of the ruleset (libnftables-json(5)), and
@@ -143,10 +159,11 @@ $ sudo nft -j list table inet rustlet
             {"drop": null}]}}, …
 ```
 
-The unit tests snapshot the JSON of a sample ruleset (two networks, two
-ports, forwarding isolated: [`snapshots/`](../../crates/rustlet-net/src/snapshots/)); while it was
-written, each snapshot was also fed to `nft --check -j -f`, which has the
-kernel validate the whole transaction without committing it.
+The unit tests snapshot the JSON of a sample ruleset (three networks, one
+with IPv6, three ports, forwarding isolated for both families:
+[`snapshots/`](../../crates/rustlet-net/src/snapshots/)); each time it changes, the snapshot is also fed to
+`nft --check -j -f`, which has the kernel validate the whole transaction
+without committing it.
 
 **It is replaced whole, atomically.** The daemon never edits the table.
 Whenever a network or a published port changes, it computes the whole
@@ -191,18 +208,35 @@ address it sees, and from a container it says `lan 192.0.2.2`, the test
 host's address, not the container's. Internal networks get no
 masquerading rule at all.
 
+**IPv6 too.** A network with IPv6 gets the same rule for its IPv6 subnet:
+
+```text
+ip6 saddr fd9a:7b:7e99::/64 oifname != "rlbbd6e48557003" masquerade comment "fd9a:7b:7e99::/64 out"
+```
+
+NAT for IPv6 (NAT66) is frowned upon where every machine can have a
+global address: IPv6 was meant to end the need for it. But a container
+network's unique local addresses ([chapter 14](14-veth-bridges-netlink.md) §7) are routed nowhere
+beyond the host, any more than 10.89/16 is, and the LAN's routers don't
+know where they are; masquerading lets containers reach IPv6 destinations
+without teaching the LAN a route. Docker does the same by default (its
+`gateway_mode_ipv6=nat`; a `routed` mode needs the LAN to route the
+containers' prefix to the host). In `dn_ipv6_networks` the LAN machine
+sees the test host's address, `lan6 2001:db8::2`.
+
 ## 4. In: DNAT for published ports
 
 ```text
-meta nfproto ipv4 iifname != "rustlet0" fib daddr type local tcp dport 8080 dnat ip to 10.89.0.2:80
+meta nfproto ipv4 fib daddr type local tcp dport 8080 dnat ip to 10.89.0.2:80
 ```
 
 Left to right:
 
-- `meta nfproto ipv4`: the table is `inet`, so it sees IPv6 too, and a
-  container has only an IPv4 address. (`nft` leaves this match out when it
-  prints a rule with an `ip` match, which implies it.)
-- `iifname != "rustlet0"`: not from the port's own bridge (§5).
+- `meta nfproto ipv4`: the table is `inet`, so it sees IPv6 too, and this
+  rule is for the container's IPv4 address. (`nft` leaves this match out
+  when it prints a rule with an `ip` match, which implies it.)
+- no `iifname`: wherever the packet came from, a container on the same
+  bridge included (that is §5's hairpin traffic).
 - `fib daddr type local`: the destination is one of the host's own
   addresses, whichever: what "every address" means for `-p 8080:80`. With
   `-p 192.168.50.143:8080:80` this becomes `ip daddr 192.168.50.143`.
@@ -213,6 +247,20 @@ Left to right:
 DNAT leaves the source alone, so the container sees the real client. In
 `net_bridge_nat_published_ports_and_guards` the LAN machine's request to the
 host's port is answered with `container 192.0.2.1`.
+
+On a network with IPv6 a published port gets a rule of each family, the
+IPv6 one to the container's IPv6 address:
+
+```text
+meta nfproto ipv6 fib daddr type local tcp dport 8080 dnat ip6 to [fd9a:7b:7e99::2]:80 comment "web 8080/tcp -> [fd9a:7b:7e99::2]:80"
+```
+
+so the LAN and the host reach it over either family (`-p [::]:8080:80`, or
+an IPv6 address in brackets, publishes on IPv6 alone). A container on
+several networks has one set of published ports, which lead to its
+addresses on the network its default route goes through, a network of
+each family ([chapter 14](14-veth-bridges-netlink.md) §10): when that network is disconnected,
+the next ruleset has them lead to the next one.
 
 Packets the host sends itself never pass `prerouting`. The **`output`**
 chain has the same rule for them, with one more match, `ip daddr !=
@@ -243,7 +291,7 @@ third through either of the proxy's sockets (curl tries `::1` first for
 
 ## 5. What NAT can't reach, and the proxy
 
-Three kinds of traffic to a published port never meet a DNAT rule that
+Two kinds of traffic to a published port never meet a DNAT rule that
 could work for them:
 
 - **To `127.0.0.1`.** Rewriting a loopback destination to 10.89.0.2 is
@@ -252,15 +300,12 @@ could work for them:
   Kubernetes' kube-proxy once set it, and neighbours on the LAN could then
   reach services bound to the host's loopback (CVE-2020-8558). Rustlets
   never sets it.
-- **Over IPv6.** The containers have IPv4 addresses only; NAT can't turn
-  an IPv6 connection into an IPv4 one.
-- **Hairpin traffic**: a container connecting to the host's address and a
-  port another container on the *same bridge* publishes. DNATed, its
-  packets would go back onto the bridge, and the server's replies would
-  go straight to the client across the bridge, from 10.89.0.2 rather than
-  from the address the client connected to; the client would drop them.
-  The DNAT rule therefore skips traffic from the port's own bridge
-  (`iifname != "rustlet0"`).
+- **Over IPv6, to a container without an IPv6 address** (one on an
+  IPv4-only network): NAT can't turn an IPv6 connection into an IPv4 one.
+  A container on a network with IPv6 gets DNAT over IPv6 (§4).
+
+A third kind was the proxy's at first, hairpin traffic; the end of this
+section tells why it no longer is.
 
 So the daemon also listens on the published port itself and relays what
 arrives there, as Docker's `docker-proxy` does
@@ -299,9 +344,10 @@ runtime's, in front of the user.
 
 **Answering from the right address.** A UDP socket bound to `0.0.0.0` or
 `[::]` sends from whichever address the kernel picks for the route back:
-to a hairpin client, the bridge's 10.89.0.1 rather than the
-192.168.50.143 it wrote to; over IPv6, perhaps one of the host's temporary
-addresses. A client takes such an answer for somebody else's (a connected
+to a client that wrote to one of the host's addresses, perhaps another (a
+hairpin client, while that was the proxy's, got the bridge's 10.89.0.1
+instead of the 192.168.50.143 it wrote to); over IPv6, perhaps one of the
+host's temporary addresses. A client takes such an answer for somebody else's (a connected
 client socket never even sees it). So the proxy asks the kernel for each
 datagram's destination (`IP_PKTINFO`, `IPV6_PKTINFO` on the published
 socket) and sends each answer with that address as its source, in a
@@ -340,6 +386,65 @@ new daemon binds them again as it takes the container over
 page from the LAN while no daemon runs, then waits for `127.0.0.1` to
 answer again. (§2.5 records this as a deviation.)
 
+**Where it relays to can change.** A container disconnected from the
+network its ports led to (§4) needs its proxies to lead elsewhere, but
+closing and binding again would leave the port free for a moment, for
+anyone. So a proxy's backend is a value the daemon changes while the proxy
+runs ([`proxy::Backend`](../../crates/rustlet-net/src/proxy.rs)): a TCP connection keeps the backend it
+started with, new ones get the new one; a UDP client whose socket leads to
+the old one gets a new socket with its next datagram; and with no backend
+at all (no network with a way out) a TCP client is closed at once and a
+datagram dropped, while the socket stays bound. `dn_connect_and_disconnect`
+fetches the page through `127.0.0.1` after the move.
+
+**Hairpin traffic.** A container on `rustlet0` connecting to
+192.168.50.143:8080, published by another container on `rustlet0` (or by
+itself): DNATed like any other, its packets go back onto the bridge they
+came from, and the server answers the client straight across the bridge,
+from 10.89.0.2 rather than from the address the client connected to; the
+client drops the answer. Phase 5 first dealt with it by leaving such
+traffic alone (`iifname != "rustlet0"` in the DNAT rule), so that it
+reached the proxy instead, as Docker's userland proxy does. Traffic the
+proxy gets is the host's own input, though, and when ufw was enabled on
+this host its incoming policy dropped it: a container timed out on a
+neighbour's published port through the host's address, and through its
+gateway's, while one on another network got through (DNATed, forwarded).
+
+Now the DNAT rule applies whatever the packet came in on, and one more
+rule per subnet masquerades DNATed traffic that goes back out of the
+bridge it came from:
+
+```text
+ip saddr 10.89.0.0/24 oifname "rustlet0" ct status dnat masquerade comment "10.89.0.0/24 hairpin"
+```
+
+The server sees the bridge's address as its client and answers the host,
+which undoes both rewrites on the way back. `ct status dnat` keeps
+everything else alone: traffic between two containers on a bridge is
+switched, not routed, and never reaches these hooks, unless the
+`br_netfilter` module makes bridged frames pass them, and then it must
+keep its addresses. Hairpin traffic is forwarded traffic now, which ufw's
+route rules let through (§8), and it costs no relay:
+
+```text
+$ rustlet run --rm alpine wget -qO- http://192.168.50.143:8080/ | grep title; rustlet logs web | tail -1
+<title>Welcome to nginx!</title>
+10.89.0.1 - - [02/Oct/2026:18:40:24 +0000] "GET / HTTP/1.1" 200 896 "-" "Wget" "-"
+```
+
+nginx logs the gateway, 10.89.0.1, as its client: the masquerade. Podman's
+netavark handles hairpin traffic the same way, and Docker does with
+`--userland-proxy=false`, where it also turns on hairpin mode on the bridge
+ports. That matters with `br_netfilter` loaded, when the bridge itself
+runs these hooks on the frames it switches and a container connecting to
+*its own* published port could need hairpin mode on its port; Rustlets
+doesn't set it, and this host doesn't load `br_netfilter`. Here even that
+case works: the host routes the packet, and it leaves through the bridge
+from the host's side. `net_bridge_nat_published_ports_and_guards` has the
+container fetch its own published port through the host's address and get
+`container 10.89.0.1`; `dn_published_ports`, a neighbour. Without the
+masquerade rule the first times out.
+
 ## 6. Not past the bridge
 
 With `ip_forward` on, the host forwards any packet that arrives for an
@@ -362,7 +467,9 @@ masqueraded flow (conntrack hasn't undone the NAT yet), so neither is
 affected. Docker 28 added rules to its `raw` table for the same reason,
 one per container address; Rustlets has one per subnet. The same rule also
 keeps containers on *another* network from reaching this one: their packets
-arrive on their own bridge.
+arrive on their own bridge. A network with IPv6 has the same guard for its
+IPv6 subnet (`ip6 daddr fd9a:7b:7e99::/64 iifname != "rlbbd6e48557003"
+drop`).
 
 **The forward chain** decides what may be forwarded at all:
 
@@ -372,7 +479,8 @@ oifname "rustlet0" ct status dnat accept                  # published ports
 iifname "rustlet0" oifname "rustlet0" accept              # container to container on the bridge
 oifname "rustlet0" drop                                   # nothing else into the bridge
 iifname "rustlet0" accept                                 # containers out
-drop                                                      # (forwarding was off: nothing else)
+meta nfproto ipv4 drop                                    # (IPv4 forwarding was off: nothing else)
+meta nfproto ipv6 drop                                    # (the same for IPv6)
 ```
 
 Into a bridge go only replies, published ports and traffic within the
@@ -388,18 +496,30 @@ pins the order down.
 `net_bridge_nat_published_ports_and_guards` gives the LAN namespace exactly
 that route through the test host and connects to the container: it fails.
 Then it flushes `raw_prerouting` and tries again: the forward chain alone
-still drops it, while the published port still answers. On the real host,
-`scripts/smoke.sh` does the same with a throwaway namespace behind a veth
-(`rlsmoke`), with the real rules:
+still drops it, while the published port still answers.
+`net_ipv6_bridge_nat66_published_ports_and_guards` does the same over
+IPv6. On the real host, `scripts/smoke.sh` does both with a throwaway
+namespace behind a veth (`rlsmoke`, which has 2001:db8:5::/64 too), with
+the real rules and ufw active:
 
 ```text
 ==> 3. the LAN can't reach containers directly (container 10.89.0.3)
     ok: the LAN reaches the published port
     ok: the LAN can't reach 10.89.0.3:80 directly
+…
+==> 6. an IPv6 network
+    ok: smoke-net6 has fd9a:7b:7e99::/64
+    ok: IPv6 forwarding is on
+    ok: curl [::1]:18086 (the proxy, to fd9a:7b:7e99::2)
+    ok: curl [fd4b:a90d:1d5c:63:6cb3:e6d9:5b01:25b3]:18086 (DNAT)
+    ok: the LAN reaches it over IPv6 (DNAT, forwarded)
+    ok: the LAN can't reach [fd9a:7b:7e99::2]:80 directly
+    ok: AAAA: smoke-web6 is fd9a:7b:7e99::2
 ```
 
-**When Rustlets turned forwarding on**, the chain ends with a plain
-`drop`: nothing that involves none of its bridges is forwarded. A host
+**When Rustlets turned forwarding on**, the chain ends with a `drop` for
+that family: nothing of it that involves none of its bridges is
+forwarded. A host
 that didn't forward before Rustlets came along doesn't start forwarding
 between its other interfaces (a LAN and a VPN, say) because containers
 needed it. Docker does the same by setting the iptables `FORWARD` policy
@@ -408,7 +528,9 @@ Docker's: other software that later wants this host to forward (libvirt,
 a VPN server) finds it dropped by Rustlets' table, until `scripts/cleanup.sh`
 removes the table. When forwarding was already on (the record says 1),
 the drop is left out: someone else forwards, and it isn't Rustlets' place
-to stop them.
+to stop them. Each family is judged on its own (`meta nfproto ipv4`,
+`ipv6`): a host that routed IPv6 before Rustlets turned IPv4 forwarding on
+goes on routing IPv6.
 
 ## 7. The order at startup
 
@@ -422,22 +544,31 @@ never leaves forwarding on without the guards:
 2. the pin directory, then every network's bridge (idempotent:
    `link::ensure_bridge`);
 3. the firewall;
-4. only then `ip_forward`, after recording its old value.
+4. only then `ip_forward`, after recording its old value, and IPv6
+   forwarding (`net.ipv6.conf.all.forwarding`) the same way, if a network
+   has IPv6;
+5. ufw's route rules (§8).
 
 ```text
 $ cat /proc/sys/net/ipv4/ip_forward; cat /run/rustlet/host-sysctl.orig
 1
 net.ipv4.ip_forward=0
+net.ipv6.conf.all.forwarding=0
 ```
 
-The record ([`sysctl::enable_forwarding`](../../crates/rustlet-net/src/sysctl.rs)) is written once, before the
-first change, and never overwritten: a second daemon must not record the
-value the first one set. `scripts/cleanup.sh` reads it back and restores
-the sysctl (step 7). It lives under `/run`, a tmpfs: a reboot resets the
-sysctl and forgets the record together. The same record tells the
-firewall whether it may add the final drop of §6. After reconciliation
-(chapter 13) has taken over or undone every run, the ruleset is applied
-once more.
+The record ([`sysctl::enable_forwarding`](../../crates/rustlet-net/src/sysctl.rs), `enable_forwarding6`) holds a
+line per sysctl, written once, before the first change, and never
+overwritten: a second daemon must not record the value the first one set.
+`scripts/cleanup.sh` reads it back and restores every line (step 8). It
+lives under `/run`, a tmpfs: a reboot resets the sysctls and forgets the
+record together. The same record tells the firewall whether it may add the
+final drops of §6. IPv6 forwarding is turned on when the first network with
+IPv6 is created, in the same order (the firewall with the network's guards
+first), and like `ip_forward` it then stays on; the drop must too, so a
+daemon that starts with no IPv6 network left still adds it, because the
+record says IPv6 forwarding was Rustlets' doing (`dn_ipv6_networks` checks
+it after a restart). After reconciliation (chapter 13) has taken over or
+undone every run, the ruleset is applied once more.
 
 ## 8. ufw
 
@@ -446,18 +577,93 @@ underneath, tables `ip filter` and `ip6 filter`), with its own policy for
 forwarded traffic, `DROP` on this host (`DEFAULT_FORWARD_POLICY` in
 `/etc/default/ufw`). Rustlets' `accept`s can't overrule another table's
 `drop` (§2), so with ufw active, containers' traffic would be forwarded by
-one table and dropped by the other. When a bridge is set up and ufw is
-active, the daemon says so in its log and asks ufw itself to route the
-bridge ([`ufw.rs`](../../crates/rustlet-net/src/ufw.rs)): `ufw route allow in on rustlet0` and `ufw route
-allow out on rustlet0`; removing the network removes them. ufw is inactive
-on this host, so this code has only run in its unit test.
+one table and dropped by the other. So for every network the daemon asks
+ufw itself to route the bridge's traffic, both ways
+([`ufw.rs`](../../crates/rustlet-net/src/ufw.rs)): `ufw route allow in on <bridge>` and `ufw route allow
+out on <bridge>`. Rustlets' own table still decides what may reach a
+container (§6); the two rules only keep ufw from dropping what it lets
+through.
+
+ufw was inactive on this host while Phase 5 was built, and this code
+first ran when ufw was enabled, after the rest of the phase. With the
+daemon started and two networks created:
+
+```text
+$ journalctl -u rustletd | grep ufw
+… INFO rustletd::network: ufw: routing rustlet0's traffic (ufw route allow in/out on rustlet0)
+$ sudo ufw status verbose
+Status: active
+Logging: on (low)
+Default: deny (incoming), allow (outgoing), deny (routed)
+New profiles: skip
+
+To                         Action      From
+--                         ------      ----
+Anywhere                   ALLOW FWD   Anywhere on rustlet0
+Anywhere on rustlet0       ALLOW FWD   Anywhere
+Anywhere                   ALLOW FWD   Anywhere on rlb5b9b1acf3190
+Anywhere on rlb5b9b1acf3190 ALLOW FWD   Anywhere
+Anywhere                   ALLOW FWD   Anywhere on rlbbd6e48557003
+Anywhere on rlbbd6e48557003 ALLOW FWD   Anywhere
+Anywhere (v6)              ALLOW FWD   Anywhere (v6) on rustlet0
+Anywhere (v6) on rustlet0  ALLOW FWD   Anywhere (v6)
+…
+```
+
+ufw adds each rule for IPv6 as well ("(v6)"). Its routed default reads
+"deny" since `ip_forward` is on; before the daemon first started, ufw
+reported it "disabled".
+
+Three things were decided by running it:
+
+- **Kept whether ufw is active or not.** An inactive ufw only writes the
+  rules into its configuration (`/etc/ufw/user.rules`, `user6.rules`), and
+  they take effect the day someone runs `ufw enable`. Keeping them only
+  while ufw is active would cut every container off the moment ufw is
+  enabled under a running daemon, which is how this host got its ufw.
+- **Only by a daemon in the host's own network namespace.** `ufw status`
+  checks for ufw's chains in the namespace it runs in, so in a test
+  daemon's namespace it says "inactive" whatever the host's ufw does; but
+  `ufw route allow` would still write the host's configuration files, once
+  for every test network. [`ufw::manages_host`](../../crates/rustlet-net/src/ufw.rs) compares the daemon's
+  network namespace with PID 1's, and the tests' daemons never touch ufw.
+- **What's missing, once per start.** Each `ufw` call starts a Python
+  program. At startup the daemon reads `ufw show added` once and adds only
+  the rules a network lacks; the calls take turns, because ufw rewrites
+  its rule files whole. Creating a network adds its two rules, removing it
+  takes them away, and `scripts/cleanup.sh` (step 7) removes every rule of
+  a `rustlet*` or `rlb*` bridge. `manage_ufw = false` in `daemon.toml`
+  turns all of it off.
+
+`scripts/smoke.sh` checks it on the real host, and its other steps ran
+with ufw active (the LAN namespace reached published ports over IPv4 and
+IPv6, forwarded, and couldn't reach containers directly):
+
+```text
+==> 9. ufw
+    ok: ufw routes rustlet0's traffic (Status: active)
+    ok: ufw routes rlb5e10250e9ec2's traffic (Status: active)
+    ok: ufw routes rlb01482e772d2b's traffic (Status: active)
+    ok: removing smoke-net2 removed rlb4f3e2a43803e's rules
+```
+
+**What ufw still decides.** Traffic delivered to the host itself is for
+ufw's incoming policy to judge, Rustlets' or not. Of a published port's
+traffic, that is what the proxy serves: loopback clients, which ufw always
+lets in (`-i lo`), and IPv6 clients of a container without IPv6, which it
+drops unless the port is allowed (`sudo ufw allow 8080/tcp`), as it does
+docker-proxy's. Hairpin traffic was in that list, and ufw dropped it,
+until it became forwarded traffic (§5). A container reaching one of the
+host's own services (`--add-host db:host-gateway`) is incoming traffic
+too, from the bridge: allow it per port (`sudo ufw allow in on rustlet0 to
+any port 5432`), or the whole bridge.
 
 ## 9. Testing without touching the host
 
 The `net_` and `dn_` tests never change the real host's firewall: their
 daemons run in a network namespace of their own (chapter 14), which has
 its own netfilter tables and its own `ip_forward`, beside a "LAN"
-namespace that plays 192.0.2.1. The rules are real, the kernel is real,
+namespace that plays 192.0.2.1 and 2001:db8::1. (Nor its ufw: §8.) The rules are real, the kernel is real,
 the LAN is a namespace. Only the installed service, and `scripts/smoke.sh`
 against it, use the host's own tables.
 
@@ -469,9 +675,16 @@ against it, use the host's own tables.
   replaces it whole.
 - Docker runs a `docker-proxy` process per published port; Rustlets'
   proxy is tasks of the daemon.
-- With `--userland-proxy=false` Docker handles hairpin and loopback traffic
-  with NAT instead (hairpin mode on the bridge ports, `route_localnet`).
-  Rustlets has no such mode.
+- Docker's userland proxy serves hairpin traffic, and with
+  `--userland-proxy=false` it handles hairpin and loopback traffic with NAT
+  instead (hairpin mode on the bridge ports, `route_localnet`). Rustlets
+  handles hairpin traffic with NAT always, as Podman does, and loopback
+  traffic with its proxy always, never `route_localnet`.
+- Docker inserts its own chains ahead of ufw's in iptables' `FORWARD`, so
+  published ports bypass ufw (a common surprise); Rustlets asks ufw to
+  route its bridges, so `ufw status` shows what is let through.
+- Both NAT IPv6 by default on networks with IPv6 (Docker 27 and later,
+  with `ip6tables` on).
 - Docker's raw guards are per container address, Rustlets' per subnet.
 
 ## 11. Try it
@@ -486,7 +699,13 @@ sudo ss -tlnp 'sport = :8080'                    # rustletd holds 0.0.0.0 and [:
 $R run -d -p 80 --name any nginx && $R port any  # the kernel's choice
 $R run -d --name dup -p 8080:80 nginx            # taken: a conflict (dup stays created)
 cat /run/rustlet/host-sysctl.orig                # what cleanup.sh restores
-scripts/smoke.sh                                 # step 3: a LAN namespace can't reach the container
+$R run --rm alpine wget -qO- http://192.168.50.143:8080/ | head -4   # hairpin: DNAT, masqueraded
+$R logs web | tail -1                            # nginx saw 10.89.0.1
+$R network create --ipv6 six && $R run -d --name web6 --network six -p 8086:80 nginx
+sudo nft list table inet rustlet                 # ip6 rules: guard, DNAT, NAT66, hairpin
+curl -s "http://[::1]:8086/" | head -4           # the proxy, to the container's IPv6 address
+sudo ufw status verbose; sudo ufw show added     # the route rules (if ufw is installed)
+scripts/smoke.sh                                 # steps 3, 6, 9: the LAN, IPv6, ufw
 $R rm -f web any dup
 cargo xtask itest -- net_ dn_                    # the tests behind this chapter
 ```
@@ -503,8 +722,9 @@ cargo xtask itest -- net_ dn_                    # the tests behind this chapter
    and what would it take to make it possible? Why doesn't Rustlets do
    that?
 5. A container on `rustlet0` connects to 192.168.50.143:8080, published by
-   another container on `rustlet0`. Follow its packets. What would go
-   wrong if the DNAT rule didn't skip `iifname "rustlet0"`?
+   another container on `rustlet0`. Follow its packets through the hooks.
+   What would go wrong without the hairpin masquerade, and why does that
+   rule match `ct status dnat`?
 6. Why does the daemon bind the published port itself, even though DNAT
    delivers external traffic without any socket?
 7. A UDP client on IPv6 sends to the host's stable address and gets an
@@ -516,6 +736,13 @@ cargo xtask itest -- net_ dn_                    # the tests behind this chapter
    why is its old value recorded only once?
 10. ufw is active and its forward policy is `DROP`. Why doesn't Rustlets'
     `iifname "rustlet0" accept` help, and what does the daemon do instead?
+    Why does it keep those rules while ufw is inactive, and why never from
+    a test daemon?
+11. The last network with IPv6 is removed, and the daemon restarts. Is
+    IPv6 forwarding on? Must the forward chain's IPv6 drop still be there,
+    and how does the daemon know?
+12. Why masquerade IPv6 at all, when IPv6 was meant to end NAT? What would
+    the LAN need for containers to be reached without it?
 
 ## Experiments
 
@@ -533,6 +760,9 @@ cargo xtask itest -- net_ dn_                    # the tests behind this chapter
   compare `nft list table inet rustlet` with the `-p 8080:80` case, and
   try the port from the host and from another machine.
 - **Hairpin.** From a container on the default network, `wget -qO-
-  http://192.168.50.143:8080` (your host's address). Then publish nginx on
-  a user-defined network instead and try again from the default one.
-  Which path does each request take?
+  http://192.168.50.143:8080` (your host's address), and look at nginx's
+  log. Then delete the hairpin rule (`nft -a list chain inet rustlet
+  postrouting` shows handles) and try again; with `ufw` active, also put
+  `iifname != "rustlet0"` back into the DNAT rule by hand so that the
+  request reaches the proxy, and watch ufw drop it (`sudo dmesg | grep
+  UFW` with ufw's logging on). Which path did each request take?
