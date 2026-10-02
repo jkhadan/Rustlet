@@ -739,8 +739,17 @@ impl Daemon {
     /// rules, its address, its veth, its pin. Never fails; what can't be
     /// undone is logged.
     pub async fn detach_network(&self, c: &Container, run: &NetRun) {
-        // Its DNS server and proxies stop as they are dropped.
-        self.networks.state().live.remove(c.id());
+        // Its DNS server and proxies, closed before anything else: a start
+        // right after (a restart) may want the same port.
+        let live = self.networks.state().live.remove(c.id());
+        if let Some(live) = live {
+            if let Some(dns) = live.dns {
+                dns.close().await;
+            }
+            for p in live.proxies {
+                p.close().await;
+            }
+        }
         if let (Some(net), Some(ip)) = (&run.network_name, run.ip) {
             self.networks.zone.remove(net, ip);
         }

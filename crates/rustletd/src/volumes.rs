@@ -253,9 +253,17 @@ impl Daemon {
             let lock = self.volume_lock(&name);
             let _turn = lock.lock().await;
             let (data, rootfs, target) = (self.volume_data(&name), rootfs.to_owned(), m.target.clone());
-            let copied = blocking(move || copy_into_volume(&rootfs, &target, &data, remap))
-                .await
-                .map_err(|e| e.context(format!("copy the image's {} into the volume {name}", m.target)))?;
+            let copied = blocking(move || {
+                let r = copy_into_volume(&rootfs, &target, &data, remap);
+                if r.is_err() {
+                    // Half a copy would count as content: empty the volume,
+                    // so the next start copies again.
+                    let _ = empty_dir(&data);
+                }
+                r
+            })
+            .await
+            .map_err(|e| e.context(format!("copy the image's {} into the volume {name}", m.target)))?;
             if let Some(r) = copied
                 && !r.skipped.is_empty()
             {
@@ -386,6 +394,23 @@ fn copy_into_volume(
     Ok(Some(rustlet_image::copyup::copy_up(root.as_fd(), Path::new(target), dest.as_fd(), &map)?))
 }
 
+/// Removes everything in `dir`, which stays (on its filesystem only, not
+/// following symlinks: `rustlet_sys::tree`).
+fn empty_dir(dir: &Path) -> ApiResult<()> {
+    let fd = nix::fcntl::open(
+        dir,
+        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+        Mode::empty(),
+    )
+    .map_err(|e| ApiError::internal(format!("open {}: {e}", dir.display())))?;
+    for entry in std::fs::read_dir(dir).map_err(|e| ApiError::internal(format!("read {}: {e}", dir.display())))? {
+        let entry = entry.map_err(|e| ApiError::internal(e.to_string()))?;
+        rustlet_sys::tree::remove_tree_at(fd.as_fd(), &entry.file_name())
+            .map_err(|e| ApiError::internal(format!("remove {}: {e}", entry.path().display())))?;
+    }
+    Ok(())
+}
+
 /// The bytes the files below `dir` hold (not following symlinks, staying
 /// on its filesystem).
 fn tree_size(dir: &Path) -> u64 {
@@ -436,6 +461,17 @@ mod tests {
         };
         assert!(check_mount(&idmapped, false).is_err(), "idmap without a user namespace");
         assert!(check_mount(&idmapped, true).is_ok());
+    }
+
+    #[test]
+    fn emptied_directories_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::fs::write(dir.path().join("a/b/f"), "x").unwrap();
+        std::os::unix::fs::symlink("/etc", dir.path().join("link")).unwrap();
+        empty_dir(dir.path()).unwrap();
+        assert!(dir.path().is_dir() && std::fs::read_dir(dir.path()).unwrap().next().is_none());
+        assert!(Path::new("/etc/passwd").exists(), "a symlink is removed, not followed");
     }
 
     #[test]

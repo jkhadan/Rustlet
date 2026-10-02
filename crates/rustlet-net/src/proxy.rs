@@ -125,6 +125,16 @@ impl Proxy {
     }
 }
 
+impl Proxy {
+    /// Stops the proxy and waits until its task is gone, and with it the
+    /// published socket: the port can be bound again as soon as this
+    /// returns (a container restarted on the same port).
+    pub async fn close(mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
+}
+
 impl Drop for Proxy {
     fn drop(&mut self) {
         self.task.abort();

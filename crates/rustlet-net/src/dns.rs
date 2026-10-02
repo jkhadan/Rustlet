@@ -265,6 +265,15 @@ impl DnsServer {
     }
 }
 
+impl DnsServer {
+    /// Stops the server and waits until its tasks are gone, and with them
+    /// its sockets.
+    pub async fn close(mut self) {
+        self.tasks.abort_all();
+        while self.tasks.join_next().await.is_some() {}
+    }
+}
+
 impl Drop for DnsServer {
     fn drop(&mut self) {
         // An aborted task's future is dropped, and with it the `JoinSet` of
