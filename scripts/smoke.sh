@@ -74,7 +74,7 @@ out=$($R run --rm $IMG sh -c 'echo hello; exit 3'); code=$?
 
 say "2. a published port"
 $R run -d --name smoke-web -p $PORT:80 $IMG_WEB >/dev/null || fail "run nginx"
-for _ in $(seq 1 50); do curl -fsS -o /dev/null http://127.0.0.1:$PORT/ && break; sleep 0.2; done
+for _ in $(seq 1 50); do curl -fs -o /dev/null http://127.0.0.1:$PORT/ && break; sleep 0.2; done
 check "curl 127.0.0.1:$PORT (the proxy)" sh -c "curl -fsS http://127.0.0.1:$PORT/ | grep -q 'Welcome to nginx'"
 check "curl $HOST_IP:$PORT (DNAT)" sh -c "curl -fsS http://$HOST_IP:$PORT/ | grep -q 'Welcome to nginx'"
 WEB_IP=$($R inspect smoke-web | sed -n 's/.*"ip_address": "\([0-9.]*\)".*/\1/p' | head -1)
@@ -117,7 +117,7 @@ say "7. a daemon restart"
 sudo -n systemctl restart rustletd || fail "restart rustletd"
 for _ in $(seq 1 50); do $R version >/dev/null 2>&1 && break; sleep 0.2; done
 check "smoke-web is still running" sh -c "$R ps | grep -q smoke-web"
-for _ in $(seq 1 50); do curl -fsS -o /dev/null http://127.0.0.1:$PORT/ && break; sleep 0.2; done
+for _ in $(seq 1 50); do curl -fs -o /dev/null http://127.0.0.1:$PORT/ && break; sleep 0.2; done
 check "its port answers on 127.0.0.1 again" curl -fsS http://127.0.0.1:$PORT/
 check "and through DNAT" curl -fsS http://$HOST_IP:$PORT/
 out=$($R run --rm --network smoke-net $IMG getent hosts smoke-db 2>&1)
