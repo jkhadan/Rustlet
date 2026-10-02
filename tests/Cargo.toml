@@ -33,3 +33,5 @@ flate2.workspace = true
 nix = { workspace = true, features = ["personality"] }
 tempfile.workspace = true
 serde_json.workspace = true
+# Editing a stopped daemon's state.db, to stage what a crash would leave.
+rusqlite.workspace = true

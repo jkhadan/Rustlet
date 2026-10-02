@@ -21,7 +21,7 @@ use rustlet_image::rootfs::{ContainerRootfs, remap};
 use rustlet_runtime::cgroups::{Cgroup, CgroupPath};
 use rustlet_shim::ShimArgs;
 use rustlet_shim::client::{self as shim, ShimClient};
-use rustlet_shim::protocol::{ExitStatus, Handshake, Request, Response, ShimState};
+use rustlet_shim::protocol::{ExitStatus, Handshake, Request, Response, ShimState, ShimStatus};
 use rustlet_spec::container::{
     ContainerConfig, ContainerStatus, CreateResponse, UsernsMode, WaitCondition, WaitResponse,
 };
@@ -144,6 +144,9 @@ impl Daemon {
     async fn start_locked(self: &Arc<Self>, c: &Arc<Container>) -> ApiResult<()> {
         let result = self.start_run(c).await;
         if let Err(e) = &result {
+            // The attaches waiting for this start won't get it: they end
+            // with its error, rather than wait for the next start.
+            c.fail_pending_attaches(e);
             let message = e.message.clone();
             let _ = c.update(&self.db, |s| {
                 s.state.error = Some(message);
@@ -189,6 +192,7 @@ impl Daemon {
     /// isn't live), so all of it can go.
     async fn clear_leftovers(&self, c: &Container) {
         let id = c.id().to_owned();
+        self.discard_shim(&id).await;
         if self.paths.runtime_root.join(&id).exists() {
             self.runc_delete(&id).await;
         }
@@ -207,6 +211,19 @@ impl Daemon {
         }
         let shim_dir = self.paths.shim(c.id()).dir().to_owned();
         let _ = std::fs::remove_dir_all(shim_dir);
+    }
+
+    /// Shuts down a shim that is still there although its container isn't
+    /// running as far as the daemon knows (a start cut short): it kills and
+    /// deletes the container first.
+    async fn discard_shim(&self, id: &str) {
+        let socket = self.paths.shim(id).socket();
+        if shim::call(&socket, &Request::Status).await.is_err() {
+            return;
+        }
+        tracing::info!(%id, "shutting down the shim of an unfinished start");
+        let _ = shim::call(&socket, &Request::Delete { force: true }).await;
+        let _ = shim::call(&socket, &Request::Shutdown).await;
     }
 
     /// `rustlet-runc delete --force`, straight from the daemon: for when no
@@ -308,16 +325,7 @@ impl Daemon {
                 return Err(e);
             }
         }
-        c.update(&self.db, |s| {
-            s.cgroup = Some(cgroup.clone());
-            s.state.status = ContainerStatus::Running;
-            s.state.pid = Some(init_pid);
-            s.state.started_at = Some(rustlet_shim::logfile::now());
-            s.state.finished_at = None;
-            s.state.exit_code = None;
-            s.state.oom_killed = false;
-            s.state.error = None;
-        })?;
+        c.update(&self.db, |s| record_start(s, init_pid, cgroup))?;
         self.emit(c, "start", &[]);
         self.spawn_monitor(c.clone(), socket);
         Ok(())
@@ -329,6 +337,10 @@ impl Daemon {
         let pending: Vec<_> = std::mem::take(&mut *c.pending_attach.lock().unwrap_or_else(|e| e.into_inner()));
         let mut size = None;
         for p in pending {
+            if p.tx.is_closed() {
+                // Its client gave up waiting.
+                continue;
+            }
             let opened = async {
                 let client = ShimClient::connect(socket).await?;
                 client.open_stream(&Request::Attach { stdin: p.stdin }).await
@@ -590,12 +602,7 @@ impl Daemon {
         c.update(&self.db, |s| s.state.status = ContainerStatus::Removing)?;
         self.clear_leftovers(c).await;
         let dir = self.paths.container_dir(c.id());
-        let removed = blocking(move || match ContainerRootfs::open(&dir) {
-            Ok(rootfs) => rootfs.remove().map_err(ApiError::from),
-            Err(_) if !dir.exists() => Ok(()),
-            Err(e) => Err(ApiError::from(e)),
-        })
-        .await;
+        let removed = blocking(move || ContainerRootfs::remove_dir(&dir).map_err(ApiError::from)).await;
         if let Err(e) = removed {
             let _ = c.update(&self.db, |s| {
                 s.state.status = ContainerStatus::Dead;
@@ -639,7 +646,9 @@ impl Daemon {
         let done = |s: &Shared| match condition {
             WaitCondition::NotRunning if !live => true,
             WaitCondition::NotRunning | WaitCondition::NextExit => s.exits > exits || s.removed,
-            WaitCondition::Removed => s.removed,
+            // A dead container stays until an `rm` succeeds: its removal, or
+            // the cleanup after its exit, failed (`error` says why).
+            WaitCondition::Removed => s.removed || s.persisted.state.status == ContainerStatus::Dead,
         };
         let state = match rx.wait_for(done).await {
             Ok(s) => s.persisted.state.clone(),
@@ -657,39 +666,46 @@ impl Daemon {
         for c in self.all_containers() {
             let id = c.id().to_owned();
             let socket = self.paths.shim(&id).socket();
-            match c.status() {
-                ContainerStatus::Running | ContainerStatus::Paused => match shim::call(&socket, &Request::Status).await
-                {
-                    Ok(Response::Status(st)) => match st.state {
-                        ShimState::Running | ShimState::Paused => {
-                            let status = if st.state == ShimState::Paused {
-                                ContainerStatus::Paused
-                            } else {
-                                ContainerStatus::Running
-                            };
-                            let _ = c.update(&self.db, |s| {
-                                s.state.status = status;
-                                s.state.pid = Some(st.init_pid);
-                            });
-                            tracing::info!(%id, "took over the running container");
-                            self.spawn_monitor(c.clone(), socket);
-                        }
-                        ShimState::Exited => self.handle_exit(&c, st.exit.unwrap_or_else(unknown_exit), None).await,
-                        ShimState::Created => {
-                            let error = "the daemon stopped while the container was starting".to_owned();
-                            self.handle_exit(&c, unknown_exit(), Some(error)).await
-                        }
-                    },
-                    _ => {
-                        // No shim: it was killed, or the host restarted.
-                        let saved = std::fs::read(self.paths.shim(&id).exit_json())
-                            .ok()
-                            .and_then(|b| serde_json::from_slice::<ExitStatus>(&b).ok());
-                        let error =
-                            saved.is_none().then(|| "the container's shim was gone when the daemon started".to_owned());
-                        self.handle_exit(&c, saved.unwrap_or_else(unknown_exit), error).await;
-                    }
+            let recorded_live = c.status().is_live();
+            // A shim that answers is asked whatever the database says: the
+            // last daemon may have died between the shim's `Start` and
+            // recording it. (A removal goes on below; it shuts shims down.)
+            let shim = match c.status() {
+                ContainerStatus::Removing => None,
+                _ => match shim::call(&socket, &Request::Status).await {
+                    Ok(Response::Status(st)) => Some(st),
+                    _ => None,
                 },
+            };
+            match shim {
+                Some(st) if matches!(st.state, ShimState::Running | ShimState::Paused) => {
+                    self.take_over(&c, &st, socket);
+                    continue;
+                }
+                Some(st) if st.state == ShimState::Exited => {
+                    self.handle_exit(&c, st.exit.unwrap_or_else(unknown_exit), None).await;
+                    continue;
+                }
+                Some(_) if recorded_live => {
+                    let error = "the daemon stopped while the container was starting".to_owned();
+                    self.handle_exit(&c, unknown_exit(), Some(error)).await;
+                    continue;
+                }
+                // Created, but never started: as if that start hadn't been.
+                Some(_) => self.discard_shim(&id).await,
+                None if recorded_live => {
+                    // No shim: it was killed, or the host restarted.
+                    let saved = std::fs::read(self.paths.shim(&id).exit_json())
+                        .ok()
+                        .and_then(|b| serde_json::from_slice::<ExitStatus>(&b).ok());
+                    let error =
+                        saved.is_none().then(|| "the container's shim was gone when the daemon started".to_owned());
+                    self.handle_exit(&c, saved.unwrap_or_else(unknown_exit), error).await;
+                    continue;
+                }
+                None => {}
+            }
+            match c.status() {
                 ContainerStatus::Restarting => self.schedule_restart(&c, Duration::ZERO),
                 ContainerStatus::Removing => {
                     let d = self.clone();
@@ -706,9 +722,42 @@ impl Daemon {
                         }
                     }
                 }
+                // Handled above.
+                ContainerStatus::Running | ContainerStatus::Paused => {}
             }
         }
     }
+
+    /// A run its shim says is going on becomes the container's again, and
+    /// is watched. If the database never heard of its start, that start is
+    /// recorded now.
+    fn take_over(self: &Arc<Self>, c: &Arc<Container>, st: &ShimStatus, socket: PathBuf) {
+        let missed = !c.status().is_live();
+        let status = if st.state == ShimState::Paused { ContainerStatus::Paused } else { ContainerStatus::Running };
+        let cgroup = cgroup_path(&self.cgroup_parent, c.id());
+        let _ = c.update(&self.db, |s| {
+            if missed {
+                record_start(s, st.init_pid, cgroup);
+            }
+            s.state.status = status;
+            s.state.pid = Some(st.init_pid);
+        });
+        tracing::info!(id = %c.id(), missed, "took over the running container");
+        self.spawn_monitor(c.clone(), socket);
+    }
+}
+
+/// What a start records: the run's cgroup and init, and a state without
+/// the last run's end.
+fn record_start(s: &mut Persisted, init_pid: i32, cgroup: String) {
+    s.cgroup = Some(cgroup);
+    s.state.status = ContainerStatus::Running;
+    s.state.pid = Some(init_pid);
+    s.state.started_at = Some(rustlet_shim::logfile::now());
+    s.state.finished_at = None;
+    s.state.exit_code = None;
+    s.state.oom_killed = false;
+    s.state.error = None;
 }
 
 /// An exit nobody saw.

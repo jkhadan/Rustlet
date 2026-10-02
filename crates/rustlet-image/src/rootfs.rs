@@ -263,6 +263,23 @@ impl ContainerRootfs {
         self.remove_files()
     }
 
+    /// Deletes a container directory in whatever state it is: a removal
+    /// that failed half-way may have left it without `upper/`, `work/` or
+    /// `rootfs/`, and [`open`](Self::open) refuses it then. Nothing to
+    /// delete is fine.
+    pub fn remove_dir(dir: &Path) -> Result<()> {
+        if dir.symlink_metadata().is_err() {
+            return Ok(());
+        }
+        match ContainerRootfs::open(dir) {
+            Ok(rootfs) => rootfs.remove(),
+            Err(_) => {
+                let dir = dir.canonicalize().with_context(|| format!("open {}", dir.display()))?;
+                ContainerRootfs { dir, mounted: false }.remove_files()
+            }
+        }
+    }
+
     fn remove_files(&mut self) -> Result<()> {
         // Whatever is still mounted below (staged layers after a crash, the
         // overlay itself) goes first: safe_remove_tree refuses otherwise.
@@ -348,4 +365,24 @@ fn canonical_new(dir: &Path) -> Result<PathBuf> {
         return Err(Error::invalid(format!("{} already exists", dir.display())));
     }
     Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_half_removed_container_directory_can_still_be_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap().join("c");
+        ContainerRootfs::create(&dir).unwrap();
+        std::fs::write(dir.join("upper/file"), "x").unwrap();
+        // What a removal that failed half-way leaves: `open` refuses it.
+        std::fs::remove_dir(dir.join("work")).unwrap();
+        assert!(ContainerRootfs::open(&dir).is_err());
+        ContainerRootfs::remove_dir(&dir).unwrap();
+        assert!(dir.symlink_metadata().is_err());
+        // Already gone: nothing to do.
+        ContainerRootfs::remove_dir(&dir).unwrap();
+    }
 }

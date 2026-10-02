@@ -324,7 +324,16 @@ async fn wait_removed(ctx: &mut Ctx, id: &str) -> anyhow::Result<()> {
         _ = tokio::signal::ctrl_c() => return Ok(()),
     };
     match removed {
-        Ok(_) => Ok(()),
+        Ok(w) => {
+            // Dead: the removal failed, and the container is still there.
+            if let Some(error) = w.error
+                && ctx.client.inspect_container(id).await.is_ok_and(|i| i.state.status == ContainerStatus::Dead)
+            {
+                let short = rustlet_spec::short_id(id);
+                writeln!(ctx.console.stderr, "rustlet: error: {short} could not be removed: {error}")?;
+            }
+            Ok(())
+        }
         // Removed before we asked.
         Err(e) if e.is_not_found() => Ok(()),
         Err(e) => {

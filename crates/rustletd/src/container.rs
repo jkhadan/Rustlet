@@ -106,8 +106,13 @@ impl Container {
     pub fn mark_removed(&self) {
         self.shared.send_modify(|s| s.removed = true);
         // Attaches still waiting for a start that won't come.
+        self.fail_pending_attaches(&ApiError::no_such_container(&self.record.name));
+    }
+
+    /// Ends the attaches waiting for a start with `e`.
+    pub fn fail_pending_attaches(&self, e: &ApiError) {
         for p in self.pending_attach.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
-            let _ = p.tx.send(Err(ApiError::no_such_container(&self.record.name)));
+            let _ = p.tx.send(Err(e.clone()));
         }
     }
 

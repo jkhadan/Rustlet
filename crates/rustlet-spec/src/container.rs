@@ -281,7 +281,8 @@ pub enum WaitCondition {
     /// Wait for the next exit, even if it isn't running now (`run`
     /// waits like this before `start`).
     NextExit,
-    /// Wait until the container is removed (`run --rm`).
+    /// Wait until the container is removed (`run --rm`), or dead: its
+    /// removal (or the cleanup after its exit) failed, and `error` says why.
     Removed,
 }
 

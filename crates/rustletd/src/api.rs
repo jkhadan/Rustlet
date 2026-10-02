@@ -77,6 +77,14 @@ fn no_content() -> Response {
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// Runs an operation to its end in a task of its own. hyper drops a
+/// handler whose client hangs up (Ctrl-C on `rustlet start`), and an
+/// operation stopped at an arbitrary `.await` (with a shim spawned but the
+/// start not recorded, say) leaves processes that nothing watches.
+async fn to_the_end<T: Send + 'static>(op: impl Future<Output = ApiResult<T>> + Send + 'static) -> ApiResult<T> {
+    tokio::spawn(op).await.unwrap_or_else(|e| Err(ApiError::internal(format!("the operation failed: {e}"))))
+}
+
 fn kernel() -> String {
     nix::sys::utsname::uname().map(|u| u.release().to_string_lossy().into_owned()).unwrap_or_default()
 }
@@ -159,7 +167,7 @@ async fn list(State(d): D, Query(q): Query<ListQuery>) -> Json<Vec<rustlet_spec:
 }
 
 async fn create(State(d): D, Json(config): Json<ContainerConfig>) -> ApiResult<Response> {
-    let r = d.create(config).await?;
+    let r = to_the_end(async move { d.create(config).await }).await?;
     Ok((StatusCode::CREATED, Json(r)).into_response())
 }
 
@@ -170,43 +178,43 @@ async fn inspect(State(d): D, Path(id): Path<String>) -> ApiResult<Json<rustlet_
 
 async fn remove(State(d): D, Path(id): Path<String>, Query(q): Query<RemoveQuery>) -> ApiResult<Response> {
     let c = d.find(&id)?;
-    d.remove(&c, q.force).await?;
+    to_the_end(async move { d.remove(&c, q.force).await }).await?;
     Ok(no_content())
 }
 
 async fn start(State(d): D, Path(id): Path<String>) -> ApiResult<Response> {
     let c = d.find(&id)?;
-    d.start(&c).await?;
+    to_the_end(async move { d.start(&c).await }).await?;
     Ok(no_content())
 }
 
 async fn stop(State(d): D, Path(id): Path<String>, Query(q): Query<StopQuery>) -> ApiResult<Response> {
     let c = d.find(&id)?;
-    d.stop(&c, q.timeout).await?;
+    to_the_end(async move { d.stop(&c, q.timeout).await }).await?;
     Ok(no_content())
 }
 
 async fn kill(State(d): D, Path(id): Path<String>, Query(q): Query<KillQuery>) -> ApiResult<Response> {
     let c = d.find(&id)?;
-    d.kill(&c, q.signal.as_deref()).await?;
+    to_the_end(async move { d.kill(&c, q.signal.as_deref()).await }).await?;
     Ok(no_content())
 }
 
 async fn restart(State(d): D, Path(id): Path<String>, Query(q): Query<StopQuery>) -> ApiResult<Response> {
     let c = d.find(&id)?;
-    d.restart(&c, q.timeout).await?;
+    to_the_end(async move { d.restart(&c, q.timeout).await }).await?;
     Ok(no_content())
 }
 
 async fn pause(State(d): D, Path(id): Path<String>) -> ApiResult<Response> {
     let c = d.find(&id)?;
-    d.pause(&c, true).await?;
+    to_the_end(async move { d.pause(&c, true).await }).await?;
     Ok(no_content())
 }
 
 async fn unpause(State(d): D, Path(id): Path<String>) -> ApiResult<Response> {
     let c = d.find(&id)?;
-    d.pause(&c, false).await?;
+    to_the_end(async move { d.pause(&c, false).await }).await?;
     Ok(no_content())
 }
 
@@ -318,7 +326,7 @@ async fn exec_start_attached(State(d): D, Path(id): Path<String>, ws: WebSocketU
 
 async fn exec_start_detached(State(d): D, Path(id): Path<String>) -> ApiResult<Json<rustlet_spec::exec::ExecStarted>> {
     let s = d.find_exec(&id)?;
-    Ok(Json(d.start_exec_detached(s).await?))
+    Ok(Json(to_the_end(async move { d.start_exec_detached(s).await }).await?))
 }
 
 // ── images ─────────────────────────────────────────────────────────────────
@@ -354,7 +362,8 @@ async fn image_remove(
     State(d): D,
     Query(q): Query<ImageDeleteQuery>,
 ) -> ApiResult<Json<rustlet_spec::image::ImageDeleteResponse>> {
-    let r = d.images.remove(&q.name, q.force, &d.image_users()).await?;
+    let images = d.clone();
+    let r = to_the_end(async move { images.images.remove(&q.name, q.force, &images.image_users()).await }).await?;
     for name in &r.untagged {
         d.events.emit(EventKind::Image, "untag", name, Default::default());
     }

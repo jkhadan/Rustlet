@@ -1940,6 +1940,7 @@ dependencies = [
  "flate2",
  "futures",
  "nix",
+ "rusqlite",
  "rustlet-client",
  "rustlet-image",
  "rustlet-runtime",
