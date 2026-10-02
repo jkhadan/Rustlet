@@ -8,9 +8,11 @@
 #   2. kill shims
 #   3. cgroup.kill every container cgroup, wait for `populated 0`, rmdir deepest-first
 #   4. unmount everything under /var/lib/rustlet and /run/rustlet, deepest-first
-#   5. delete netns pins, the rustlet0 bridge and rlv* veths
+#   5. delete netns pins, the rustlet0 and rlb* bridges and rlv* veths
 #   6. nft delete table inet rustlet
-#   7. restore ip_forward and the other host sysctls the daemon changed
+#   7. remove the route rules the daemon added to ufw for those bridges
+#   8. restore ip_forward, IPv6 forwarding and the other host sysctls the
+#      daemon changed (what <run>/host-sysctl.orig recorded)
 #
 # Usage: sudo scripts/cleanup.sh [--purge] [--dry-run]
 #   --purge    also delete /var/lib/rustlet (images, volumes, state) and the
@@ -105,7 +107,22 @@ done
 say "6. removing nftables table inet rustlet"
 if nft list table inet rustlet >/dev/null 2>&1; then run nft delete table inet rustlet; fi
 
-say "7. restoring host sysctls"
+say "7. removing ufw's route rules for Rustlets' bridges"
+# The daemon keeps `ufw route allow in/out on <bridge>` for every network
+# while ufw is installed, active or not (crates/rustlet-net/src/ufw.rs).
+UFW=$(command -v ufw || { [ -x /usr/sbin/ufw ] && echo /usr/sbin/ufw; })
+if [ -n "$UFW" ]; then
+  "$UFW" show added 2>/dev/null |
+    sed -n -E 's/^ufw route (allow (in|out) on (rustlet[0-9]*|rlb[0-9a-f]+))$/\1/p' |
+    while read -r rule; do
+      # shellcheck disable=SC2086 # the rule's words are ufw's arguments
+      run "$UFW" route delete $rule >/dev/null && echo "   ufw route $rule: removed"
+    done
+else
+  echo "   ufw is not installed"
+fi
+
+say "8. restoring host sysctls"
 if [ -n "$SAVED_SYSCTLS" ]; then
   while IFS='=' read -r k v; do
     [ -n "$k" ] || continue
@@ -143,6 +160,9 @@ left=0
 if grep -qE " ($DATA|$RUN)/" /proc/self/mountinfo; then echo "   mounts:";  grep -E " ($DATA|$RUN)/" /proc/self/mountinfo | awk '{print "     " $5}'; left=1; fi
 if ip -o link show 2>/dev/null | grep -qE ': (rustlet|rlv|rlb)'; then echo "   links remain"; left=1; fi
 if nft list table inet rustlet >/dev/null 2>&1; then echo "   nft table remains"; left=1; fi
+if [ -n "$UFW" ] && "$UFW" show added 2>/dev/null | grep -qE '^ufw route allow (in|out) on (rustlet[0-9]*|rlb[0-9a-f]+)$'; then
+  echo "   ufw route rules remain"; left=1
+fi
 if [ -d "$CG/system.slice/rustletd.service/containers" ] && [ -n "$(ls -A "$CG/system.slice/rustletd.service/containers" 2>/dev/null)" ]; then
   echo "   container cgroups remain"; left=1
 fi
