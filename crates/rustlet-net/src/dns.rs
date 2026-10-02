@@ -46,10 +46,14 @@
 //!   none answers, `SERVFAIL`. At most [`MAX_FORWARDS`] forwards per server
 //!   (UDP and TCP together) are in flight; beyond that a query gets
 //!   `SERVFAIL` at once.
-//! - **Not a query** (a response, an opcode other than `QUERY`, not exactly
-//!   one question, or a body that doesn't parse): `FORMERR` (`NOTIMP` for
-//!   another opcode), a bare header. Less than a header (12 bytes) is
-//!   dropped: it has no ID to answer.
+//! - **Not a query** (an opcode other than `QUERY`, not exactly one
+//!   question, or a body that doesn't parse): `FORMERR` (`NOTIMP` for
+//!   another opcode), a bare header. A **response** is dropped without a
+//!   word, as Unbound and miekg/dns (Docker's library) do: answering one
+//!   with `FORMERR`, itself a response, could start a reply loop with any
+//!   other UDP service that answers what it receives (the "Loop DoS" class,
+//!   CVE-2024-2169). Less than a header (12 bytes) is dropped too: it has
+//!   no ID to answer.
 //!
 //! A question of another class than `IN` goes the way of everything else,
 //! whatever its name. The server's own answers to queries carry the question
@@ -59,9 +63,8 @@
 //! UDP: a local answer longer than the client takes (512 bytes, or what its
 //! `EDNS` record offers) is cut to the records that fit, with `TC` set, so
 //! the client asks again over TCP. A datagram from the socket's own address
-//! is ignored: only a forged one comes from there (`CAP_NET_RAW` in the
-//! container), and as `FORMERR` is a response too, answering it would have
-//! the server answer its own answers for ever.
+//! is ignored as well: only a forged one comes from there (`CAP_NET_RAW` in
+//! the container), and the server has no business talking to itself.
 //!
 //! TCP: messages framed by a two-byte length, several per connection,
 //! answered in turn; [`TCP_IDLE`] without a message (or without the client
@@ -527,7 +530,7 @@ pub fn answer_locally(query: &[u8], view: &View) -> Option<Vec<u8>> {
     // The header is all that is certain here, and all that is answered.
     let reject = |code| Some(encode(&response(&header.metadata, None, code, view)));
     if header.message_type == MessageType::Response {
-        return reject(ResponseCode::FormErr);
+        return Some(Vec::new());
     }
     // Before the count: the sections of other opcodes mean other things.
     if header.op_code != OpCode::Query {
@@ -922,7 +925,9 @@ mod tests {
         let none = edit(&asked, |m| m.queries.clear());
         // A header that promises a question the message doesn't have.
         let cut = asked[..HEADER_LEN + 3].to_vec();
-        for (what, bytes) in [("response", response), ("two", two), ("none", none), ("cut", cut)] {
+        // A response gets nothing back: answering it could start a loop.
+        assert_eq!(answer_locally(&response, &view), Some(Vec::new()));
+        for (what, bytes) in [("two", two), ("none", none), ("cut", cut)] {
             let answer = local(&bytes, &view);
             assert_eq!((answer.id, answer.response_code), (1, ResponseCode::FormErr), "{what}");
             assert_eq!(answer.message_type, MessageType::Response, "{what}");
@@ -969,14 +974,18 @@ mod tests {
         crowd(&view.zone);
         let plain = query(1, "many", RecordType::A);
         let whole = answer_locally(&plain, &view).unwrap();
-        assert_eq!(Message::from_vec(&whole).unwrap().answers.len(), CROWD.into(), "all of them, as TCP gets them");
+        assert_eq!(
+            Message::from_vec(&whole).unwrap().answers.len(),
+            usize::from(CROWD),
+            "all of them, as TCP gets them"
+        );
 
         let cut = fit_udp(&plain, whole.clone());
         assert!(cut.len() <= 512, "{} bytes", cut.len());
         let cut = Message::from_vec(&cut).unwrap();
         assert!(cut.truncation);
         assert_eq!((cut.id, cut.response_code, cut.queries.len()), (1, ResponseCode::NoError, 1));
-        assert!((20..CROWD.into()).contains(&cut.answers.len()), "{} records", cut.answers.len());
+        assert!((20..usize::from(CROWD)).contains(&cut.answers.len()), "{} records", cut.answers.len());
 
         // A client that takes more (EDNS) gets them all.
         let mut edns = Edns::new();
@@ -1065,11 +1074,11 @@ mod tests {
         let over_udp = ask_udp(udp, &asked, PATIENCE).await.expect("an answer");
         assert!(over_udp.len() <= 512, "{} bytes", over_udp.len());
         let over_udp = Message::from_vec(&over_udp).unwrap();
-        assert!(over_udp.truncation && over_udp.answers.len() < CROWD.into());
+        assert!(over_udp.truncation && over_udp.answers.len() < usize::from(CROWD));
         let mut stream = TcpStream::connect(tcp).await.unwrap();
         let over_tcp = ask_tcp(&mut stream, &asked).await;
         assert!(!over_tcp.truncation);
-        assert_eq!(over_tcp.answers.len(), CROWD.into());
+        assert_eq!(over_tcp.answers.len(), usize::from(CROWD));
     }
 
     #[tokio::test]
