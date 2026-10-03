@@ -139,6 +139,24 @@ impl TestDaemon {
         import(store.content(), name, &[alpine_layer()], cfg).unwrap();
     }
 
+    /// [`TestDaemon::import_alpine`], with the image config's JSON changed
+    /// by `f` (`config.Healthcheck`, `config.Shell`: what oci-spec's types
+    /// don't have).
+    pub fn import_alpine_json(&self, name: &str, f: impl FnOnce(&mut serde_json::Value)) {
+        let store = Store::open(&self.data).unwrap();
+        let content = store.content();
+        let env = ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"];
+        let image = import(content, name, &[alpine_layer()], config(&["/bin/sh"], &env, None).unwrap()).unwrap();
+        let bytes = content.read_blob(&image.config_digest, rustlet_image::config::MAX_CONFIG_BYTES).unwrap();
+        let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        f(&mut json);
+        let target =
+            rustlet_image::import::write_image(content, &serde_json::to_vec(&json).unwrap(), image.manifest.layers())
+                .unwrap();
+        let name = rustlet_image::ImageRef::parse(name).unwrap().name();
+        content.set_ref(&rustlet_image::content::RefEntry { name, target, repo_digest: None }).unwrap();
+    }
+
     /// The mounts the daemon made below its data root.
     pub fn mounts(&self) -> Vec<String> {
         let data = self.data.canonicalize().unwrap_or_else(|_| self.data.clone());

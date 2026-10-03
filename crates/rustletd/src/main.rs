@@ -21,6 +21,7 @@
 //! | `daemon` | shared state, startup |
 //! | `db` | state.db (SQLite) |
 //! | `container`, `lifecycle` | the container state machine, the shim, restart policies |
+//! | `health` | healthchecks: a command run in the container now and then |
 //! | `attach`, `exec` | WebSocket sessions bridged to shim streams |
 //! | `logs`, `stats`, `events` | the streams |
 //! | `images`, `worker` | pulls and unpacks in memory-limited children, rmi + GC |
@@ -39,6 +40,7 @@ mod db;
 mod error;
 mod events;
 mod exec;
+mod health;
 mod images;
 mod isolation;
 mod lifecycle;

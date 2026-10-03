@@ -42,7 +42,7 @@ const KILL_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_STOP_TIMEOUT: u32 = 10;
 
 impl Daemon {
-    fn emit(&self, c: &Container, action: &str, extra: &[(&str, String)]) {
+    pub(crate) fn emit(&self, c: &Container, action: &str, extra: &[(&str, String)]) {
         let mut attrs =
             BTreeMap::from([("name".to_owned(), c.record.name.clone()), ("image".to_owned(), c.record.image.clone())]);
         for (k, v) in extra {
@@ -426,6 +426,7 @@ impl Daemon {
         }
         c.update(&self.db, |s| record_start(s, init_pid, cgroup))?;
         self.emit(c, "start", &[]);
+        self.start_health(c, Some(image), true);
         self.spawn_monitor(c.clone(), socket);
         Ok(())
     }
@@ -488,6 +489,7 @@ impl Daemon {
     /// Cleans up after a run, publishes the exit, then applies the restart
     /// policy. Doesn't take the op lock (see `container`).
     async fn handle_exit(self: &Arc<Self>, c: &Arc<Container>, exit: ExitStatus, error: Option<String>) {
+        crate::health::stop_health(c);
         let id = c.id().to_owned();
         let socket = self.paths.shim(&id).socket();
         let deleted = matches!(shim::call(&socket, &Request::Delete { force: true }).await, Ok(Response::Ok));
@@ -871,6 +873,10 @@ impl Daemon {
             s.state.pid = Some(st.init_pid);
         });
         tracing::info!(id = %c.id(), missed, "took over the running container");
+        // Its checks go on from where the last daemon's left them (or start
+        // over, for a start that daemon never recorded).
+        let image = self.images.resolve(&c.record.image_id).ok();
+        self.start_health(c, image.as_ref(), missed);
         self.spawn_monitor(c.clone(), socket);
     }
 }

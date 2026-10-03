@@ -28,8 +28,11 @@ pub struct ImageConfig {
     pub oci: ImageConfiguration,
     /// `rootfs.diff_ids`, parsed.
     pub diff_ids: Vec<Digest>,
-    /// Docker's `config.Healthcheck` (used from Phase 4).
+    /// Docker's `config.Healthcheck`.
     pub healthcheck: Option<Healthcheck>,
+    /// Docker's `config.Shell` (`SHELL`): what shell-form commands of the
+    /// image run with; `None`: `["/bin/sh", "-c"]`.
+    pub shell: Option<Vec<String>>,
 }
 
 /// Docker's `HEALTHCHECK`. Durations are nanoseconds, as Go writes them.
@@ -83,9 +86,15 @@ impl ImageConfig {
         struct DockerConfig {
             #[serde(rename = "Healthcheck")]
             healthcheck: Option<Healthcheck>,
+            #[serde(rename = "Shell")]
+            shell: Option<Vec<String>>,
         }
         let docker: Docker = serde_json::from_slice(bytes).map_err(|e| Error::invalid(format!("image config: {e}")))?;
-        Ok(ImageConfig { oci, diff_ids, healthcheck: docker.config.and_then(|c| c.healthcheck) })
+        let (healthcheck, shell) = match docker.config {
+            Some(c) => (c.healthcheck, c.shell.filter(|s| !s.is_empty())),
+            None => (None, None),
+        };
+        Ok(ImageConfig { oci, diff_ids, healthcheck, shell })
     }
 
     /// The `config` section (`Env`, `Cmd`, `User`, …), if the image has one.
@@ -133,6 +142,7 @@ mod tests {
         let h = c.healthcheck.as_ref().unwrap();
         assert_eq!(h.test, ["CMD-SHELL", "curl -f http://localhost/"]);
         assert_eq!((h.interval, h.retries, h.timeout), (Some(30_000_000_000), Some(3), None));
+        assert_eq!(c.shell, None);
         assert_eq!(c.platform(), "linux/amd64");
         c.check_runnable().unwrap();
     }

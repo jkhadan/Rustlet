@@ -62,6 +62,8 @@ pub struct Container {
     /// The restart policy's timer, while the container is `restarting`.
     pub restart_timer: Mutex<Option<tokio::task::AbortHandle>>,
     pub backoff: Mutex<Backoff>,
+    /// The healthcheck monitor of the current run (`health`).
+    pub health_task: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 impl Container {
@@ -75,6 +77,7 @@ impl Container {
             pending_attach: Mutex::new(Vec::new()),
             restart_timer: Mutex::new(None),
             backoff: Mutex::new(Backoff::default()),
+            health_task: Mutex::new(None),
         }
     }
 

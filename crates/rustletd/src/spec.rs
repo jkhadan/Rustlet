@@ -95,7 +95,42 @@ pub fn check(c: &ContainerConfig) -> ApiResult<Checked> {
         }
     }
     let devices = c.devices.iter().map(|d| parse_device(d)).collect::<ApiResult<_>>()?;
+    if let Some(h) = &c.healthcheck {
+        check_healthcheck(h)?;
+    }
     Ok(Checked { caps, seccomp, no_new_privileges, devices })
+}
+
+/// Docker's rules for a healthcheck's options: a test of `NONE`, `CMD`
+/// with a program, or `CMD-SHELL` with one command (or none, for the
+/// image's); durations of at least a millisecond, if given.
+fn check_healthcheck(h: &rustlet_spec::container::HealthConfig) -> ApiResult<()> {
+    match h.test.split_first() {
+        None => {}
+        Some((kind, [])) if kind == "NONE" => {}
+        Some((kind, rest)) if kind == "CMD" && !rest.is_empty() && !rest[0].is_empty() => {}
+        Some((kind, [command])) if kind == "CMD-SHELL" && !command.trim().is_empty() => {}
+        Some(_) => {
+            return Err(ApiError::invalid(format!(
+                "healthcheck test {:?}: give [\"CMD\", program, args…], [\"CMD-SHELL\", command] or [\"NONE\"]",
+                h.test
+            )));
+        }
+    }
+    for (what, value) in [
+        ("interval", h.interval),
+        ("timeout", h.timeout),
+        ("start period", h.start_period),
+        ("start interval", h.start_interval),
+    ] {
+        if let Some(ns) = value
+            && ns != 0
+            && ns < 1_000_000
+        {
+            return Err(ApiError::invalid(format!("the healthcheck's {what} must be at least 1ms")));
+        }
+    }
+    Ok(())
 }
 
 /// Docker's rules: `--cap-drop ALL` starts from nothing and adds the
@@ -432,6 +467,25 @@ mod tests {
                 ("/dev/kvm".into(), "/dev/kvm".into(), "r".into()),
                 ("/dev/sda".into(), "/dev/xvda".into(), "rw".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn healthcheck_options_are_checked_as_docker_does() {
+        use rustlet_spec::container::HealthConfig;
+        let with = |h: HealthConfig| ContainerConfig { image: "a".into(), healthcheck: Some(h), ..Default::default() };
+        let test = |t: &[&str]| HealthConfig { test: t.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+        for ok in [&[][..], &["NONE"], &["CMD", "true"], &["CMD", "pg_isready", "-q"], &["CMD-SHELL", "curl -f x"]] {
+            assert!(check(&with(test(ok))).is_ok(), "{ok:?}");
+        }
+        for bad in
+            [&["CMD"][..], &["CMD-SHELL"], &["CMD-SHELL", "a", "b"], &["NONE", "x"], &["SHELL", "x"], &["CMD", ""]]
+        {
+            assert!(check(&with(test(bad))).is_err(), "{bad:?}");
+        }
+        assert!(check(&with(HealthConfig { interval: Some(999_999), ..Default::default() })).is_err());
+        assert!(
+            check(&with(HealthConfig { timeout: Some(0), interval: Some(1_000_000), ..Default::default() })).is_ok()
         );
     }
 
