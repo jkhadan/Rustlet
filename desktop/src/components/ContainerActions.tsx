@@ -54,7 +54,7 @@ export function ContainerActions({ container, compact, navigateOnRemove }: { con
       destructive: true,
     });
     if (!ok) return;
-    if (await run("Removing", () => api.containers.remove(id, { force: live, volumes }))) {
+    if (await run("Remove", () => api.containers.remove(id, { force: live, volumes }))) {
       if (navigateOnRemove) navigate("/containers");
     }
   };
