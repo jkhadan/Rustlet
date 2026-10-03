@@ -53,6 +53,10 @@ describe("format", () => {
   it("commands split and print like a shell's", () => {
     expect(splitCommand(`sh -c "echo 'hi there'; sleep 1"`)).toEqual(["sh", "-c", "echo 'hi there'; sleep 1"]);
     expect(splitCommand(`a\\ b '' c`)).toEqual(["a b", "", "c"]);
+    // In double quotes a backslash stays, but before $ ` " \ and a newline.
+    expect(splitCommand(String.raw`sh -c "printf 'a\nb'"`)).toEqual(["sh", "-c", String.raw`printf 'a\nb'`]);
+    expect(splitCommand('echo "\\$HOME \\` \\" \\\\ \\x"')).toEqual(["echo", '$HOME ` " \\ \\x']);
+    expect(splitCommand('echo "a\\\nb"')).toEqual(["echo", "ab"]);
     expect(() => splitCommand(`echo "x`)).toThrow();
     expect(commandText(["sh", "-c", "echo hi"])).toBe("sh -c 'echo hi'");
     expect(imageName("docker.io/library/alpine:latest")).toBe("alpine:latest");

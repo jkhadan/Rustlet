@@ -18,6 +18,19 @@ describe("ANSI colours in logs", () => {
     expect(color256(232)).toBe("rgb(8, 8, 8)");
   });
 
+  it("reads the colon form of extended colours, the colour space given or not", () => {
+    // ITU T.416, as xterm documents it and VTE and kitty write it.
+    expect(parseAnsi("\x1b[38:2::255:0:0mX")).toEqual([{ text: "X", fg: "rgb(255, 0, 0)" }]);
+    expect(parseAnsi("\x1b[48:2:1:10:20:30mX")[0].bg).toBe("rgb(10, 20, 30)");
+    expect(parseAnsi("\x1b[38:2:10:20:30mX")[0].fg).toBe("rgb(10, 20, 30)");
+    expect(parseAnsi("\x1b[38:5:196mX")[0].fg).toBe(color256(196));
+    // The sub-parameters are the colour's alone: a blue of 0 is no reset.
+    expect(parseAnsi("\x1b[1;38:2::0:128:0;4mX")).toEqual([{ text: "X", bold: true, underline: true, fg: "rgb(0, 128, 0)" }]);
+    // An underline's colour isn't drawn, and its values are no codes.
+    expect(parseAnsi("\x1b[58;2;0;0;0;31mX")).toEqual([{ text: "X", fg: "#dc2626" }]);
+    expect(parseAnsi("\x1b[4:3mX\x1b[4:0mY")).toEqual([{ text: "X", underline: true }, { text: "Y" }]);
+  });
+
   it("carries a style to the next line and drops other escapes", () => {
     const state = { style: {} };
     parseAnsi("\x1b[32mgreen starts", state);

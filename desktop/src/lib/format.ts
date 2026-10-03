@@ -119,9 +119,13 @@ export function splitCommand(line: string): string[] {
   for (let i = 0; i < line.length; i++) {
     const c = line[i];
     if (quote) {
+      // In double quotes a backslash quotes only what is special there
+      // (POSIX: $, `, ", \ and a newline, which goes with it): before
+      // anything else it stays, `"printf 'a\nb'"` is for printf to read.
       if (c === quote) quote = null;
-      else if (c === "\\" && quote === '"' && i + 1 < line.length) cur += line[++i];
-      else cur += c;
+      else if (c === "\\" && quote === '"' && i + 1 < line.length && '$`"\\\n'.includes(line[i + 1])) {
+        if (line[++i] !== "\n") cur += line[i];
+      } else cur += c;
     } else if (c === "'" || c === '"') {
       quote = c;
       has = true;

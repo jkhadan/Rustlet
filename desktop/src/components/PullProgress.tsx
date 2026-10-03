@@ -44,9 +44,12 @@ export function PullProgress({ state }: { state: PullState }) {
             {layers.map((b) => {
               const unpack = state.layers.find((l) => l.blob === b.digest);
               const pct = b.total ? Math.min(100, (b.current / b.total) * 100) : 0;
+              // A ready image has every layer unpacked, also one whose
+              // `unpacked` the daemon dropped.
+              const done = state.phase === "ready" || unpack?.state === "unpacked" || b.state === "exists";
               return (
                 <li key={b.digest} className="grid grid-cols-[1.25rem_7rem_1fr_6.5rem] items-center gap-2">
-                  {unpack?.state === "unpacked" || b.state === "exists" ? (
+                  {done ? (
                     <CheckCircle2 className="text-success size-3.5" />
                   ) : unpack?.state === "unpacking" ? (
                     <PackageOpen className="text-info size-3.5" />
@@ -70,7 +73,9 @@ export function PullProgress({ state }: { state: PullState }) {
                       : unpack?.state === "unpacking"
                         ? "unpacking…"
                         : unpack?.state === "unpacked"
-                          ? `${bytes(unpack.bytes ?? 0)} unpacked`
+                          ? unpack.bytes != null
+                            ? `${bytes(unpack.bytes)} unpacked`
+                            : "unpacked"
                           : `${bytes(b.current)} / ${bytes(b.total)}`}
                   </span>
                 </li>

@@ -52,9 +52,12 @@ export function ImagePage() {
   }
   if (image.error) {
     if (image.error instanceof CommandFailed && image.error.kind === "no_such_image") {
+      // The page is the route's name: removing one of an image's names
+      // leaves the image, under its others. Only an id says it is gone.
+      const byId = /^sha256:[0-9a-f]{64}$/.test(name);
       return (
-        <Empty icon={<Layers />} title="This image is gone">
-          Its names were removed.{" "}
+        <Empty icon={<Layers />} title={byId ? "This image is gone" : `No image is named ${imageName(name)} any more`}>
+          {byId ? "It was removed. " : "The name was removed; the image may live on under another. "}
           <Link to="/images" className="text-primary hover:underline">
             Back to the images
           </Link>

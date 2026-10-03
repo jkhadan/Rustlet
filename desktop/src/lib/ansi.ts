@@ -43,16 +43,29 @@ const ESCAPE = /\x1b\[([0-9;:?]*)([@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[
 
 type Style = Omit<Span, "text">;
 
+/** An extended colour from its mode and values (`5, n` or `2, r, g, b`),
+ * and how many of the values it took. */
+function extendedColor(v: number[]): [string | undefined, number] {
+  if (v[0] === 5 && v.length >= 2) return [color256(v[1]), 2];
+  if (v[0] === 2 && v.length >= 4) return [`rgb(${v[1]}, ${v[2]}, ${v[3]})`, 4];
+  return [undefined, 0];
+}
+
 function applySgr(params: string, style: Style): Style {
-  const codes = params === "" ? [0] : params.split(/[;:]/).map((p) => (p === "" ? 0 : Number(p)));
+  // Parameters are separated by `;`, and one may carry sub-parameters
+  // after `:`, which are its own (ITU T.416: `38:5:n`, and
+  // `38:2:<colour space>:r:g:b`, the colour space mostly left empty). An
+  // empty value is 0: `ESC [ m` resets.
+  const ps = params.split(";").map((p) => p.split(":").map((v) => (v === "" ? 0 : Number(v))));
   let s = { ...style };
-  for (let i = 0; i < codes.length; i++) {
-    const c = codes[i];
+  for (let i = 0; i < ps.length; i++) {
+    const [c, ...sub] = ps[i];
     if (c === 0) s = {};
     else if (c === 1) s.bold = true;
     else if (c === 2) s.dim = true;
     else if (c === 3) s.italic = true;
-    else if (c === 4) s.underline = true;
+    // `4:0` is no underline; `4:3` and the like, other kinds of one.
+    else if (c === 4) s.underline = sub[0] === 0 ? undefined : true;
     else if (c === 22) s.bold = s.dim = undefined;
     else if (c === 23) s.italic = undefined;
     else if (c === 24) s.underline = undefined;
@@ -62,15 +75,20 @@ function applySgr(params: string, style: Style): Style {
     else if (c >= 40 && c <= 47) s.bg = BASIC[c - 40];
     else if (c >= 100 && c <= 107) s.bg = BASIC[c - 100 + 8];
     else if (c === 49) s.bg = undefined;
-    else if (c === 38 || c === 48) {
-      const key = c === 38 ? "fg" : "bg";
-      if (codes[i + 1] === 5 && codes[i + 2] !== undefined) {
-        s[key] = color256(codes[i + 2]);
-        i += 2;
-      } else if (codes[i + 1] === 2 && codes[i + 4] !== undefined) {
-        s[key] = `rgb(${codes[i + 2]}, ${codes[i + 3]}, ${codes[i + 4]})`;
-        i += 4;
+    else if (c === 38 || c === 48 || c === 58) {
+      // The colour is in the sub-parameters (where r:g:b may follow the
+      // colour space or stand alone), or else in the parameters after
+      // this one (`38;5;n`, `38;2;r;g;b`). 58, the underline's colour, is
+      // not drawn, but its values are skipped all the same.
+      let color: string | undefined;
+      if (sub.length) {
+        [color] = extendedColor(sub[0] === 2 && sub.length >= 5 ? [2, ...sub.slice(2)] : sub);
+      } else {
+        const [found, used] = extendedColor(ps.slice(i + 1).map((p) => p[0]));
+        color = found;
+        i += used;
       }
+      if (color && c !== 58) s[c === 38 ? "fg" : "bg"] = color;
     }
   }
   return s;

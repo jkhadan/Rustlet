@@ -89,29 +89,50 @@ export function ErrorState({ error, what }: { error: unknown; what?: string }) {
   );
 }
 
-/** Starts the installed service through pkexec. */
+/** Where the installed service listens (`rustlet_spec::DEFAULT_SOCKET`). */
+const SYSTEM_SOCKET = "/run/rustlet/rustlet.sock";
+
+/** Starts the installed service through pkexec. `offered`: whether the app
+ * talks to that service. With `RUSTLET_HOST` naming another socket,
+ * starting it would start a daemon the app doesn't use. */
 export function useStartDaemon() {
+  const { connection } = useDaemon();
   const [starting, setStarting] = useState(false);
+  const offered = connection.state !== "connecting" && connection.socket === SYSTEM_SOCKET;
   const start = useCallback(async () => {
     setStarting(true);
     try {
       await api.daemon.start();
-      toast.success("rustletd started");
+      // systemctl succeeds as well when the service already ran: whether
+      // the app can use it is for its socket to say. (The connection
+      // indicator follows on its own, within seconds.)
+      const failed = await api.daemon.version().then(() => null, (e: unknown) => e);
+      if (failed == null) {
+        toast.success("The rustletd service is running");
+      } else if (failed instanceof CommandFailed && failed.kind === "denied") {
+        toast.error("The rustletd service is running, but its socket isn't yours to use", {
+          description: "It belongs to root and the rustlet group: the page says how to join it.",
+        });
+      } else {
+        toast.warning("The rustletd service is running, but its socket doesn't answer", {
+          description: failed instanceof Error ? failed.message : String(failed),
+        });
+      }
     } catch (e) {
       toast.error("Couldn't start rustletd", { description: e instanceof Error ? e.message : String(e) });
     } finally {
       setStarting(false);
     }
   }, []);
-  return { start, starting };
+  return { start, starting, offered };
 }
 
 /** The whole view, when the daemon can't be used. */
 export function DaemonDown() {
   const { connection } = useDaemon();
-  const { start, starting } = useStartDaemon();
+  const { start, starting, offered } = useStartDaemon();
   const error = connection.state === "disconnected" ? connection.error : null;
-  const socket = connection.state === "disconnected" ? connection.socket : "/run/rustlet/rustlet.sock";
+  const socket = connection.state === "disconnected" ? connection.socket : SYSTEM_SOCKET;
   if (connection.state === "connecting") {
     return (
       <div className="flex items-center justify-center gap-2 py-20">
@@ -133,10 +154,16 @@ export function DaemonDown() {
             <code className="font-mono">rustlet</code> group. Membership is as powerful as root: whoever can create
             containers can mount the host's <code className="font-mono">/</code> into one.
           </>
-        ) : (
+        ) : offered ? (
           <>
             Nothing answers on <code className="font-mono">{socket}</code>. Start the installed service, or set{" "}
             <code className="font-mono">RUSTLET_HOST</code> to another daemon's socket before launching the app.
+          </>
+        ) : (
+          <>
+            Nothing answers on <code className="font-mono">{socket}</code>, the socket{" "}
+            <code className="font-mono">RUSTLET_HOST</code> names: start the daemon that listens there. (The installed
+            service listens on <code className="font-mono">{SYSTEM_SOCKET}</code>.)
           </>
         )}
       </p>
@@ -145,15 +172,17 @@ export function DaemonDown() {
           {"sudo groupadd --system rustlet\nsudo usermod -aG rustlet $USER\nsudo systemctl restart rustletd\n# then log out and in again"}
         </pre>
       )}
-      {denied && (
+      {denied && offered && (
         <p className="text-muted-foreground text-sm">
           A stopped daemon can look the same: its run directory may be root's alone until it starts.
         </p>
       )}
-      <Button variant={denied ? "outline" : "primary"} onClick={start} disabled={starting}>
-        {starting ? <Spinner className={denied ? undefined : "text-primary-foreground"} /> : <Power />}
-        Start rustletd
-      </Button>
+      {offered && (
+        <Button variant={denied ? "outline" : "primary"} onClick={start} disabled={starting}>
+          {starting ? <Spinner className={denied ? undefined : "text-primary-foreground"} /> : <Power />}
+          Start rustletd
+        </Button>
+      )}
       {error && <p className="text-muted-foreground/80 selectable text-xs break-all">{error.message}</p>}
     </div>
   );

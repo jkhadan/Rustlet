@@ -3,7 +3,9 @@
 // (labelled with its address). A container on the host's network hangs off
 // the host, beside the networks; one in another's namespace hangs below
 // that container, in a fourth row. Each container sits under the middle of
-// its networks.
+// its networks. A running container on no network, or in the namespace of
+// one that isn't drawn, follows the rest of its row with no edge: every
+// running container is a node.
 
 import type { ContainerSummary, Network } from "@/bindings";
 
@@ -82,7 +84,8 @@ export function buildTopology(networks: Network[], containers: ContainerSummary[
   });
 
   // Row 2: containers with interfaces, under the middle of their networks;
-  // then those in another's namespace, and those with none.
+  // then the loose ones: on no network, or in the namespace of a container
+  // that isn't drawn.
   const netX = new Map(nets.map((n, i) => [n.id, x1(i)]));
   const attached = new Map<string, { netId: string; ip: string }[]>();
   for (const n of nets) {
@@ -94,13 +97,32 @@ export function buildTopology(networks: Network[], containers: ContainerSummary[
   const row2 = [...attached.entries()]
     .map(([id, eps]) => ({ c: byId.get(id)!, eps, want: eps.reduce((s, e) => s + (netX.get(e.netId) ?? 0), 0) / eps.length }))
     .sort((a, b) => a.want - b.want || a.c.name.localeCompare(b.c.name));
-  const joined = running.filter((c) => c.network_mode.startsWith("container:"));
-  const isolated = running.filter((c) => c.network_mode === "none");
+  // `container:<id>` names the other container by its full id. It may have
+  // stopped, or be gone (removed while this one kept its namespace); then
+  // there is nothing to hang this one under.
+  const listed = new Map(containers.map((c) => [c.id, c]));
+  const ownerOf = (c: ContainerSummary) =>
+    c.network_mode.startsWith("container:") ? listed.get(c.network_mode.slice("container:".length)) : undefined;
+  const joined = running.filter((c) => {
+    const owner = ownerOf(c);
+    return owner !== undefined && isRunning(owner);
+  });
+  const loose = running.filter((c) => c.network_mode !== "host" && !attached.has(c.id) && !joined.includes(c));
+  const looseFlag = (c: ContainerSummary) => {
+    if (c.network_mode === "none") return "no network";
+    // Bridge mode with no endpoint: `network disconnect` took it off every
+    // network (the daemon lets the last one go too).
+    if (!c.network_mode.startsWith("container:")) return "not on any network";
+    const owner = ownerOf(c);
+    return owner
+      ? `in the network namespace of ${owner.name} (${owner.state.status})`
+      : "in the network namespace of a removed container";
+  };
   const placed = spread(
     row2.map((r) => r.want),
     LAYOUT.colGap,
   );
-  // The joined and isolated ones follow the rest at the right.
+  // The loose ones follow the rest at the right.
   let right = row2.length ? placed[row2.length - 1] : -LAYOUT.colGap;
   const next = () => (right += LAYOUT.colGap);
   const y2 = LAYOUT.rowGap * 2;
@@ -110,16 +132,12 @@ export function buildTopology(networks: Network[], containers: ContainerSummary[
       edges.push({ id: `${e.netId}-${r.c.id}`, source: `net:${e.netId}`, target: `ctr:${r.c.id}`, label: e.ip.replace(/\/\d+$/, "") });
     }
   });
-  isolated.forEach((c) => nodes.push(containerNode(c, next(), y2)));
+  loose.forEach((c) => nodes.push(containerNode(c, next(), y2, [looseFlag(c)])));
   // Row 3: under the container whose namespace each one joined.
-  const ownerOf = (c: ContainerSummary) => {
-    const target = c.network_mode.slice("container:".length);
-    return running.find((o) => o.id === target || o.name === target || o.id.startsWith(target));
-  };
   const placedAt = new Map(nodes.map((n) => [n.id, n.x]));
   const row3 = joined
-    .map((c) => ({ c, owner: ownerOf(c) }))
-    .map((j) => ({ ...j, want: (j.owner && placedAt.get(`ctr:${j.owner.id}`)) ?? next() }))
+    .map((c) => ({ c, owner: ownerOf(c)! }))
+    .map((j) => ({ ...j, want: placedAt.get(`ctr:${j.owner.id}`) ?? next() }))
     .sort((a, b) => a.want - b.want);
   const xs3 = spread(
     row3.map((j) => j.want),
@@ -127,15 +145,19 @@ export function buildTopology(networks: Network[], containers: ContainerSummary[
   );
   row3.forEach((j, i) => {
     nodes.push(containerNode(j.c, xs3[i], LAYOUT.rowGap * 3));
-    if (j.owner) {
-      edges.push({ id: `share-${j.c.id}`, source: `ctr:${j.owner.id}`, target: `ctr:${j.c.id}`, label: "same network namespace", dashed: true });
-    }
+    edges.push({ id: `share-${j.c.id}`, source: `ctr:${j.owner.id}`, target: `ctr:${j.c.id}`, label: "same network namespace", dashed: true });
   });
   return { nodes, edges };
 }
 
-function containerNode(c: ContainerSummary, x: number, y: number): TopoNode {
-  const ports = c.ports.filter((p) => p.host_ip !== "::").map((p) => `${p.host_port}→${p.container_port}/${p.protocol}`);
+function containerNode(c: ContainerSummary, x: number, y: number, flags: string[] = []): TopoNode {
+  // One entry per mapping (`-p 8080:80` is one, on 0.0.0.0; `-p [::]:8080:80`
+  // another, on ::); the address only when it is a particular one.
+  const ports = c.ports.map((p) => {
+    const any = p.host_ip === "0.0.0.0" || p.host_ip === "::";
+    const host = any ? "" : p.host_ip.includes(":") ? `[${p.host_ip}]:` : `${p.host_ip}:`;
+    return `${host}${p.host_port}→${p.container_port}/${p.protocol}`;
+  });
   return {
     id: `ctr:${c.id}`,
     kind: "container",
@@ -145,6 +167,6 @@ function containerNode(c: ContainerSummary, x: number, y: number): TopoNode {
     detail: [c.image.replace(/^docker\.io\/(library\/)?/, ""), ...ports],
     ref: c.id,
     status: c.state.status,
-    flags: c.network_mode === "none" ? ["no network"] : [],
+    flags,
   };
 }

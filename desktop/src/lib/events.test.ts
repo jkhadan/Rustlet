@@ -82,11 +82,13 @@ describe("event → stale queries", () => {
     expect(stale(v)).toEqual([keys.volume("data"), keys.volumes()].map((k) => JSON.stringify(k)).sort());
   });
 
-  it("connecting a container changes the container too", () => {
-    const client = clientWith(keys.networks(), keys.container("web"), keys.containers(true), keys.volumes());
-    applyEvents(client, [event("network", "connect", "n1", { name: "backend", container: "abc" })]);
-    expect(stale(client)).toHaveLength(3);
-    expect(stale(client)).not.toContain(JSON.stringify(keys.volumes()));
+  it("connecting or disconnecting a container changes the container too, running or not", () => {
+    for (const action of ["connect", "disconnect"]) {
+      const client = clientWith(keys.networks(), keys.container("web"), keys.containers(true), keys.volumes());
+      applyEvents(client, [event("network", action, "n1", { name: "backend", container: "abc" })]);
+      expect(stale(client)).toHaveLength(3);
+      expect(stale(client)).not.toContain(JSON.stringify(keys.volumes()));
+    }
   });
 
   it("an unknown kind refreshes everything", () => {
@@ -119,5 +121,23 @@ describe("activity feed lines", () => {
     expect(describeEvent(event("network", "disconnect", "n1", { name: "bridge", container: "0123456789abcdef" }), names)).toBe(
       "web disconnected from bridge",
     );
+  });
+
+  it("name an image as the image list does", () => {
+    const digest = `sha256:${"4f".repeat(32)}`;
+    // A pull names the reference as stored, with the digest in `id`.
+    expect(describeEvent(event("image", "pull", "docker.io/library/alpine:latest", { id: digest }))).toBe(
+      "image alpine:latest pulled",
+    );
+    expect(describeEvent(event("image", "untag", "ghcr.io/o/n:1", { id: digest }))).toBe("image ghcr.io/o/n:1 untagged");
+    // One `delete` per image, named as `rmi` was given it: a name or an id.
+    expect(describeEvent(event("image", "delete", "alpine", { id: digest }))).toBe("image alpine deleted");
+    expect(describeEvent(event("image", "delete", digest, { id: digest }))).toBe("image 4f4f4f4f4f4f deleted");
+  });
+
+  it("say a restart that couldn't start, not an exit", () => {
+    // The restart policy's start failed: no run began, so no exit code.
+    const e = event("container", "die", "abc", { name: "web", image: "nginx", error: "the container's image: no such image" });
+    expect(describeEvent(e)).toBe("web couldn't restart: the container's image: no such image");
   });
 });

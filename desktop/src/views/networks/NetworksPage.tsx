@@ -15,7 +15,7 @@ import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { Tooltip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/cn";
 import { useNow } from "@/lib/daemon";
-import { ago } from "@/lib/format";
+import { ago, isLive } from "@/lib/format";
 import { api } from "@/lib/ipc";
 import { useContainers, useNetworks } from "@/lib/queries";
 
@@ -79,7 +79,7 @@ export function NetworksPage() {
               />
               <TopologyGraph networks={networks.data} containers={containers.data ?? []} selected={selected} onSelect={setSelected} />
             </Card>
-            {current && <NetworkDetail network={current} onRemove={() => void remove(current)} />}
+            {current && <NetworkDetail key={current.id} network={current} onRemove={() => void remove(current)} />}
             {networks.data.length === 0 ? (
               <Empty icon={<NetworkIcon />} title="No networks" />
             ) : (
@@ -151,16 +151,23 @@ export function NetworksPage() {
   );
 }
 
+/** A network, its containers and a form to connect another. Keyed by the
+ * network: what was typed for one isn't sent to the next. */
 function NetworkDetail({ network: n, onRemove }: { network: Network; onRemove: () => void }) {
   const containers = useContainers(true);
   const [target, setTarget] = useState("");
   const [alias, setAlias] = useState("");
   const [busy, setBusy] = useState(false);
   // `network connect` takes a container whose first network is a bridge
-  // network (the default or a user-defined one), running or not.
+  // network (the default or a user-defined one), running or not; not one
+  // on this network already. A running one is if it has an endpoint here;
+  // a stopped one has none, but is if it was created for this network.
+  // (One connected to it while stopped looks like any other here: the
+  // daemon refuses it, and says so.)
   const candidates = (containers.data ?? []).filter(
     (c) =>
       !n.containers.some((e) => e.container_id === c.id) &&
+      (isLive(c) || (c.network_mode !== n.name && c.network_mode !== n.id)) &&
       c.network_mode !== "host" &&
       c.network_mode !== "none" &&
       !c.network_mode.startsWith("container:"),
@@ -169,11 +176,15 @@ function NetworkDetail({ network: n, onRemove }: { network: Network; onRemove: (
   const connect = async () => {
     if (!target) return;
     setBusy(true);
-    const aliases = alias.split(/[\s,]+/).filter(Boolean);
-    await attempt(`Connecting to ${n.name} failed`, () => api.networks.connect(n.id, { container: target, aliases }));
+    // The default network has no DNS, and so no alias field: the daemon
+    // refuses aliases there.
+    const aliases = n.dns ? alias.split(/[\s,]+/).filter(Boolean) : [];
+    const ok = await attempt(`Connecting to ${n.name} failed`, () => api.networks.connect(n.id, { container: target, aliases }));
     setBusy(false);
-    setTarget("");
-    setAlias("");
+    if (ok) {
+      setTarget("");
+      setAlias("");
+    }
   };
 
   return (

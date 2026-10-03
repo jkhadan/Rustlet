@@ -77,4 +77,59 @@ describe("topology", () => {
     const row2 = nodes.filter((n) => n.y === LAYOUT.rowGap * 2).map((n) => n.x).sort((p, q) => p - q);
     for (let i = 1; i < row2.length; i++) expect(row2[i] - row2[i - 1]).toBeGreaterThanOrEqual(LAYOUT.colGap);
   });
+
+  it("draws a running container that is on no network, though its mode names one", () => {
+    // `network disconnect bridge web` lets the last network go too: web runs
+    // on, with only `lo`, and its mode still says `bridge`.
+    const { nodes, edges } = buildTopology([net("n1", "bridge", [])], [ctr("web")]);
+    expect(nodes.find((n) => n.id === "ctr:web")).toMatchObject({ y: LAYOUT.rowGap * 2, flags: ["not on any network"] });
+    expect(edges.some((e) => e.target === "ctr:web")).toBe(false);
+  });
+
+  it("finds the container whose namespace one shares by its full id, and only that one", () => {
+    // `run --name web`, `run --network container:web --name side`, `rm -f web`,
+    // `run --name web` again: side is in the first web's namespace.
+    const old = "0".repeat(64);
+    const web = { ...ctr("1".repeat(64)), name: "web" };
+    const bridge = net("n1", "bridge", [[web.id, "10.89.0.3/24"]]);
+    const gone = buildTopology([bridge], [web, ctr("side", `container:${old}`)]);
+    expect(gone.edges.some((e) => e.target === "ctr:side")).toBe(false);
+    expect(gone.nodes.find((n) => n.id === "ctr:side")).toMatchObject({
+      y: LAYOUT.rowGap * 2,
+      flags: ["in the network namespace of a removed container"],
+    });
+    // Still listed but stopped: named, not drawn under anything.
+    const stopped = buildTopology([bridge], [web, { ...ctr(old, "bridge", "exited"), name: "old" }, ctr("side", `container:${old}`)]);
+    expect(stopped.edges.some((e) => e.target === "ctr:side")).toBe(false);
+    expect(stopped.nodes.find((n) => n.id === "ctr:side")?.flags).toEqual(["in the network namespace of old (exited)"]);
+    // Neither a name nor a prefix of an id is an id.
+    for (const mode of ["container:web", `container:${web.id.slice(0, 12)}`]) {
+      expect(buildTopology([bridge], [web, ctr("side", mode)]).edges.some((e) => e.target === "ctr:side")).toBe(false);
+    }
+    expect(buildTopology([bridge], [web, ctr("side", `container:${web.id}`)]).edges).toContainEqual(
+      expect.objectContaining({ source: `ctr:${web.id}`, target: "ctr:side" }),
+    );
+  });
+
+  it("shows every published port, with its address when it is a particular one", () => {
+    // One entry per mapping: `-p 8080:80` is on 0.0.0.0 alone (its [::]
+    // socket has none), `-p [::]:8443:443` on :: alone.
+    const web = {
+      ...ctr("a"),
+      ports: [
+        { host_ip: "0.0.0.0", host_port: 8080, container_port: 80, protocol: "tcp" as const },
+        { host_ip: "::", host_port: 8443, container_port: 443, protocol: "tcp" as const },
+        { host_ip: "127.0.0.1", host_port: 5353, container_port: 53, protocol: "udp" as const },
+        { host_ip: "::1", host_port: 9000, container_port: 9000, protocol: "tcp" as const },
+      ],
+    };
+    const { nodes } = buildTopology([net("n1", "bridge", [["a", "10.89.0.2/24"]])], [web]);
+    expect(nodes.find((n) => n.id === "ctr:a")!.detail).toEqual([
+      "alpine:latest",
+      "8080→80/tcp",
+      "8443→443/tcp",
+      "127.0.0.1:5353→53/udp",
+      "[::1]:9000→9000/tcp",
+    ]);
+  });
 });

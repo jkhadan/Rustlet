@@ -1,12 +1,14 @@
 // A pull's progress, folded from its events (`PullEvent`, in the order the
 // daemon sends them: resolving, resolved, per blob exists | downloading… →
 // downloaded, done, per layer layer_exists | unpacking → unpacked, ready;
-// or error at any point).
+// or error at any point). The daemon drops progress a client doesn't keep
+// up with, but never `ready` or `error`: those settle every row.
 
 import type { BlobKind, PullEvent } from "@/bindings";
 
-export type BlobState = "waiting" | "downloading" | "downloaded" | "exists";
-export type LayerState = "waiting" | "unpacking" | "unpacked" | "exists";
+/** `stopped`: cut short by the pull's failure. */
+export type BlobState = "waiting" | "downloading" | "downloaded" | "exists" | "stopped";
+export type LayerState = "waiting" | "unpacking" | "unpacked" | "exists" | "stopped";
 
 export interface BlobProgress {
   digest: string;
@@ -110,10 +112,31 @@ export function pullReducer(s: PullState, e: PullEvent): PullState {
         layers: upsertLayer(s.layers, e.chain_id, (l) => ({ ...l, state: "unpacked", entries: e.entries, bytes: e.bytes })),
       };
     case "ready":
-      return { ...s, phase: "ready", manifest: e.manifest };
+      // Everything is stored and unpacked, whatever said so went missing.
+      return {
+        ...s,
+        phase: "ready",
+        manifest: e.manifest,
+        blobs: s.blobs.map((b) => (b.state === "exists" ? b : { ...b, current: b.total, state: "downloaded" })),
+        layers: s.layers.map((l) => (l.state === "exists" ? l : { ...l, state: "unpacked" })),
+      };
     case "error":
-      return { ...s, phase: "error", error: e.message };
+      // Nothing goes on: what was under way stopped where it was.
+      return {
+        ...s,
+        phase: "error",
+        error: e.message,
+        blobs: s.blobs.map((b) => (b.state === "downloading" || b.state === "waiting" ? { ...b, state: "stopped" } : b)),
+        layers: s.layers.map((l) => (l.state === "unpacking" || l.state === "waiting" ? { ...l, state: "stopped" } : l)),
+      };
   }
+}
+
+/** The pull's stream failed: a `{type: "error"}` message, which is what
+ * the daemon's own `error` event arrives as (rustlet-client turns it into
+ * a stream error), as does a broken connection. */
+export function failPull(s: PullState, message: string): PullState {
+  return pullReducer(s, { status: "error", message });
 }
 
 /** Download progress of the layers, 0 to 1 (the config is tiny). */

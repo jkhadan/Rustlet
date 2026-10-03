@@ -21,15 +21,19 @@ export type Connection =
 
 export interface Daemon {
   connection: Connection;
+  /** How many times the app has connected: a view whose stream ended with
+   * the connection (a daemon restart) opens it again when this changes. */
+  generation: number;
   /** The latest events, newest first. */
   events: Event[];
 }
 
-const DaemonContext = createContext<Daemon>({ connection: { state: "connecting" }, events: [] });
+const DaemonContext = createContext<Daemon>({ connection: { state: "connecting" }, generation: 0, events: [] });
 
 export function DaemonProvider({ children }: { children: ReactNode }) {
   const client = useQueryClient();
   const [connection, setConnection] = useState<Connection>({ state: "connecting" });
+  const [generation, setGeneration] = useState(0);
   const [events, setEvents] = useState<Event[]>([]);
 
   useEffect(() => {
@@ -40,6 +44,7 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
       switch (m.type) {
         case "connected":
           setConnection({ state: "connected", socket: m.socket, version: m.version });
+          setGeneration((g) => g + 1);
           // Anything may have changed while nobody listened.
           void client.invalidateQueries();
           break;
@@ -71,7 +76,7 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
     };
   }, [client]);
 
-  const value = useMemo(() => ({ connection, events }), [connection, events]);
+  const value = useMemo(() => ({ connection, generation, events }), [connection, generation, events]);
   return <DaemonContext.Provider value={value}>{children}</DaemonContext.Provider>;
 }
 

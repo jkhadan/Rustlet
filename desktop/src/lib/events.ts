@@ -14,6 +14,8 @@ import type { QueryClient, QueryKey } from "@tanstack/react-query";
 
 import type { Event } from "@/bindings";
 
+import { imageName, shortId } from "./format";
+
 /** The query keys of the app, in one place. */
 export const keys = {
   containers: (all: boolean) => ["containers", { all }] as const,
@@ -107,6 +109,9 @@ export function describeEvent(e: Event, nameOf: (id: string) => string | undefin
     case "container":
       switch (e.action) {
         case "die":
+          // A restart the policy couldn't start ends with an error, and no
+          // exit code: no run began.
+          if (e.attributes.error != null) return `${name} couldn't restart: ${e.attributes.error}`;
           return `${name} exited (${e.attributes.exit_code ?? "?"})${e.attributes.oom_killed === "true" ? ", OOM-killed" : ""}`;
         case "oom":
           return `${name}: out of memory`;
@@ -126,8 +131,12 @@ export function describeEvent(e: Event, nameOf: (id: string) => string | undefin
         default:
           return `${name} ${pastTense(e.action)}`;
       }
-    case "image":
-      return `image ${e.id} ${e.action === "pull" ? "pulled" : e.action === "untag" ? "untagged" : "deleted"}`;
+    case "image": {
+      // By name, as the image list shows it (`alpine:latest`); a `delete`
+      // names the image as `rmi` was given it, which may be its digest.
+      const image = /^(sha256:)?[0-9a-f]{64}$/.test(e.id) ? shortId(e.id) : imageName(e.id);
+      return `image ${image} ${e.action === "pull" ? "pulled" : e.action === "untag" ? "untagged" : "deleted"}`;
+    }
     case "network": {
       const net = e.attributes.name ?? e.id.slice(0, 12);
       if (e.action === "connect" || e.action === "disconnect") {

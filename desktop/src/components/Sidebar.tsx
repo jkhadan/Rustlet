@@ -62,8 +62,8 @@ function Logo() {
 
 /** The footer: is the daemon there, which one, and a way to start it. */
 function ConnectionIndicator() {
-  const { connection } = useDaemon();
-  const { start, starting } = useStartDaemon();
+  const { connection, generation } = useDaemon();
+  const { start, starting, offered } = useStartDaemon();
   return (
     <div className="border-t px-3 py-3 text-xs">
       {connection.state === "connecting" && (
@@ -73,7 +73,7 @@ function ConnectionIndicator() {
       )}
       {connection.state === "connected" && (
         <Tooltip content={`${connection.socket} · API ${connection.version.api_version}`} side="right">
-          <div className="flex items-center gap-2" data-testid="connection" data-state="connected">
+          <div className="flex items-center gap-2" data-testid="connection" data-state="connected" data-generation={generation}>
             <span className="bg-success relative inline-flex size-2 rounded-full">
               <span className="bg-success absolute inline-flex size-full animate-ping rounded-full opacity-40" />
             </span>
@@ -92,7 +92,7 @@ function ConnectionIndicator() {
               <span className="font-medium">{connection.error.kind === "denied" ? "Permission denied" : "Not connected"}</span>
             </div>
           </Tooltip>
-          {(connection.error.kind === "unreachable" || connection.error.kind === "denied") && (
+          {offered && (connection.error.kind === "unreachable" || connection.error.kind === "denied") && (
             <Button size="sm" onClick={start} disabled={starting} className="w-full">
               {starting ? <Spinner className="size-3" /> : <Power />} Start daemon
             </Button>
