@@ -130,7 +130,7 @@ impl Streams {
 }
 
 /// Forwards `stream` to `channel` until it ends, fails, or the frontend is
-/// gone, in batches of what has already arrived.
+/// gone, in batches of what arrives within [`BATCH_WINDOW`].
 pub async fn forward<T, S>(mut stream: S, channel: Channel<StreamMessage<T>>)
 where
     T: Serialize,
@@ -216,10 +216,7 @@ pub async fn watch_daemon(client: Client, channel: Channel<DaemonMessage>) {
                     }
                 }
             }
-            Err(error) => {
-                delay = (delay * 2).min(MAX_RETRY);
-                error
-            }
+            Err(error) => error,
         };
         if reported.as_ref() != Some(&error) {
             let message = DaemonMessage::Disconnected { socket: socket.clone(), error: error.clone() };
@@ -229,6 +226,7 @@ pub async fn watch_daemon(client: Client, channel: Channel<DaemonMessage>) {
             reported = Some(error);
         }
         tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(MAX_RETRY);
     }
 }
 

@@ -44,7 +44,8 @@ async function check(what, f) {
   try {
     await f();
     console.log(`  ✓ ${step}. ${what} (${Date.now() - t} ms)`);
-    if (shots) await d.screenshot(`${shots}/e2e-${String(step).padStart(2, "0")}.png`);
+    // (There is no window to take after the last step.)
+    if (shots) await d.screenshot(`${shots}/e2e-${String(step).padStart(2, "0")}.png`).catch(() => {});
   } catch (e) {
     console.log(`  ✗ ${step}. ${what}: ${e.message}`);
     if (shots) await d.screenshot(`${shots}/e2e-failed.png`).catch(() => {});
@@ -60,7 +61,7 @@ const rowStatus = (name) =>
     name,
   );
 
-for (const n of ["e2e-cli", "e2e-gui"]) rustlet("rm", "-f", n);
+for (const n of ["e2e-cli", "e2e-gui", "e2e-quit"]) rustlet("rm", "-f", n);
 rustlet("network", "rm", "e2e-net");
 rustlet("volume", "rm", "e2e-vol");
 
@@ -202,10 +203,26 @@ try {
     await d.waitFor(async () => (await rowStatus("e2e-cli")) === null, 5_000, "e2e-cli gone from the list");
   });
 
+  await check("quitting the app hangs up its terminals, leaving no shell behind", async () => {
+    if (!rustlet("run", "-d", "--name", "e2e-quit", "alpine", "sleep", "1000")) throw new Error("rustlet run failed");
+    await d.go("/containers/e2e-quit/terminal");
+    await d.find('[data-testid="terminal-state"][data-state="open"]', 15_000);
+    // `ps` itself is no shell. A failed exec counts as no shell while
+    // waiting for one, and as one while waiting for none.
+    const shell = (failed) => /\bsh\b/.test(rustlet("exec", "e2e-quit", "ps", "-o", "comm") ?? failed);
+    await d.waitFor(() => shell(""), 5_000, "the terminal's sh in the container");
+    // As a logout does. (Closing the window through WebDriver won't do:
+    // WebKitWebDriver kills the app with SIGKILL once its last window is
+    // gone, which nothing can answer. The window's own close ends in the
+    // same exit as SIGTERM does.)
+    execFileSync("pkill", ["-TERM", "-x", "rustlets-deskto"]);
+    await d.waitFor(() => !shell("sh"), 5_000, "no sh in the container");
+  });
+
   console.log(`all ${step} steps passed`);
 } finally {
   await d.quit();
-  for (const n of ["e2e-cli", "e2e-gui"]) rustlet("rm", "-f", n);
+  for (const n of ["e2e-cli", "e2e-gui", "e2e-quit"]) rustlet("rm", "-f", n);
   rustlet("network", "rm", "e2e-net");
   rustlet("volume", "rm", "e2e-vol");
 }

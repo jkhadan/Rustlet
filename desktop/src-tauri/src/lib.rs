@@ -34,6 +34,7 @@ pub mod streams;
 pub mod terminal;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tauri::webview::PageLoadEvent;
 
@@ -55,8 +56,22 @@ pub fn run() {
     let streams = Arc::new(streams::Streams::default());
     let terminals = Arc::new(terminal::Terminals::default());
     let (on_load_streams, on_load_terminals) = (streams.clone(), terminals.clone());
-    tauri::Builder::default()
+    let on_exit_terminals = terminals.clone();
+    let app = tauri::Builder::default()
         .manage(App { client, streams, terminals })
+        .setup(|app| {
+            // Logging out (SIGTERM), Ctrl-C under `pnpm tauri dev`, a closed
+            // terminal that started the app (SIGHUP): an orderly exit, so
+            // that the terminals are hung up below.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Some(signal) = exit_signal().await {
+                    tracing::info!("{signal}: exiting");
+                    handle.exit(0);
+                }
+            });
+            Ok(())
+        })
         // A page that (re)loads starts from nothing: whatever the previous
         // one had open would run on with nobody to show it to.
         .on_page_load(move |_, payload| {
@@ -108,6 +123,35 @@ pub fn run() {
             commands::volume_remove,
             commands::volume_prune,
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("the app failed to start");
+    // The window is closed, or the app was told to quit: the terminals'
+    // processes get SIGHUP, as when a tab closes. Without it, the sockets
+    // close with the process, which the daemon takes for a detach, and a
+    // shell per open terminal would run on in its container.
+    app.run(move |_, event| {
+        if let tauri::RunEvent::Exit = event {
+            tracing::debug!(terminals = on_exit_terminals.len(), "exiting: hanging up the terminals");
+            tauri::async_runtime::block_on(async {
+                let all = on_exit_terminals.close_all();
+                if tokio::time::timeout(Duration::from_secs(2), all).await.is_err() {
+                    tracing::warn!("the daemon didn't take every terminal's hangup in time");
+                }
+            });
+        }
+    });
+}
+
+/// The first of SIGTERM, SIGINT and SIGHUP, by name; `None` if they can't
+/// be caught.
+async fn exit_signal() -> Option<&'static str> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).ok()?;
+    let mut int = signal(SignalKind::interrupt()).ok()?;
+    let mut hup = signal(SignalKind::hangup()).ok()?;
+    tokio::select! {
+        _ = term.recv() => Some("SIGTERM"),
+        _ = int.recv() => Some("SIGINT"),
+        _ = hup.recv() => Some("SIGHUP"),
+    }
 }
