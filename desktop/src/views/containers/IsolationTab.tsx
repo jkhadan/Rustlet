@@ -84,10 +84,18 @@ export function IsolationTab({ container, running }: { container: ContainerInspe
 }
 
 function Summary({ r }: { r: Isolation }) {
-  const own = r.namespaces.filter((n) => !n.shared_with_host).length;
+  // Apart from the host's, a namespace may still be another container's too
+  // (`--network container:web`): that one isn't its own, though it keeps
+  // the host out as well.
+  const apart = r.namespaces.filter((n) => !n.shared_with_host);
+  const own = apart.filter((n) => n.shared_with.length === 0).length;
+  const shared = apart.length - own;
   const userns = r.namespaces.find((n) => n.kind === "user");
   const items: [string, boolean][] = [
-    [`${own} of ${r.namespaces.length} namespaces its own`, own >= 6],
+    [
+      `${own} of ${r.namespaces.length} namespaces its own${shared ? `, ${shared} shared with other containers` : ""}`,
+      apart.length >= 6,
+    ],
     [userns && !userns.shared_with_host ? "user namespace: root is unprivileged outside" : "no user namespace: root is host root", !!userns && !userns.shared_with_host],
     [`${r.capabilities.bounding.length} of ${r.capabilities.known.length} capabilities`, r.capabilities.bounding.length < 20],
     [r.seccomp.mode === "filter" ? `seccomp: ${r.seccomp.profile?.allowed.length ?? "?"} system calls allowed` : `seccomp: ${r.seccomp.mode}`, r.seccomp.mode === "filter"],

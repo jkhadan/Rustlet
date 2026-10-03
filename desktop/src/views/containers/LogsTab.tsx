@@ -6,12 +6,13 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { ArrowDownToLine, Eraser, Search } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import type { ContainerInspect, LogEntry } from "@/bindings";
+import type { ContainerInspect, LogEntry, LogStream } from "@/bindings";
 import { Button } from "@/components/ui/button";
 import { Checkbox, Input, Select } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/misc";
 import { parseAnsi, type Span, stripAnsi } from "@/lib/ansi";
 import { cn } from "@/lib/cn";
+import { useDaemon } from "@/lib/daemon";
 import { api, type StreamHandle } from "@/lib/ipc";
 
 /** Lines kept in memory at most; older ones are dropped. */
@@ -38,6 +39,17 @@ export function LogsTab({ container }: { container: ContainerInspect }) {
   const stick = useRef(true);
   const [atEnd, setAtEnd] = useState(true);
   const counter = useRef(0);
+  // rustletd going away cuts the stream short: it fails, or a follow ends
+  // while the container still runs. The next connection (a new
+  // `generation`) opens it again, from the tail as at first: the view is
+  // read afresh rather than added to, so no line shows twice, and what was
+  // logged meanwhile (the shim keeps writing) is in it.
+  const { generation } = useDaemon();
+  const cut = useRef(false);
+  const [reopened, setReopened] = useState(0);
+  useEffect(() => {
+    if (cut.current) setReopened((n) => n + 1);
+  }, [generation]);
 
   // A new run (a restart) gets a new stream: following ends with each exit.
   const run = container.state.started_at ?? "";
@@ -47,32 +59,61 @@ export function LogsTab({ container }: { container: ContainerInspect }) {
     let closed = false;
     let handle: StreamHandle | undefined;
     const style = { style: {} };
+    const following = follow && live;
     setLines([]);
     setStatus("loading");
     setError(null);
     counter.current = 0;
+    cut.current = false;
+    // The shim cuts a line longer than 16 KiB into entries, and only the
+    // last has the newline; `rustlet logs` prints them back to back. The
+    // pieces wait here, per stream, for the one that ends the line (or the
+    // end of the log), and make one line with the first one's time.
+    const held = new Map<LogStream, LogEntry>();
+    const add = (entries: LogEntry[]) => {
+      if (!entries.length) return;
+      const more = entries.map((e): Line => {
+        const text = e.log.replace(/\r?\n$/, "");
+        return {
+          n: counter.current++,
+          ts: e.ts,
+          stderr: e.stream === "stderr",
+          spans: parseAnsi(text, style),
+          plain: stripAnsi(text),
+        };
+      });
+      setLines((old) => {
+        const next = old.concat(more);
+        return next.length > MAX_LINES ? next.slice(next.length - MAX_LINES) : next;
+      });
+    };
     api.containers
-      .logs(container.id, { follow: follow && live, tail: tail === "all" ? null : Number(tail) }, (m) => {
+      .logs(container.id, { follow: following, tail: tail === "all" ? null : Number(tail) }, (m) => {
         if (closed) return;
         if (m.type === "items") {
-          const add = m.items.map((e: LogEntry) => {
-            const text = e.log.replace(/\r?\n$/, "");
-            return {
-              n: counter.current++,
-              ts: e.ts,
-              stderr: e.stream === "stderr",
-              spans: parseAnsi(text, style),
-              plain: stripAnsi(text),
-            };
-          });
-          setLines((old) => {
-            const next = old.concat(add);
-            return next.length > MAX_LINES ? next.slice(next.length - MAX_LINES) : next;
-          });
-          setStatus(follow && live ? "following" : "loading");
+          const whole: LogEntry[] = [];
+          for (const e of m.items) {
+            const before = held.get(e.stream);
+            const joined = before ? { ...before, log: before.log + e.log } : e;
+            if (e.log.endsWith("\n")) {
+              held.delete(e.stream);
+              whole.push(joined);
+            } else {
+              held.set(e.stream, joined);
+            }
+          }
+          add(whole);
+          setStatus(following ? "following" : "loading");
         } else if (m.type === "end") {
+          // The last output before an exit may lack its newline.
+          add([...held.values()].sort((a, b) => (a.ts < b.ts ? -1 : 1)));
+          held.clear();
+          // A follow ends by itself when the container exits, and `live`
+          // changing opens the next stream; while it still runs, it was cut.
+          cut.current = following;
           setStatus("ended");
         } else {
+          cut.current = true;
           setStatus("error");
           setError(m.error.message);
         }
@@ -81,11 +122,12 @@ export function LogsTab({ container }: { container: ContainerInspect }) {
         if (closed) h.cancel();
         else {
           handle = h;
-          setStatus((s) => (s === "loading" && follow && live ? "following" : s));
+          setStatus((s) => (s === "loading" && following ? "following" : s));
         }
       })
       .catch((e: unknown) => {
         if (!closed) {
+          cut.current = true;
           setStatus("error");
           setError(e instanceof Error ? e.message : String(e));
         }
@@ -94,7 +136,7 @@ export function LogsTab({ container }: { container: ContainerInspect }) {
       closed = true;
       handle?.cancel();
     };
-  }, [container.id, run, live, follow, tail]);
+  }, [container.id, run, live, follow, tail, reopened]);
 
   const shown = useMemo(() => {
     const f = filter.trim().toLowerCase();
@@ -105,6 +147,9 @@ export function LogsTab({ container }: { container: ContainerInspect }) {
     count: shown.length,
     getScrollElement: () => scroller.current,
     estimateSize: () => 20,
+    // Measured heights are kept by key: by index, a filter or a trim
+    // would give each row the height of the one that was there before.
+    getItemKey: (i) => shown[i].n,
     overscan: 30,
   });
 

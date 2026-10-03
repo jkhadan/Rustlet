@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { StatsSample } from "@/bindings";
+import type { NetDev, StatsSample } from "@/bindings";
 
 import { cpuPercent, memoryUsage, Series, toPoint } from "./stats";
 
@@ -58,7 +58,6 @@ describe("stats", () => {
     expect(p.rx).toBe(2000);
     expect(p.tx).toBe(0);
     expect(p.read).toBe(2048);
-    expect(toPoint(null, b).rx).toBe(0);
 
     const s = new Series(3);
     for (let i = 0; i < 5; i++) s.push(sample(`2026-10-02T12:00:0${i}Z`, i * 100_000));
@@ -66,5 +65,30 @@ describe("stats", () => {
     const [x, cpu] = s.columns("cpu");
     expect(x).toEqual([Date.parse("2026-10-02T12:00:02Z") / 1000, Date.parse("2026-10-02T12:00:03Z") / 1000, Date.parse("2026-10-02T12:00:04Z") / 1000]);
     expect(cpu[2]).toBeCloseTo(10);
+  });
+
+  it("an interface or a device that goes away takes nothing from the others' rates", () => {
+    const dev = (name: string, rx: number): NetDev => ({ name, rx_bytes: rx, rx_packets: 0, rx_errors: 0, rx_dropped: 0, tx_bytes: 0, tx_packets: 0, tx_errors: 0, tx_dropped: 0 });
+    const a = sample("2026-10-02T12:00:00Z", 0, {
+      network: [dev("eth0", 1_000_000), dev("eth1", 5_000_000_000)],
+      io: { "8:0": { rbytes: 1000, wbytes: 0 }, "253:1": { rbytes: 1 << 30, wbytes: 0 } },
+    });
+    // A second later eth1 is disconnected and 253:1 no longer listed; eth0
+    // received 10 MB meanwhile, 8:0 read 4 KiB.
+    const b = sample("2026-10-02T12:00:01Z", 0, { network: [dev("eth0", 11_000_000)], io: { "8:0": { rbytes: 5096, wbytes: 0 } } });
+    expect(toPoint(a, b).rx).toBe(10_000_000);
+    expect(toPoint(a, b).read).toBe(4096);
+    // Connected again: its counter is new, not traffic of this second.
+    const c = sample("2026-10-02T12:00:02Z", 0, { network: [dev("eth0", 11_000_000), dev("eth1", 9_000)] });
+    expect(toPoint(b, c).rx).toBe(0);
+  });
+
+  it("the first sample makes no point: it has no rates yet", () => {
+    const s = new Series();
+    s.push(sample("2026-10-02T12:00:00Z", 5_000_000));
+    expect(s.points).toEqual([]);
+    expect(s.latest?.cpu.usage_usec).toBe(5_000_000);
+    s.push(sample("2026-10-02T12:00:01Z", 5_500_000));
+    expect(s.points.map((p) => p.cpu)).toEqual([50]);
   });
 });

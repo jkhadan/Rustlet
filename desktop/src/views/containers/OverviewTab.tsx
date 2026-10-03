@@ -8,6 +8,17 @@ import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { useNow } from "@/lib/daemon";
 import { ago, bytes, commandText, portsText } from "@/lib/format";
 
+/** `--security-opt` values as rustletd reads them (spec.rs, `check`):
+ * `key=value` or `key:value`, the last of a key winning. */
+function securityOpts(opts: string[]): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const opt of opts) {
+    const i = opt.search(/[=:]/);
+    out.set(i < 0 ? opt : opt.slice(0, i), i < 0 ? "" : opt.slice(i + 1));
+  }
+  return out;
+}
+
 export function OverviewTab({ container: c }: { container: ContainerInspect }) {
   const now = useNow();
   const cfg = c.config;
@@ -16,11 +27,14 @@ export function OverviewTab({ container: c }: { container: ContainerInspect }) {
     cfg.restart.name === "on-failure" && cfg.restart.max_retries
       ? `on-failure:${cfg.restart.max_retries}`
       : cfg.restart.name;
+  const opts = securityOpts(cfg.security_opt);
   const security = [
     cfg.privileged && "privileged",
     cfg.userns === "remap" && "user namespace",
     cfg.read_only && "read-only root",
-    cfg.security_opt.some((o) => o.startsWith("seccomp=unconfined")) && "seccomp unconfined",
+    opts.get("seccomp") === "unconfined" && "seccomp unconfined",
+    // Rustlets sets it unless told not to.
+    opts.get("no-new-privileges") === "false" && "no-new-privileges off",
     ...cfg.cap_add.map((c) => `+${c}`),
     ...cfg.cap_drop.map((c) => `-${c}`),
   ].filter(Boolean) as string[];
@@ -168,8 +182,11 @@ export function OverviewTab({ container: c }: { container: ContainerInspect }) {
                     </Td>
                     <Td>
                       {m.type === "volume" ? (
+                        // `inspect` doesn't say which volumes are anonymous
+                        // (theirs are 64 hex digits, but a named one's may
+                        // be too): the name, whole.
                         <Link to="/volumes" className="hover:underline">
-                          <Mono>{m.name && m.name.length > 24 ? `${m.name.slice(0, 12)}… (anonymous)` : m.name}</Mono>
+                          <Mono className="break-all">{m.name}</Mono>
                         </Link>
                       ) : (
                         <Mono>{m.source}</Mono>

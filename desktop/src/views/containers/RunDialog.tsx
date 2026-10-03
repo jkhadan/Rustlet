@@ -3,7 +3,7 @@
 // showing its progress, and create again; then start.
 
 import { ChevronDown, ChevronRight, Play } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useNavigate } from "react-router";
 import { toast } from "sonner";
 
@@ -14,8 +14,8 @@ import { Dialog } from "@/components/ui/dialog";
 import { Checkbox, Field, Input, Select, Textarea } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/misc";
 import { imageName, splitCommand } from "@/lib/format";
-import { api, call, CommandFailed } from "@/lib/ipc";
-import { initialPull, pullReducer, type PullState } from "@/lib/pull";
+import { api, CommandFailed, type StreamHandle } from "@/lib/ipc";
+import { failPull, initialPull, pullReducer, type PullState } from "@/lib/pull";
 import { useImages, useNetworks } from "@/lib/queries";
 
 interface Form {
@@ -62,19 +62,24 @@ const empty: Form = {
   start: true,
 };
 
-const lines = (s: string) =>
+const values = (s: string, separators: RegExp) =>
   s
-    .split(/[\n,]/)
+    .split(separators)
     .map((l) => l.trim())
     .filter(Boolean);
+
+/** One value per line, for values that may hold a comma: a volume's
+ * options (`/srv:/srv:ro,nocopy`), an environment variable's value. */
+const lines = (s: string) => values(s, /\n/);
+
+/** One per line or separated by commas, for values that can't hold one
+ * (ports, capabilities). */
+const list = (s: string) => values(s, /[\n,]/);
 
 /** The form as the API's `ContainerConfig` (ports and volumes parsed by
  * Rust, as the CLI parses them). */
 async function toConfig(f: Form): Promise<Partial<ContainerConfig> & { image: string }> {
-  const parsed = await call<{ ports: ContainerConfig["ports"]; mounts: ContainerConfig["mounts"] }>("parse_run_options", {
-    ports: lines(f.ports),
-    volumes: lines(f.volumes),
-  });
+  const parsed = await api.containers.parseRunOptions(list(f.ports), lines(f.volumes));
   const number = (s: string, what: string) => {
     if (!s.trim()) return null;
     const n = Number(s);
@@ -86,10 +91,7 @@ async function toConfig(f: Form): Promise<Partial<ContainerConfig> & { image: st
     image: f.image.trim(),
     name: f.name.trim() || null,
     cmd: f.command.trim() ? splitCommand(f.command) : [],
-    env: f.env
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean),
+    env: lines(f.env),
     ports: parsed.ports,
     mounts: parsed.mounts,
     network: f.network,
@@ -103,10 +105,14 @@ async function toConfig(f: Form): Promise<Partial<ContainerConfig> & { image: st
     memory: memory == null ? null : Math.round(memory * 1024 * 1024),
     cpus: number(f.cpus, "CPUs"),
     pids_limit: number(f.pids, "PIDs limit"),
-    cap_add: lines(f.capAdd),
-    cap_drop: lines(f.capDrop),
+    cap_add: list(f.capAdd),
+    cap_drop: list(f.capDrop),
   };
 }
+
+/** What a pull rejects with when the dialog closes during it: the run goes
+ * no further, and there is nothing to report. */
+class Closed extends Error {}
 
 export function RunDialog({ open, onOpenChange, image }: { open: boolean; onOpenChange: (o: boolean) => void; image?: string }) {
   const [form, setForm] = useState<Form>(() => ({ ...empty, image: image ?? "" }));
@@ -118,6 +124,10 @@ export function RunDialog({ open, onOpenChange, image }: { open: boolean; onOpen
   const networks = useNetworks();
   const navigate = useNavigate();
   const set = <K extends keyof Form>(k: K, v: Form[K]) => setForm((f) => ({ ...f, [k]: v }));
+  // The pull under way. Closing the dialog lets go of it: its progress
+  // stops coming (the stream is cancelled), but rustletd pulls to the end
+  // whether or not a client stays.
+  const pulling = useRef<{ reference: string; abandon(): void } | null>(null);
 
   const reset = () => {
     setForm({ ...empty, image: image ?? "" });
@@ -127,20 +137,52 @@ export function RunDialog({ open, onOpenChange, image }: { open: boolean; onOpen
   };
 
   /** Pulls `reference` with the `missing` policy, showing progress. */
-  const pullImage = (reference: string) =>
-    new Promise<void>((resolve, reject) => {
-      setPull(initialPull(reference));
+  const pullImage = (reference: string) => {
+    let handle: StreamHandle | undefined;
+    let abandoned = false;
+    let stop: (e: Closed) => void = () => {};
+    const p = {
+      reference,
+      abandon() {
+        abandoned = true;
+        handle?.cancel();
+        stop(new Closed());
+      },
+    };
+    pulling.current = p;
+    setPull(initialPull(reference));
+    const fail = (message: string) => setPull((s) => failPull(s ?? initialPull(reference), message));
+    return new Promise<void>((resolve, reject) => {
+      stop = reject;
       api.images
         .pull(reference, "missing", (m) => {
+          if (abandoned) return;
           if (m.type === "items") {
             setPull((s) => m.items.reduce(pullReducer, s ?? initialPull(reference)));
             const last = m.items[m.items.length - 1];
             if (last?.status === "error") reject(new Error(last.message));
-          } else if (m.type === "end") resolve();
-          else reject(new CommandFailed(m.error));
+          } else if (m.type === "end") {
+            resolve();
+          } else {
+            // The daemon's `error` event arrives as this (rustlet-client
+            // makes it the stream's error), as does a broken connection.
+            fail(m.error.message);
+            reject(new CommandFailed(m.error));
+          }
         })
-        .catch(reject);
+        .then((h) => {
+          if (abandoned) h.cancel();
+          else handle = h;
+        })
+        .catch((e: unknown) => {
+          if (abandoned) return;
+          fail(e instanceof Error ? e.message : String(e));
+          reject(e);
+        });
+    }).finally(() => {
+      if (pulling.current === p) pulling.current = null;
     });
+  };
 
   const submit = async () => {
     setError(null);
@@ -162,17 +204,41 @@ export function RunDialog({ open, onOpenChange, image }: { open: boolean; onOpen
       for (const w of created.warnings) toast.warning(w);
       if (form.start) {
         setBusy("Starting");
-        await api.containers.start(created.id);
+        try {
+          await api.containers.start(created.id);
+        } catch (e) {
+          // A container that never ran is removed, as `rustlet run --rm`
+          // removes one (run.rs, `remove_unstarted`); here without --rm
+          // too, since Run is one step and the next press, with the input
+          // fixed, would find the name taken. Best effort: the error to
+          // show is the start's.
+          await api.containers.remove(created.id, { force: true, volumes: true }).catch(() => {});
+          throw e;
+        }
       }
       toast.success(`${created.name} ${form.start ? "is running" : "created"}`);
       onOpenChange(false);
       reset();
       if (!form.autoRemove) navigate(`/containers/${created.id}`);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (!(e instanceof Closed)) setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(null);
     }
+  };
+
+  /** Closes the dialog (X, Escape or Cancel), which opens afresh next time.
+   * A pull under way is let go of (see `pulling`); a create or a start is
+   * short, and finishes first. */
+  const close = () => {
+    if (busy && busy !== "Pulling") return;
+    const p = pulling.current;
+    if (p) {
+      p.abandon();
+      toast.info(`rustletd goes on pulling ${p.reference}`);
+    }
+    reset();
+    onOpenChange(false);
   };
 
   const imageNames = [...new Set((images.data ?? []).flatMap((i) => i.names.map(imageName)))].sort();
@@ -180,12 +246,7 @@ export function RunDialog({ open, onOpenChange, image }: { open: boolean; onOpen
   return (
     <Dialog
       open={open}
-      onOpenChange={(o) => {
-        if (!busy) {
-          onOpenChange(o);
-          if (!o) reset();
-        }
-      }}
+      onOpenChange={(o) => (o ? onOpenChange(true) : close())}
       title="Run a container"
       description="Create a container from an image and start it, as rustlet run -d does."
       className="w-[min(680px,94vw)]"
@@ -193,7 +254,7 @@ export function RunDialog({ open, onOpenChange, image }: { open: boolean; onOpen
         <>
           <Checkbox checked={form.start} onChange={(v) => set("start", v)} label="Start it" />
           <div className="flex-1" />
-          <Button onClick={() => onOpenChange(false)} disabled={busy != null}>
+          <Button onClick={close} disabled={busy != null && busy !== "Pulling"}>
             Cancel
           </Button>
           <Button variant="primary" onClick={() => void submit()} disabled={busy != null || !form.image.trim()} data-testid="run-submit">
@@ -240,10 +301,10 @@ export function RunDialog({ open, onOpenChange, image }: { open: boolean; onOpen
           />
         </Field>
         <div className="grid grid-cols-2 gap-3">
-          <Field label="Ports (-p)" hint="One per line: 8080:80, 127.0.0.1::53/udp">
+          <Field label="Ports (-p)" hint="One per line or separated by commas: 8080:80, 127.0.0.1::53/udp">
             <Textarea value={form.ports} onChange={(e) => set("ports", e.target.value)} placeholder="8080:80" rows={2} />
           </Field>
-          <Field label="Volumes (-v)" hint="data:/data, /srv/www:/usr/share/nginx/html:ro">
+          <Field label="Volumes (-v)" hint="One per line (a comma separates options): /srv/www:/srv:ro,nocopy">
             <Textarea value={form.volumes} onChange={(e) => set("volumes", e.target.value)} placeholder="data:/data" rows={2} />
           </Field>
         </div>

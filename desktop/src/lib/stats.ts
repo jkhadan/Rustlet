@@ -36,12 +36,16 @@ export function memoryUsage(s: StatsSample): number {
   return inactive < s.memory_current ? s.memory_current - inactive : s.memory_current;
 }
 
-/** Bytes through the container's interfaces (not its loopback). */
+/** The interfaces that count: the container's own, not its loopback. */
+function interfaces(s: StatsSample) {
+  return s.network.filter((d) => d.name !== "lo");
+}
+
+/** Bytes through the container's interfaces. */
 export function networkTotals(s: StatsSample): { rx: number; tx: number } {
   let rx = 0;
   let tx = 0;
-  for (const d of s.network) {
-    if (d.name === "lo") continue;
+  for (const d of interfaces(s)) {
     rx += d.rx_bytes;
     tx += d.tx_bytes;
   }
@@ -65,37 +69,64 @@ function elapsedSeconds(prev: StatsSample, cur: StatsSample): number {
   return a == null || b == null ? 0 : (b - a) / 1000;
 }
 
-/** The point for `cur`; without `prev`, the rates and CPU are 0. */
-export function toPoint(prev: StatsSample | null, cur: StatsSample): Point {
+/** A byte counter of each interface or device, by its name. */
+type Counters = Map<string, number>;
+
+const net =
+  (key: "rx_bytes" | "tx_bytes") =>
+  (s: StatsSample): Counters =>
+    new Map(interfaces(s).map((d) => [d.name, d[key]]));
+
+const block =
+  (key: "rbytes" | "wbytes") =>
+  (s: StatsSample): Counters =>
+    new Map(Object.entries(s.io).map(([dev, io]) => [dev, io[key] ?? 0]));
+
+/** How much the counters grew, each against itself. An interface or a
+ * device in only one of the samples (`network connect` or `disconnect`
+ * between them) adds nothing: subtracting sums would count its whole
+ * counter as traffic, or take it away from the others'. A counter that
+ * went down started again (an interface of the same name made anew), and
+ * adds nothing either. */
+function growth(prev: Counters, cur: Counters): number {
+  let n = 0;
+  for (const [key, b] of cur) {
+    const a = prev.get(key);
+    if (a !== undefined && b >= a) n += b - a;
+  }
+  return n;
+}
+
+/** The point for `cur`, from the sample before it. A first sample has no
+ * rates yet, so it makes no point (`rustlet stats` doesn't draw it
+ * either). */
+export function toPoint(prev: StatsSample, cur: StatsSample): Point {
   const t = (parseTime(cur.read) ?? Date.now()) / 1000;
-  const dt = prev ? elapsedSeconds(prev, cur) : 0;
-  const rate = (a: number, b: number) => (dt > 0 && b >= a ? (b - a) / dt : 0);
-  const net = networkTotals(cur);
-  const blk = blockTotals(cur);
-  const pnet = prev ? networkTotals(prev) : net;
-  const pblk = prev ? blockTotals(prev) : blk;
+  const dt = elapsedSeconds(prev, cur);
+  const rate = (counters: (s: StatsSample) => Counters) => (dt > 0 ? growth(counters(prev), counters(cur)) / dt : 0);
   return {
     t,
-    cpu: prev ? cpuPercent(prev, cur) : 0,
+    cpu: cpuPercent(prev, cur),
     memory: memoryUsage(cur),
     memoryLimit: cur.memory_max,
-    rx: rate(pnet.rx, net.rx),
-    tx: rate(pnet.tx, net.tx),
-    read: rate(pblk.read, blk.read),
-    write: rate(pblk.write, blk.write),
+    rx: rate(net("rx_bytes")),
+    tx: rate(net("tx_bytes")),
+    read: rate(block("rbytes")),
+    write: rate(block("wbytes")),
     pids: cur.pids_current,
     pidsLimit: cur.pids_max,
   };
 }
 
-/** The last `max` points of a stream of samples. */
+/** The last `max` points of a stream of samples: one for each sample after
+ * the first. */
 export class Series {
   points: Point[] = [];
   private last: StatsSample | null = null;
   constructor(private readonly max = 120) {}
 
   push(sample: StatsSample): void {
-    this.points.push(toPoint(this.last, sample));
+    if (this.last) this.points.push(toPoint(this.last, sample));
     if (this.points.length > this.max) this.points.splice(0, this.points.length - this.max);
     this.last = sample;
   }

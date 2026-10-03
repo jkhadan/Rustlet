@@ -26,11 +26,13 @@ import type {
   Isolation,
   LogEntry,
   LogsQuery,
+  MountSpec,
   Network,
   NetworkConnect,
   NetworkCreate,
   NetworkCreateResponse,
   NetworkDisconnect,
+  PortMapping,
   PruneResponse,
   PullEvent,
   PullPolicy,
@@ -41,7 +43,8 @@ import type {
 } from "@/bindings";
 
 /** `unreachable`: nothing listens on the socket; `denied`: the socket isn't
- * this user's; `failed`: anything else; or the daemon's own kind. */
+ * this user's; `failed`: anything else; or the daemon's own kind
+ * (`invalid` also comes from `parse_run_options`). */
 export type CommandErrorKind = "unreachable" | "denied" | "failed" | ErrorKind;
 
 /** What a failed command rejects with. */
@@ -93,6 +96,13 @@ export type DaemonMessage =
   | { type: "disconnected"; socket: string; error: CommandError }
   | { type: "events"; events: Event[] };
 
+/** `-p` and `-v` values, parsed as `rustlet run` parses them
+ * (`RunOptions`). */
+export interface RunOptions {
+  ports: PortMapping[];
+  mounts: MountSpec[];
+}
+
 /** The JSON messages of a terminal's output channel (`TerminalMessage`);
  * its data arrives as `ArrayBuffer`s. */
 export type TerminalMessage = { type: "exit"; code: number } | { type: "error"; error: CommandError };
@@ -143,6 +153,9 @@ export const api = {
     inspect: (id: string) => call<ContainerInspect>("container_inspect", { id }),
     create: (config: Partial<ContainerConfig> & { image: string }) =>
       call<CreateResponse>("container_create", { config }),
+    /** Rejects with `invalid` and the CLI's message for a value the CLI
+     * would refuse. */
+    parseRunOptions: (ports: string[], volumes: string[]) => call<RunOptions>("parse_run_options", { ports, volumes }),
     start: (id: string) => call<void>("container_start", { id }),
     stop: (id: string, timeout?: number) => call<void>("container_stop", { id, timeout }),
     restart: (id: string, timeout?: number) => call<void>("container_restart", { id, timeout }),
@@ -191,7 +204,9 @@ export const api = {
       const output = new Channel<ArrayBuffer | TerminalMessage>(onOutput);
       return call<number>("terminal_open", { ...args, user: args.user ?? null, output });
     },
-    input: (session: number, data: string) => call<void>("terminal_input", { session, data }),
+    // A `Vec<u8>` comes from JSON as an array of numbers (a typed array
+    // would become an object).
+    input: (session: number, data: Uint8Array) => call<void>("terminal_input", { session, data: Array.from(data) }),
     resize: (session: number, rows: number, cols: number) => call<void>("terminal_resize", { session, rows, cols }),
     close: (session: number) => call<void>("terminal_close", { session }),
   },

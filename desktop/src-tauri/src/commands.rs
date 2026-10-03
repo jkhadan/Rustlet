@@ -217,9 +217,12 @@ pub async fn terminal_open(
     app.terminals.open(&app.client, req, output).await
 }
 
+/// `data` is bytes, not text: what xterm.js calls binary input (mouse
+/// reports in the X10 encoding) is a byte per character, which UTF-8 would
+/// turn into two.
 #[tauri::command(rename_all = "snake_case")]
-pub async fn terminal_input(app: S<'_>, session: SessionId, data: String) -> CommandResult<()> {
-    app.terminals.input(session, data.as_bytes()).await
+pub async fn terminal_input(app: S<'_>, session: SessionId, data: Vec<u8>) -> CommandResult<()> {
+    app.terminals.input(session, &data).await
 }
 
 #[tauri::command(rename_all = "snake_case")]

@@ -30,12 +30,15 @@ export function ContainersPage() {
     );
   }, [containers.data, filter]);
   const live = (containers.data ?? []).filter(isLive).length;
+  // With stopped ones hidden, the daemon lists only live ones: how many are
+  // stopped isn't known here.
+  const stopped = all ? ` · ${(containers.data?.length ?? 0) - live} stopped` : " · stopped ones hidden";
 
   return (
     <div>
       <PageHeader
         title="Containers"
-        subtitle={containers.data ? `${live} running · ${(containers.data?.length ?? 0) - live} stopped` : " "}
+        subtitle={containers.data ? `${live} running${stopped}` : " "}
         actions={
           <Button variant="primary" onClick={() => setRunning(true)} data-testid="open-run">
             <Plus /> Run a container
@@ -64,7 +67,7 @@ export function ContainersPage() {
         ) : containers.error ? (
           <ErrorState error={containers.error} what="containers" />
         ) : rows.length === 0 ? (
-          <Empty icon={<Boxes />} title={filter ? "No container matches" : "No containers yet"}>
+          <Empty icon={<Boxes />} title={filter ? "No container matches" : all ? "No containers yet" : "No container is running"}>
             {!filter && (
               <>
                 Run one here, or with <code className="font-mono">rustlet run -d nginx</code>: it shows up at once.

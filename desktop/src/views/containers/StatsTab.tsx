@@ -9,6 +9,7 @@ import type { ContainerInspect, Pressure } from "@/bindings";
 import { Chart } from "@/components/Chart";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Empty, Meter, Spinner } from "@/components/ui/misc";
+import { useDaemon } from "@/lib/daemon";
 import { bytes, percent } from "@/lib/format";
 import { api, type StreamHandle } from "@/lib/ipc";
 import { blockTotals, networkTotals, Series } from "@/lib/stats";
@@ -20,6 +21,15 @@ export function StatsTab({ container, running }: { container: ContainerInspect; 
   const [version, setVersion] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const run = container.state.started_at ?? "";
+  // rustletd going away cuts the stream short (it fails, or ends while the
+  // container still runs); the next connection (a new `generation`) starts
+  // the charts again.
+  const { generation } = useDaemon();
+  const cut = useRef(false);
+  const [reopened, setReopened] = useState(0);
+  useEffect(() => {
+    if (cut.current) setReopened((n) => n + 1);
+  }, [generation]);
 
   useEffect(() => {
     if (!running) return;
@@ -28,6 +38,11 @@ export function StatsTab({ container, running }: { container: ContainerInspect; 
     series.current = new Series(120);
     setVersion(0);
     setError(null);
+    cut.current = false;
+    const fail = (message: string) => {
+      cut.current = true;
+      setError(message);
+    };
     api.containers
       .stats(container.id, (m) => {
         if (closed) return;
@@ -35,16 +50,18 @@ export function StatsTab({ container, running }: { container: ContainerInspect; 
           for (const s of m.items) series.current.push(s);
           setVersion((v) => v + 1);
         } else if (m.type === "error") {
-          setError(m.error.message);
+          fail(m.error.message);
+        } else {
+          cut.current = true;
         }
       })
       .then((h) => (closed ? h.cancel() : (handle = h)))
-      .catch((e: unknown) => !closed && setError(e instanceof Error ? e.message : String(e)));
+      .catch((e: unknown) => !closed && fail(e instanceof Error ? e.message : String(e)));
     return () => {
       closed = true;
       handle?.cancel();
     };
-  }, [container.id, running, run]);
+  }, [container.id, running, run, reopened]);
 
   const s = series.current;
   const latest = s.latest;
