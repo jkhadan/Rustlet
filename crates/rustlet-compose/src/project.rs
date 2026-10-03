@@ -1,5 +1,6 @@
 //! A project, normalized: what `up` creates, with every default applied,
-//! every path absolute, every name final.
+//! every path absolute, every name final. It serializes (`compose config`
+//! prints it as JSON).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -8,7 +9,7 @@ use rustlet_spec::container::ContainerConfig;
 use rustlet_spec::image::PullPolicy;
 
 /// A loaded compose project.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Project {
     /// `-p`, else the file's `name:`, else `COMPOSE_PROJECT_NAME`, else its
     /// directory's name; lowercased, only `[a-z0-9_-]`.
@@ -27,7 +28,7 @@ pub struct Project {
 }
 
 /// One service.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Service {
     pub name: String,
     /// The image its containers run: `image:`, else `<project>-<service>`
@@ -53,7 +54,7 @@ pub struct Service {
 }
 
 /// `build:`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Build {
     /// The context directory, absolute.
     pub context: PathBuf,
@@ -68,7 +69,7 @@ pub struct Build {
 }
 
 /// One of a service's `depends_on`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Dependency {
     pub service: String,
     pub condition: Condition,
@@ -78,7 +79,8 @@ pub struct Dependency {
 }
 
 /// What a dependency must reach before the service starts.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Condition {
     /// `service_started` (the short syntax's): running.
     #[default]
@@ -90,7 +92,7 @@ pub enum Condition {
 }
 
 /// A service on one network.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ServiceNetwork {
     /// The network's daemon name (`<project>_default`).
     pub network: String,
@@ -100,7 +102,7 @@ pub struct ServiceNetwork {
 }
 
 /// A network of the project.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Network {
     /// The daemon's name: `<project>_<key>`, or `name:`, or an external
     /// network's.
@@ -115,7 +117,7 @@ pub struct Network {
 }
 
 /// A named volume of the project.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Volume {
     /// `<project>_<key>`, or `name:`, or an external volume's.
     pub name: String,
