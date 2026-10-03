@@ -657,6 +657,27 @@ fn dm_isolation_report() {
         assert!(m.seccomp.profile.is_none());
         assert!(m.filesystem.read_only);
 
+        // An entrypoint that drops to another user (as `su-exec` and `gosu`
+        // do): the ids are the process's own, inside and out, not the user
+        // `config.json` started it as.
+        let dropped = run(ContainerConfig {
+            name: Some("dropped".into()),
+            userns: UsernsMode::Remap,
+            ..sh("exec su -s /bin/sh nobody -c 'exec sleep 1000'")
+        })
+        .await;
+        let mut cred = c.isolation(&dropped).await.unwrap().credentials;
+        for _ in 0..50 {
+            if cred.host_uid != 1_000_000 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cred = c.isolation(&dropped).await.unwrap().credentials;
+        }
+        assert_eq!((cred.uid, cred.gid), (65534, 65534), "{cred:?}");
+        assert_eq!((cred.host_uid, cred.host_gid), (1_065_534, 1_065_534), "{cred:?}");
+        assert!(!cred.additional_gids.contains(&0), "root's groups are gone: {cred:?}");
+
         // Not running: nothing to read.
         c.kill(&side, None).await.unwrap();
         c.wait(&side, WaitCondition::NotRunning).await.unwrap();
@@ -671,7 +692,7 @@ fn dm_isolation_report() {
         assert_eq!(layer.chain_id, image.chain_ids[0]);
         assert_eq!(layer.diff_id, image.diff_ids[0]);
 
-        for id in [&web, &side, &remapped] {
+        for id in [&web, &side, &remapped, &dropped] {
             c.remove_container(id, true).await.unwrap();
         }
     });

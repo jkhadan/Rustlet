@@ -96,15 +96,23 @@ pub fn report(d: &Daemon, c: &Container) -> ApiResult<Isolation> {
         (Vec::new(), Vec::new())
     };
 
-    let user = spec.process().as_ref().map(|p| p.user().clone()).unwrap_or_default();
+    // The process's ids now, not config.json's user: an entrypoint may have
+    // dropped to another (`su-exec`, `gosu`). `status` shows them as the
+    // daemon, so the host, sees them.
     let effective =
         |key: &str| status.get(key).and_then(|v| v.split_whitespace().nth(1)).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let (host_uid, host_gid) = (effective("Uid"), effective("Gid"));
+    let groups = status.get("Groups").map(String::as_str).unwrap_or_default();
     let credentials = Credentials {
-        uid: user.uid(),
-        gid: user.gid(),
-        additional_gids: user.additional_gids().clone().unwrap_or_default(),
-        host_uid: effective("Uid"),
-        host_gid: effective("Gid"),
+        uid: inside(host_uid, &uid_map),
+        gid: inside(host_gid, &gid_map),
+        additional_gids: groups
+            .split_whitespace()
+            .filter_map(|g| g.parse().ok())
+            .map(|g| inside(g, &gid_map))
+            .collect(),
+        host_uid,
+        host_gid,
     };
     let caps = |key: &str| cap_names(status.get(key).map(String::as_str).unwrap_or("0"));
     let capabilities = Capabilities {
@@ -269,6 +277,18 @@ fn parse_id_map(text: &str) -> Vec<IdMapping> {
         .collect()
 }
 
+/// A host id as the container sees it: through its map, or as it is without
+/// one (no user namespace of its own). One the map doesn't cover is the
+/// kernel's overflow id, `nobody`.
+fn inside(host_id: u32, map: &[IdMapping]) -> u32 {
+    if map.is_empty() {
+        return host_id;
+    }
+    map.iter()
+        .find(|m| host_id >= m.host_id && host_id - m.host_id < m.size)
+        .map_or(65534, |m| m.container_id + (host_id - m.host_id))
+}
+
 /// A hex capability mask (`CapEff` of `/proc/<pid>/status`) as names.
 fn cap_names(hex: &str) -> Vec<String> {
     let set = CapSet(u64::from_str_radix(hex, 16).unwrap_or(0));
@@ -404,6 +424,16 @@ mod tests {
         let m = parse_id_map("         0    1000000      65536\n");
         assert_eq!(m, [IdMapping { container_id: 0, host_id: 1_000_000, size: 65536 }]);
         assert!(parse_id_map("").is_empty());
+    }
+
+    #[test]
+    fn host_ids_map_back_into_the_container() {
+        let m = [IdMapping { container_id: 0, host_id: 1_000_000, size: 65536 }];
+        assert_eq!(inside(1_000_000, &m), 0);
+        assert_eq!(inside(1_065_534, &m), 65534);
+        assert_eq!(inside(1_065_536, &m), 65534, "past the end: the overflow id");
+        assert_eq!(inside(0, &m), 65534, "the host's root isn't mapped");
+        assert_eq!(inside(1000, &[]), 1000, "no user namespace of its own");
     }
 
     #[test]

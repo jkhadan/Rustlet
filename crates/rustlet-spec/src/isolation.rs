@@ -101,8 +101,11 @@ pub struct IdMapping {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct Credentials {
-    /// The user and group `config.json` gives it, as the container sees
-    /// them.
+    /// Its effective user and group and its supplementary groups now, as
+    /// the container sees them: the host's ids mapped back through
+    /// `uid_map`/`gid_map` (an id the maps don't cover is 65534). Usually
+    /// the user `config.json` started it as, unless it has changed its ids
+    /// since (an entrypoint that drops to another user with `su-exec`, say).
     pub uid: u32,
     pub gid: u32,
     pub additional_gids: Vec<u32>,
