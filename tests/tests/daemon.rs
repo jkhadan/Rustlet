@@ -822,7 +822,9 @@ fn dm_events_for_changes_without_an_exit() {
         let e = next("a die with an error", &|e| e.id == id && e.action == "die" && e.attributes.contains_key("error"))
             .await;
         assert!(!e.attributes["error"].is_empty(), "{e:?}");
-        assert_eq!(status(&c, &id).await, ContainerStatus::Exited);
+        // `always` tries again, so it may be waiting to restart already.
+        let now = status(&c, &id).await;
+        assert!(matches!(now, ContainerStatus::Exited | ContainerStatus::Restarting), "{now:?}");
         c.remove_container(&id, false).await.unwrap();
 
         // An image removed: its name untagged, then the image deleted, once.

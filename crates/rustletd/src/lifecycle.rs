@@ -177,9 +177,9 @@ impl Daemon {
                     gave_up = true;
                 }
             });
-            // A restart that couldn't start: it is no longer restarting,
-            // and only an event tells clients so (no run began, so no exit
-            // code).
+            // A restart that couldn't start it: Exited, until the policy
+            // tries again (if it does: on-failure:N may be done), and only
+            // an event says so (no run began, so no exit code).
             if gave_up {
                 self.emit(c, "die", &[("error", e.message.clone())]);
             }
