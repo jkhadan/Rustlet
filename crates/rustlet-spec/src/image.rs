@@ -1,4 +1,4 @@
-//! Images: `pull`, `images`, `inspect`, `rmi`.
+//! Images: `pull`, `images`, `inspect`, `rmi`, `tag`, `save`, `load`.
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -191,9 +191,63 @@ pub enum PullEvent {
     },
 }
 
+/// Query of `POST /v1/images/tag`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(default)]
+pub struct ImageTagQuery {
+    /// The image: a name, an id, or a unique prefix of an id.
+    pub source: String,
+    /// The new name (`app:1.0`), moved from whatever it named before.
+    pub target: String,
+}
+
+/// `POST /v1/images/save`: the images to put in the archive. The answer
+/// is a tar archive (`application/x-tar`): an OCI image layout, with
+/// Docker's `manifest.json` beside it, so that `docker load` reads it too.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(default)]
+pub struct ImageSaveRequest {
+    /// Names or ids; an image named twice is saved once, with both names.
+    pub names: Vec<String>,
+}
+
+/// One line of the NDJSON answer to `POST /v1/images/load` (whose body is
+/// the archive: an OCI image layout, as `save` writes, or Docker's older
+/// `docker save` format): a `blob` per blob stored, a `loaded` per image,
+/// or `error` as the last line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum LoadEvent {
+    /// A blob of the archive, checked against its digest and stored (or
+    /// already there: `existed`).
+    Blob {
+        digest: String,
+        size: u64,
+        existed: bool,
+    },
+    /// An image of the archive is in the store, its layers unpacked: its id
+    /// (manifest digest) and name (none: kept unnamed).
+    Loaded {
+        id: String,
+        name: Option<String>,
+    },
+    Error {
+        message: String,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_events_are_tagged_by_status() {
+        let e = LoadEvent::Loaded { id: "sha256:ab".into(), name: Some("docker.io/library/a:1".into()) };
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"status":"loaded","id":"sha256:ab","name":"docker.io/library/a:1"}"#
+        );
+    }
 
     #[test]
     fn pull_events_are_tagged_by_status() {

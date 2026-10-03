@@ -1,5 +1,6 @@
 [package]
 name = "rustlet-compose"
+description = "Compose for Rustlets: the compose file (a subset of the Compose Specification), its interpolation and normalization, and up/down/ps/logs over rustletd's API, client-side as Compose v2."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,3 +11,19 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+rustlet-spec.workspace = true
+rustlet-client.workspace = true
+rustlet-build.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tokio.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+axum.workspace = true

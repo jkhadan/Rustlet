@@ -43,6 +43,12 @@
 //! | POST | `/images/pull?reference=&policy=` | → NDJSON [`image::PullEvent`] |
 //! | GET | `/images/inspect?name=` | → [`image::ImageInspect`] |
 //! | DELETE | `/images?name=&force=` | → [`image::ImageDeleteResponse`] |
+//! | POST | `/images/tag?source=&target=` | → 204 ([`image::ImageTagQuery`]) |
+//! | POST | `/images/save` | [`image::ImageSaveRequest`] → a tar archive (`application/x-tar`) |
+//! | POST | `/images/load` | a tar archive → NDJSON [`image::LoadEvent`] |
+//! | POST | `/build?options=` | the build context, a tar archive → NDJSON [`build::BuildEvent`] ([`build::BuildQuery`]) |
+//! | POST | `/build/prune` | → [`network::PruneResponse`] (the build cache, forgotten) |
+//! | POST | `/commit` | [`build::CommitRequest`] → 201 [`build::CommitResponse`] |
 //! | GET | `/networks` | → `[`[`network::Network`]`]` |
 //! | POST | `/networks` | [`network::NetworkCreate`] → 201 [`network::NetworkCreateResponse`] |
 //! | GET | `/networks/{id}` | → [`network::Network`] (id, unique id prefix, or name) |
@@ -78,9 +84,14 @@
 //!
 //! Attach and exec are bidirectional, so they are WebSockets; see
 //! [`stream`] for the framing.
+//!
+//! Two requests carry an archive as their body, sent as it is produced
+//! (chunked): `build` (the build context) and `images/load`. `images/save`
+//! answers with one.
 
 #![forbid(unsafe_code)]
 
+pub mod build;
 pub mod container;
 pub mod event;
 pub mod exec;
@@ -206,6 +217,11 @@ pub fn export_typescript(cfg: &ts_rs::Config) -> Result<(), ts_rs::ExportError> 
         ErrorBody,
         ErrorKind,
         StreamError,
+        build::BuildOptions,
+        build::BuildQuery,
+        build::BuildEvent,
+        build::CommitRequest,
+        build::CommitResponse,
         container::ContainerConfig,
         container::CreateResponse,
         container::ContainerSummary,
@@ -218,6 +234,10 @@ pub fn export_typescript(cfg: &ts_rs::Config) -> Result<(), ts_rs::ExportError> 
         container::KillQuery,
         container::WaitQuery,
         container::AttachQuery,
+        container::HealthConfig,
+        container::Health,
+        container::HealthStatus,
+        container::HealthResult,
         event::Event,
         event::EventsQuery,
         exec::ExecConfig,
@@ -231,6 +251,9 @@ pub fn export_typescript(cfg: &ts_rs::Config) -> Result<(), ts_rs::ExportError> 
         image::ImageDeleteResponse,
         image::PullQuery,
         image::PullEvent,
+        image::ImageTagQuery,
+        image::ImageSaveRequest,
+        image::LoadEvent,
         isolation::Isolation,
         logs::LogEntry,
         logs::LogsQuery,

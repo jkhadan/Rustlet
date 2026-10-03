@@ -37,6 +37,12 @@
 //!   the daemon's error line).
 //! - WebSocket ([`Session`]): attach and attached exec, both directions at
 //!   once.
+//! - Bytes ([`ByteStream`]): `save`'s archive, chunk by chunk.
+//!
+//! **Bodies that are streamed.** `build` sends a build context and `load`
+//! an archive, either of which can be large: a [`RequestBody`] is sent as it
+//! is produced, by a blocking writer on another thread
+//! ([`RequestBody::pipe`]) or a reader ([`RequestBody::from_reader`]).
 //!
 //! The status code is checked before any streaming starts, so "no such
 //! container" is an `Err` from the call itself, never an item of a stream.
@@ -51,6 +57,7 @@
 
 #![forbid(unsafe_code)]
 
+mod body;
 mod error;
 mod ndjson;
 mod session;
@@ -61,9 +68,11 @@ use std::path::{Path, PathBuf};
 use bytes::Bytes;
 use http::header::{CONTENT_TYPE, HOST, USER_AGENT};
 use http::{HeaderValue, Method, Request, Response};
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full, Limited, StreamBody};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
+use rustlet_spec::build::{BuildEvent, BuildOptions, BuildQuery, CommitRequest, CommitResponse};
 use rustlet_spec::container::{
     AttachQuery, ContainerConfig, ContainerInspect, ContainerSummary, CreateResponse, KillQuery, ListQuery,
     RemoveQuery, StopQuery, WaitCondition, WaitQuery, WaitResponse,
@@ -71,7 +80,8 @@ use rustlet_spec::container::{
 use rustlet_spec::event::{Event, EventsQuery};
 use rustlet_spec::exec::{ExecConfig, ExecCreated, ExecInspect, ExecStarted};
 use rustlet_spec::image::{
-    ImageDeleteQuery, ImageDeleteResponse, ImageInspect, ImageQuery, ImageSummary, PullEvent, PullPolicy, PullQuery,
+    ImageDeleteQuery, ImageDeleteResponse, ImageInspect, ImageQuery, ImageSaveRequest, ImageSummary, ImageTagQuery,
+    LoadEvent, PullEvent, PullPolicy, PullQuery,
 };
 use rustlet_spec::isolation::Isolation;
 use rustlet_spec::logs::{LogEntry, LogsQuery};
@@ -88,6 +98,7 @@ use tokio::net::UnixStream;
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+pub use body::{BodyWriter, ByteStream, RequestBody};
 pub use error::{Error, Result};
 pub use ndjson::JsonStream;
 pub use session::{Session, SessionEvent, SessionReceiver, SessionSender};
@@ -320,6 +331,61 @@ impl Client {
         }))
     }
 
+    /// Gives the image `source` (a name, an id or a unique id prefix) the
+    /// name `target` too, taking it from whatever it named before.
+    pub async fn tag_image(&self, source: &str, target: &str) -> Result<()> {
+        let query = ImageTagQuery { source: source.to_owned(), target: target.to_owned() };
+        self.call(Method::POST, with_query(routes::image_tag(), &query)?).await
+    }
+
+    /// A tar archive of the images `names` (an OCI image layout, which
+    /// `load` and `docker load` read), as it is written.
+    pub async fn save_images(&self, names: &[String]) -> Result<ByteStream> {
+        let body = serde_json::to_vec(&ImageSaveRequest { names: names.to_vec() })?;
+        Ok(ByteStream::new(self.request(Method::POST, routes::image_save(), Some(body)).await?.into_body()))
+    }
+
+    /// Loads the images of the archive `archive` (as `save` writes it, or
+    /// Docker's `docker save` format). Like a pull, a failed load ends the
+    /// stream with `Err(Error::Stream(message))`; the stream never yields
+    /// [`LoadEvent::Error`].
+    pub async fn load_images(&self, archive: RequestBody) -> Result<JsonStream<LoadEvent>> {
+        let payload = Payload::Stream(archive, "application/x-tar");
+        let response = self.send_payload(Method::POST, routes::image_load(), payload).await?;
+        Ok(JsonStream::new(response.into_body(), |event| match event {
+            LoadEvent::Error { message } => Err(Error::Stream(message)),
+            event => Ok(event),
+        }))
+    }
+
+    // --- build ---
+
+    /// Builds an image from `context`, the build context packed as a tar
+    /// archive (`rustlet_build::context::pack` makes one), as `options`
+    /// say. Progress comes as it happens; a build that succeeded ends with
+    /// [`BuildEvent::Done`], one that failed with
+    /// `Err(Error::Stream(message))` (the stream never yields
+    /// [`BuildEvent::Error`]).
+    pub async fn build(&self, options: &BuildOptions, context: RequestBody) -> Result<JsonStream<BuildEvent>> {
+        let path = with_query(routes::build(), &BuildQuery::new(options))?;
+        let response = self.send_payload(Method::POST, path, Payload::Stream(context, "application/x-tar")).await?;
+        Ok(JsonStream::new(response.into_body(), |event| match event {
+            BuildEvent::Error { message } => Err(Error::Stream(message)),
+            event => Ok(event),
+        }))
+    }
+
+    /// Forgets the build cache: the next builds run every step again. The
+    /// answer lists the cache entries removed.
+    pub async fn prune_build_cache(&self) -> Result<PruneResponse> {
+        read_json(self.request(Method::POST, routes::build_prune(), None).await?).await
+    }
+
+    /// A container's changes as a new image.
+    pub async fn commit(&self, request: &CommitRequest) -> Result<CommitResponse> {
+        self.send(Method::POST, routes::commit(), request).await
+    }
+
     // --- networks ---
 
     /// Every network, the default `bridge` among them.
@@ -401,8 +467,16 @@ impl Client {
     /// returned with its body unread, anything else becomes
     /// [`Error::Api`].
     async fn request(&self, method: Method, path: String, json: Option<Vec<u8>>) -> Result<Response<Incoming>> {
+        let payload = match json {
+            Some(body) => Payload::Json(body),
+            None => Payload::Empty,
+        };
+        self.send_payload(method, path, payload).await
+    }
+
+    async fn send_payload(&self, method: Method, path: String, payload: Payload) -> Result<Response<Incoming>> {
         let io = TokioIo::new(self.connect().await?);
-        let (mut sender, connection) = hyper::client::conn::http1::handshake::<_, Full<Bytes>>(io).await?;
+        let (mut sender, connection) = hyper::client::conn::http1::handshake::<_, ReqBody>(io).await?;
         // The connection is driven until the response body has been read
         // or dropped. Its errors reach the caller through the response.
         tokio::spawn(async move {
@@ -413,9 +487,13 @@ impl Client {
             .uri(path)
             .header(HOST, "localhost")
             .header(USER_AGENT, HeaderValue::from_static(AGENT));
-        let request = match json {
-            Some(body) => builder.header(CONTENT_TYPE, "application/json").body(Full::new(Bytes::from(body)))?,
-            None => builder.body(Full::new(Bytes::new()))?,
+        let request = match payload {
+            Payload::Empty => builder.body(full(Bytes::new()))?,
+            Payload::Json(body) => builder.header(CONTENT_TYPE, "application/json").body(full(Bytes::from(body)))?,
+            Payload::Stream(body, content_type) => {
+                let frames = futures::StreamExt::map(body.stream, |chunk| chunk.map(hyper::body::Frame::data));
+                builder.header(CONTENT_TYPE, content_type).body(StreamBody::new(frames).boxed_unsync())?
+            }
         };
         let response = sender.send_request(request).await?;
         if response.status().is_success() {
@@ -466,6 +544,21 @@ impl Client {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// Every request's body type: whole or streamed.
+type ReqBody = UnsyncBoxBody<Bytes, std::io::Error>;
+
+/// What a request carries.
+enum Payload {
+    Empty,
+    Json(Vec<u8>),
+    /// A streamed body, and its content type.
+    Stream(RequestBody, &'static str),
+}
+
+fn full(bytes: Bytes) -> ReqBody {
+    Full::new(bytes).map_err(|never| match never {}).boxed_unsync()
 }
 
 /// `/v1/containers/{id}/{action}`.

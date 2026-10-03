@@ -36,7 +36,7 @@ function ctr(id: string, name: string, network_mode: string, status: "running" |
     image_id: "sha256:x",
     command: [],
     created: "",
-    state: { status, pid: null, exit_code: 0, oom_killed: false, error: null, started_at: null, finished_at: null, restart_count: 0 },
+    state: { status, pid: null, exit_code: 0, oom_killed: false, error: null, started_at: null, finished_at: null, restart_count: 0, health: null },
     labels: {},
     ports: [],
     network_mode,

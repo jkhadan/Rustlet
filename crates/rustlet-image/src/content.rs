@@ -24,6 +24,16 @@
 //! than in a database, keeps the directory a valid OCI layout that `skopeo`
 //! or `umoci` can read as it is, and makes `save`/`load` a copy.
 //!
+//! **Other entries.** Two more kinds of descriptor live in `index.json`
+//! without a name. An image a user made and didn't name (a build without
+//! `-t`, a `commit` or `load` without a name) is **kept** ([`KEPT`]):
+//! `rustlet images` lists it as `<none>`, and it stays until it is removed
+//! by its id. And the **build cache** ([`CACHE_KEY`]) is a set of images,
+//! one per build step that changed the filesystem, each under the key of
+//! that step: never listed, dropped by `builder prune`. Being in
+//! `index.json` is what keeps an image from garbage collection, whatever its
+//! kind.
+//!
 //! `index.json` is replaced atomically (write a temporary file, rename), so
 //! readers need no lock; writers serialize their read-modify-write with an
 //! open-file-description lock ([`ContentStore::lock`]), which excludes other
@@ -49,6 +59,10 @@ use crate::media;
 pub const REF_NAME: &str = "org.opencontainers.image.ref.name";
 /// The digest a registry returned for the name when it was pulled.
 pub const REPO_DIGEST: &str = "io.rustlet.image.repo-digest";
+/// Marks an unnamed image kept in the store; the value is when.
+pub const KEPT: &str = "io.rustlet.image.kept";
+/// A build cache entry's key: the image a build step produced.
+pub const CACHE_KEY: &str = "io.rustlet.build.cache-key";
 
 /// An image name in the store.
 #[derive(Debug, Clone, PartialEq)]
@@ -253,49 +267,225 @@ impl ContentStore {
     /// Points `entry.name` at `entry.target`, replacing what it pointed at.
     /// The target's blob must already be in the store.
     pub fn set_ref(&self, entry: &RefEntry) -> Result<()> {
-        let media_type = entry.target.media_type().to_string();
-        if !media::is_manifest(&media_type) {
-            return Err(Error::invalid(format!(
-                "{}: a name must point at an image manifest, not {media_type}",
-                entry.name
-            )));
-        }
-        let target = Digest::from_oci(entry.target.digest())?;
-        if !self.has_blob(&target, entry.target.size())? {
-            return Err(Error::NotFound(format!("{}: manifest {target} is not in the store", entry.name)));
-        }
-        let mut desc = entry.target.clone();
+        let mut desc = self.checked_target(&entry.target, &entry.name)?;
         let mut annotations = desc.annotations().clone().unwrap_or_default();
         annotations.insert(REF_NAME.to_owned(), entry.name.clone());
         match &entry.repo_digest {
             Some(d) => annotations.insert(REPO_DIGEST.to_owned(), d.to_string()),
             None => annotations.remove(REPO_DIGEST),
         };
+        annotations.remove(KEPT);
+        annotations.remove(CACHE_KEY);
         desc.set_annotations(Some(annotations));
-
-        let _lock = self.lock()?;
-        let index = self.read_index()?;
-        let mut manifests: Vec<Descriptor> =
-            index.manifests().iter().filter(|d| ref_name(d) != Some(entry.name.as_str())).cloned().collect();
-        manifests.push(desc);
-        manifests.sort_by(|a, b| ref_name(a).cmp(&ref_name(b)));
-        let mut index = index;
-        index.set_manifests(manifests);
-        self.write_index(&index)
+        self.edit_index(|manifests| {
+            manifests.retain(|d| ref_name(d) != Some(entry.name.as_str()));
+            manifests.push(desc);
+            Ok(((), true))
+        })
     }
 
     /// Removes the name `name`. Returns whether it existed. Blobs stay.
     pub fn remove_ref(&self, name: &str) -> Result<bool> {
+        self.edit_index(|manifests| {
+            let before = manifests.len();
+            manifests.retain(|d| ref_name(d) != Some(name));
+            let removed = manifests.len() != before;
+            Ok((removed, removed))
+        })
+    }
+
+    /// Keeps the unnamed image `target` (a manifest in the store) until
+    /// [`unkeep`](Self::unkeep): a build or commit without a name, a load of
+    /// an image without one. Keeping it twice is keeping it once.
+    pub fn keep(&self, target: &Descriptor) -> Result<()> {
+        let digest = Digest::from_oci(target.digest())?;
+        let mut desc = self.checked_target(target, &digest.to_string())?;
+        let mut annotations = desc.annotations().clone().unwrap_or_default();
+        annotations.retain(|k, _| k != REF_NAME && k != REPO_DIGEST && k != CACHE_KEY);
+        annotations.insert(KEPT.to_owned(), chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        desc.set_annotations(Some(annotations));
+        self.edit_index(|manifests| {
+            let have = manifests.iter().any(|d| is_kept(d) && d.digest() == target.digest());
+            if !have {
+                manifests.push(desc);
+            }
+            Ok(((), !have))
+        })
+    }
+
+    /// The kept unnamed images' manifests.
+    pub fn kept(&self) -> Result<Vec<Descriptor>> {
+        Ok(self.read_index()?.manifests().iter().filter(|d| is_kept(d)).cloned().collect())
+    }
+
+    /// Stops keeping the unnamed image `manifest`; whether it was kept.
+    pub fn unkeep(&self, manifest: &Digest) -> Result<bool> {
+        let oci = manifest.to_oci();
+        self.edit_index(|manifests| {
+            let before = manifests.len();
+            manifests.retain(|d| !(is_kept(d) && d.digest() == &oci));
+            let removed = manifests.len() != before;
+            Ok((removed, removed))
+        })
+    }
+
+    /// The build cache's image for the step `key`, if it has one.
+    pub fn cache_entry(&self, key: &str) -> Result<Option<Descriptor>> {
+        Ok(self.read_index()?.manifests().iter().find(|d| cache_key(d) == Some(key)).cloned())
+    }
+
+    /// Records `target` (a manifest in the store) as the build cache's
+    /// image for the step `key`, replacing an entry with the same key.
+    pub fn set_cache_entry(&self, key: &str, target: &Descriptor) -> Result<()> {
+        let mut desc = self.checked_target(target, key)?;
+        let mut annotations = desc.annotations().clone().unwrap_or_default();
+        annotations.retain(|k, _| k != REF_NAME && k != REPO_DIGEST && k != KEPT);
+        annotations.insert(CACHE_KEY.to_owned(), key.to_owned());
+        desc.set_annotations(Some(annotations));
+        self.edit_index(|manifests| {
+            manifests.retain(|d| cache_key(d) != Some(key));
+            manifests.push(desc);
+            Ok(((), true))
+        })
+    }
+
+    /// Every build cache entry: its key and manifest digest.
+    pub fn cache_entries(&self) -> Result<Vec<(String, Digest)>> {
+        self.read_index()?
+            .manifests()
+            .iter()
+            .filter_map(|d| Some((cache_key(d)?.to_owned(), d)))
+            .map(|(k, d)| Ok((k, Digest::from_oci(d.digest())?)))
+            .collect()
+    }
+
+    /// Forgets the whole build cache; returns the manifests its entries
+    /// named (their blobs stay until garbage collection finds nothing else
+    /// uses them).
+    pub fn remove_cache_entries(&self) -> Result<Vec<Digest>> {
+        self.edit_index(|manifests| {
+            let mut removed = Vec::new();
+            manifests.retain(|d| match cache_key(d) {
+                Some(_) => {
+                    if let Ok(digest) = Digest::from_oci(d.digest()) {
+                        removed.push(digest);
+                    }
+                    false
+                }
+                None => true,
+            });
+            let changed = !removed.is_empty();
+            Ok((removed, changed))
+        })
+    }
+
+    /// `target` as an `index.json` entry may have it: an image manifest the
+    /// store has. `what` names the entry in errors.
+    fn checked_target(&self, target: &Descriptor, what: &str) -> Result<Descriptor> {
+        let media_type = target.media_type().to_string();
+        if !media::is_manifest(&media_type) {
+            return Err(Error::invalid(format!("{what}: an entry must point at an image manifest, not {media_type}")));
+        }
+        let digest = Digest::from_oci(target.digest())?;
+        if !self.has_blob(&digest, target.size())? {
+            return Err(Error::NotFound(format!("{what}: manifest {digest} is not in the store")));
+        }
+        Ok(target.clone())
+    }
+
+    /// Changes `index.json`'s descriptors under the write lock. `f` returns
+    /// its result and whether it changed anything; only then is the file
+    /// written, sorted: named entries by name, the build cache by key, the
+    /// rest by digest. The same content always makes the same bytes.
+    fn edit_index<T>(&self, f: impl FnOnce(&mut Vec<Descriptor>) -> Result<(T, bool)>) -> Result<T> {
         let _lock = self.lock()?;
         let mut index = self.read_index()?;
-        let before = index.manifests().len();
-        let kept: Vec<Descriptor> = index.manifests().iter().filter(|d| ref_name(d) != Some(name)).cloned().collect();
-        let removed = kept.len() != before;
-        if removed {
-            index.set_manifests(kept);
+        let mut manifests = index.manifests().clone();
+        let (result, changed) = f(&mut manifests)?;
+        if changed {
+            manifests.sort_by_key(sort_key);
+            index.set_manifests(manifests);
             self.write_index(&index)?;
         }
-        Ok(removed)
+        Ok(result)
+    }
+
+    /// Starts writing a blob whose digest isn't known yet (see
+    /// [`BlobWriter`]).
+    pub fn blob_writer(&self) -> Result<BlobWriter> {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let name = format!("new-{}-{}.partial", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
+        let path = self.ingest.join(name);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .with_context(|| format!("create {}", path.display()))?;
+        Ok(BlobWriter {
+            file,
+            path,
+            blobs: self.dir.join("blobs/sha256"),
+            hasher: Hasher::new(),
+            written: 0,
+            done: false,
+        })
+    }
+}
+
+/// A blob whose digest is only known once it is written (a layer being
+/// made): hashed as it is written, and filed under that digest by
+/// [`finish`](Self::finish). Dropping it unfinished deletes what was
+/// written.
+#[derive(Debug)]
+pub struct BlobWriter {
+    file: File,
+    path: PathBuf,
+    blobs: PathBuf,
+    hasher: Hasher,
+    written: u64,
+    done: bool,
+}
+
+impl BlobWriter {
+    /// Bytes written so far.
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// Makes the data durable and moves the blob into place; returns its
+    /// digest and size. A blob the store already has is replaced by the
+    /// same bytes.
+    pub fn finish(mut self) -> Result<(Digest, u64)> {
+        let digest = self.hasher.digest();
+        self.file.sync_all().with_context(|| format!("fsync {}", self.path.display()))?;
+        let dest = self.blobs.join(digest.hex());
+        std::fs::rename(&self.path, &dest).with_context(|| format!("move blob {digest} into the store"))?;
+        self.done = true;
+        crate::snapshot::sync_dir(&self.blobs)?;
+        Ok((digest, self.written))
+    }
+}
+
+impl Write for BlobWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.file.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Drop for BlobWriter {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -334,6 +524,24 @@ pub(crate) fn ofd_lock(path: &Path) -> Result<File> {
 
 fn ref_name(d: &Descriptor) -> Option<&str> {
     d.annotations().as_ref()?.get(REF_NAME).map(String::as_str)
+}
+
+fn cache_key(d: &Descriptor) -> Option<&str> {
+    d.annotations().as_ref()?.get(CACHE_KEY).map(String::as_str)
+}
+
+fn is_kept(d: &Descriptor) -> bool {
+    ref_name(d).is_none() && d.annotations().as_ref().is_some_and(|a| a.contains_key(KEPT))
+}
+
+/// `index.json`'s order: named entries by name, then the build cache by
+/// key, then the rest (kept images, other tools' entries) by digest.
+fn sort_key(d: &Descriptor) -> (u8, String) {
+    match (ref_name(d), cache_key(d)) {
+        (Some(name), _) => (0, name.to_owned()),
+        (None, Some(key)) => (1, key.to_owned()),
+        (None, None) => (2, d.digest().to_string()),
+    }
 }
 
 fn ref_entry(d: &Descriptor) -> Option<RefEntry> {
@@ -576,6 +784,52 @@ mod tests {
         let mut index = entry("docker.io/library/d:latest", &m1);
         index.target = descriptor(media::OCI_INDEX, &m1, 7);
         assert!(matches!(s.set_ref(&index), Err(Error::Invalid(_))));
+    }
+
+    #[test]
+    fn kept_images_and_the_build_cache_are_entries_without_names() {
+        let (_dir, s) = store();
+        let m1 = s.write_blob(b"{\"m\":1}").unwrap();
+        let m2 = s.write_blob(b"{\"m\":2}").unwrap();
+        let d1 = manifest_descriptor(media::OCI_MANIFEST, &m1, 7);
+        let d2 = manifest_descriptor(media::OCI_MANIFEST, &m2, 7);
+        s.keep(&d1).unwrap();
+        s.keep(&d1).unwrap();
+        s.set_cache_entry("k2", &d2).unwrap();
+        s.set_cache_entry("k1", &d1).unwrap();
+        s.set_cache_entry("k2", &d1).unwrap();
+        s.set_ref(&RefEntry { name: "docker.io/library/a:1".into(), target: d2.clone(), repo_digest: None }).unwrap();
+        // None of them is a name.
+        assert_eq!(s.refs().unwrap().len(), 1);
+        assert_eq!(s.kept().unwrap().iter().map(|d| d.digest().to_string()).collect::<Vec<_>>(), [m1.to_string()]);
+        assert_eq!(s.cache_entry("k2").unwrap().unwrap().digest().to_string(), m1.to_string());
+        assert_eq!(s.cache_entries().unwrap(), [("k1".to_owned(), m1.clone()), ("k2".to_owned(), m1.clone())]);
+        // All are garbage collection's roots.
+        assert_eq!(s.index_digests().unwrap().len(), 4);
+        assert_eq!(s.remove_cache_entries().unwrap(), [m1.clone(), m1.clone()]);
+        assert!(s.cache_entries().unwrap().is_empty());
+        assert!(s.unkeep(&m1).unwrap());
+        assert!(!s.unkeep(&m1).unwrap());
+        assert_eq!(s.index_digests().unwrap(), [m2]);
+        // Only manifests the store has.
+        let missing = manifest_descriptor(media::OCI_MANIFEST, &Digest::of(b"nope"), 4);
+        assert!(matches!(s.keep(&missing), Err(Error::NotFound(_))));
+        assert!(matches!(s.set_cache_entry("k", &missing), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn blobs_of_unknown_digest_are_filed_under_what_they_hash_to() {
+        let (dir, s) = store();
+        let mut w = s.blob_writer().unwrap();
+        w.write_all(b"a layer").unwrap();
+        assert_eq!(w.written(), 7);
+        let (digest, size) = w.finish().unwrap();
+        assert_eq!((digest.clone(), size), (Digest::of(b"a layer"), 7));
+        assert_eq!(s.read_blob(&digest, 100).unwrap(), b"a layer");
+        let mut w = s.blob_writer().unwrap();
+        w.write_all(b"abandoned").unwrap();
+        drop(w);
+        assert_eq!(std::fs::read_dir(dir.path().join("ingest")).unwrap().count(), 0);
     }
 
     #[test]

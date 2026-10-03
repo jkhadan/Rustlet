@@ -70,6 +70,31 @@ pub fn image_pull() -> String {
 pub fn image_inspect() -> String {
     v1("/images/inspect")
 }
+/// `POST` (`?source=&target=`).
+pub fn image_tag() -> String {
+    v1("/images/tag")
+}
+/// `POST`: [`crate::image::ImageSaveRequest`] → a tar archive.
+pub fn image_save() -> String {
+    v1("/images/save")
+}
+/// `POST`: a tar archive → NDJSON [`crate::image::LoadEvent`].
+pub fn image_load() -> String {
+    v1("/images/load")
+}
+
+/// `POST` (`?options=`): a build context → NDJSON [`crate::build::BuildEvent`].
+pub fn build() -> String {
+    v1("/build")
+}
+/// `POST`: forget the build cache.
+pub fn build_prune() -> String {
+    v1("/build/prune")
+}
+/// `POST`: [`crate::build::CommitRequest`].
+pub fn commit() -> String {
+    v1("/commit")
+}
 
 /// `GET` (list) and `POST` (create).
 pub fn networks() -> String {
@@ -120,6 +145,12 @@ pub mod pattern {
     pub const IMAGES: &str = "/v1/images";
     pub const IMAGE_PULL: &str = "/v1/images/pull";
     pub const IMAGE_INSPECT: &str = "/v1/images/inspect";
+    pub const IMAGE_TAG: &str = "/v1/images/tag";
+    pub const IMAGE_SAVE: &str = "/v1/images/save";
+    pub const IMAGE_LOAD: &str = "/v1/images/load";
+    pub const BUILD: &str = "/v1/build";
+    pub const BUILD_PRUNE: &str = "/v1/build/prune";
+    pub const COMMIT: &str = "/v1/commit";
     pub const NETWORKS: &str = "/v1/networks";
     pub const NETWORK: &str = "/v1/networks/{id}";
     pub const NETWORK_PRUNE: &str = "/v1/networks/prune";
@@ -143,6 +174,17 @@ mod tests {
         }
         assert_eq!(exec_start("e1"), pattern::EXEC_START.replace("{id}", "e1"));
         assert_eq!(image_pull(), pattern::IMAGE_PULL);
+        assert_eq!(
+            [image_tag(), image_save(), image_load(), build(), build_prune(), commit()],
+            [
+                pattern::IMAGE_TAG,
+                pattern::IMAGE_SAVE,
+                pattern::IMAGE_LOAD,
+                pattern::BUILD,
+                pattern::BUILD_PRUNE,
+                pattern::COMMIT
+            ]
+        );
         assert_eq!(ping(), pattern::PING);
         assert_eq!(network("n1"), pattern::NETWORK.replace("{id}", "n1"));
         assert_eq!(network_prune(), pattern::NETWORK_PRUNE);

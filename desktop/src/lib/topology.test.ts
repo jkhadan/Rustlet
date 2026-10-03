@@ -38,7 +38,7 @@ function ctr(id: string, network_mode = "bridge", status: "running" | "exited" =
     image_id: "sha256:x",
     command: [],
     created: "",
-    state: { status, pid: 1, exit_code: null, oom_killed: false, error: null, started_at: null, finished_at: null, restart_count: 0 },
+    state: { status, pid: 1, exit_code: null, oom_killed: false, error: null, started_at: null, finished_at: null, restart_count: 0, health: null },
     labels: {},
     ports: [],
     network_mode,

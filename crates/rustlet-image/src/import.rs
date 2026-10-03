@@ -14,6 +14,8 @@
 //!
 //! Tests use it to build images in a few lines; `cargo xtask image-run
 //! --local-alpine` makes one from the Alpine minirootfs for offline use.
+//! Its last two steps, [`write_image`], are how the builder, `commit` and
+//! `load` store the images they make.
 
 use std::io::Write;
 
@@ -22,6 +24,7 @@ use oci_spec::image::{
     MediaType, Os, RootFsBuilder,
 };
 
+use crate::config::ImageConfig;
 use crate::content::{ContentStore, RefEntry, descriptor, manifest_descriptor};
 use crate::digest::Digest;
 use crate::error::{Context, Error, Result};
@@ -63,23 +66,45 @@ pub fn import(content: &ContentStore, name: &str, layers: &[Vec<u8>], config: Co
         .build()
         .map_err(|e| Error::invalid(format!("image config: {e}")))?;
     let config_json = serde_json::to_vec(&image_config).context("serialize the image config")?;
-    let config_digest = content.write_blob(&config_json)?;
+    let target = write_image(content, &config_json, &layer_descriptors)?;
+    content.set_ref(&RefEntry { name: reference.name(), target, repo_digest: None })?;
+    Image::load(content, &reference.name())
+}
 
+/// Stores an image whose layer blobs are already in the store: `config`
+/// (the image config's JSON, exactly as it should be stored) and a manifest
+/// naming it and `layers` (bottom first), both as OCI media types. Returns
+/// the manifest's descriptor, ready for `index.json`; nothing is named
+/// (the caller names, keeps or caches the image). The config must parse as
+/// one and list one diff ID per layer, and every layer blob must be in the
+/// store with its descriptor's size.
+pub fn write_image(content: &ContentStore, config: &[u8], layers: &[Descriptor]) -> Result<Descriptor> {
+    let parsed = ImageConfig::parse(config)?;
+    if parsed.diff_ids.len() != layers.len() {
+        return Err(Error::invalid(format!(
+            "the image config lists {} diff IDs for {} layers",
+            parsed.diff_ids.len(),
+            layers.len()
+        )));
+    }
+    for layer in layers {
+        let digest = Digest::from_oci(layer.digest())?;
+        media::layer_compression(layer.media_type().as_ref())?;
+        if !content.has_blob(&digest, layer.size())? {
+            return Err(Error::NotFound(format!("layer {digest} ({} bytes) is not in the store", layer.size())));
+        }
+    }
+    let config_digest = content.write_blob(config)?;
     let manifest = ImageManifestBuilder::default()
         .schema_version(2u32)
         .media_type(MediaType::ImageManifest)
-        .config(descriptor(media::OCI_CONFIG, &config_digest, config_json.len() as u64))
-        .layers(layer_descriptors)
+        .config(descriptor(media::OCI_CONFIG, &config_digest, config.len() as u64))
+        .layers(layers.to_vec())
         .build()
         .map_err(|e| Error::invalid(format!("manifest: {e}")))?;
     let manifest_json = serde_json::to_vec(&manifest).context("serialize the manifest")?;
     let manifest_digest = content.write_blob(&manifest_json)?;
-    content.set_ref(&RefEntry {
-        name: reference.name(),
-        target: manifest_descriptor(media::OCI_MANIFEST, &manifest_digest, manifest_json.len() as u64),
-        repo_digest: None,
-    })?;
-    Image::load(content, &reference.name())
+    Ok(manifest_descriptor(media::OCI_MANIFEST, &manifest_digest, manifest_json.len() as u64))
 }
 
 /// A process config for [`import`]: `cmd`, `env` and optionally `user`.
@@ -126,5 +151,33 @@ mod tests {
         assert_eq!(image.layers[1].parent.as_ref(), Some(&image.layers[0].chain_id));
         assert_eq!(image.config.config().unwrap().cmd().as_deref(), Some(&["sh".to_string()][..]));
         image.config.check_runnable().unwrap();
+    }
+
+    #[test]
+    fn write_image_checks_what_it_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let content =
+            ContentStore::open(dir.path().join("content"), dir.path().join("ingest"), dir.path().join("lock")).unwrap();
+        let tar = vec![0u8; 1024];
+        let gz = gzip(&tar).unwrap();
+        let blob = content.write_blob(&gz).unwrap();
+        let layer = descriptor(media::OCI_LAYER_GZIP, &blob, gz.len() as u64);
+        let config = |ids: &[Digest]| {
+            serde_json::to_vec(&serde_json::json!({
+                "architecture": "amd64", "os": "linux",
+                "rootfs": {"type": "layers", "diff_ids": ids.iter().map(|d| d.to_string()).collect::<Vec<_>>()},
+            }))
+            .unwrap()
+        };
+        let target = write_image(&content, &config(&[Digest::of(&tar)]), std::slice::from_ref(&layer)).unwrap();
+        let image = Image::from_manifest(&content, &Digest::from_oci(target.digest()).unwrap(), None, None).unwrap();
+        assert_eq!(image.layers[0].diff_id, Digest::of(&tar));
+        assert!(content.refs().unwrap().is_empty(), "nothing is named");
+        // One diff ID per layer; layers the store has.
+        assert!(write_image(&content, &config(&[]), std::slice::from_ref(&layer)).is_err());
+        let missing = descriptor(media::OCI_LAYER_GZIP, &Digest::of(b"x"), 1);
+        assert!(matches!(write_image(&content, &config(&[Digest::of(&tar)]), &[missing]), Err(Error::NotFound(_))));
+        // No layers at all: an image built FROM scratch with nothing in it.
+        assert!(write_image(&content, &config(&[]), &[]).is_ok());
     }
 }

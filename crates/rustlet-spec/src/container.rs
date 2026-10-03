@@ -59,6 +59,8 @@ pub struct ContainerConfig {
     pub stop_signal: Option<String>,
     /// Seconds `stop` waits before killing; default 10.
     pub stop_timeout: Option<u32>,
+    /// `--health-*`, `--no-healthcheck`: over the image's `HEALTHCHECK`.
+    pub healthcheck: Option<HealthConfig>,
     /// Capability names (`NET_ADMIN`, `CAP_NET_ADMIN`, or `ALL`) to add to
     /// and drop from the default set.
     pub cap_add: Vec<String>,
@@ -259,6 +261,89 @@ pub struct ContainerState {
     pub finished_at: Option<String>,
     /// Restarts by the restart policy since the last `start`/`restart`.
     pub restart_count: u32,
+    /// While it runs with a healthcheck: what the checks say. Kept after
+    /// the run, as the last checks said it.
+    pub health: Option<Health>,
+}
+
+/// A healthcheck: how the daemon tells whether a running container works,
+/// by running a command in it now and then (`HEALTHCHECK` in a
+/// Containerfile, `--health-*` options, compose's `healthcheck`). Durations
+/// are in nanoseconds, as Docker's API and image configs give them; absent
+/// or 0 means the default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(default)]
+pub struct HealthConfig {
+    /// `["CMD", program, args…]`, `["CMD-SHELL", command]` (run by the
+    /// image's shell, `/bin/sh -c`), or `["NONE"]`: no healthcheck, not
+    /// even the image's. Empty: the image's command, with the options given
+    /// here over its own.
+    pub test: Vec<String>,
+    /// Between checks (default 30 s).
+    pub interval: Option<u64>,
+    /// A check that takes longer fails, and is killed (default 30 s).
+    pub timeout: Option<u64>,
+    /// After a start, failures don't count for this long (default 0); a
+    /// success ends it early.
+    pub start_period: Option<u64>,
+    /// Between checks during the start period (default 5 s).
+    pub start_interval: Option<u64>,
+    /// Failures in a row that make the container unhealthy (default 3).
+    pub retries: Option<u32>,
+}
+
+impl HealthConfig {
+    /// Does this disable healthchecks (`["NONE"]`)?
+    pub fn is_none(&self) -> bool {
+        self.test.first().is_some_and(|t| t == "NONE")
+    }
+}
+
+/// What a container's healthcheck says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthStatus {
+    /// Started; no check has succeeded yet, and not enough have failed.
+    #[default]
+    Starting,
+    Healthy,
+    /// `retries` checks in a row failed.
+    Unhealthy,
+}
+
+impl std::fmt::Display for HealthStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(match self {
+            HealthStatus::Starting => "starting",
+            HealthStatus::Healthy => "healthy",
+            HealthStatus::Unhealthy => "unhealthy",
+        })
+    }
+}
+
+/// A container's health: [`ContainerState::health`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(default)]
+pub struct Health {
+    pub status: HealthStatus,
+    /// Checks that failed in a row (those of the start period not counted).
+    pub failing_streak: u32,
+    /// The last checks, at most five, oldest first.
+    pub log: Vec<HealthResult>,
+}
+
+/// One check.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(default)]
+pub struct HealthResult {
+    /// RFC 3339, UTC.
+    pub start: String,
+    pub end: String,
+    /// The command's exit status (0: healthy); -1 when it timed out or
+    /// couldn't run.
+    pub exit_code: i32,
+    /// What it printed, stdout and stderr together, at most 4 KiB.
+    pub output: String,
 }
 
 /// One line of `rustlet ps`: `GET /v1/containers`.

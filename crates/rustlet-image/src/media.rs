@@ -70,6 +70,27 @@ pub fn layer_compression(media_type: &str) -> Result<Compression> {
     }
 }
 
+/// The compression of data that starts with `magic` (its first bytes, at
+/// least four for zstd): gzip (`1f 8b`), zstd (`28 b5 2f fd`), else none.
+/// Layers and archives are told apart this way where no media type says
+/// (Docker's older `save` format, `ADD`), as `docker load` does.
+pub fn detect_compression(magic: &[u8]) -> Compression {
+    match magic {
+        [0x1f, 0x8b, ..] => Compression::Gzip,
+        [0x28, 0xb5, 0x2f, 0xfd, ..] => Compression::Zstd,
+        _ => Compression::None,
+    }
+}
+
+/// The OCI layer media type for `compression`.
+pub fn layer_media_type(compression: Compression) -> &'static str {
+    match compression {
+        Compression::None => OCI_LAYER,
+        Compression::Gzip => OCI_LAYER_GZIP,
+        Compression::Zstd => OCI_LAYER_ZSTD,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +111,14 @@ mod tests {
         }
         assert!(is_index(OCI_INDEX) && is_index(DOCKER_MANIFEST_LIST) && !is_index(OCI_MANIFEST));
         assert!(is_manifest(DOCKER_MANIFEST) && is_config(DOCKER_CONFIG) && !is_config(OCI_MANIFEST));
+    }
+
+    #[test]
+    fn compression_from_magic() {
+        assert_eq!(detect_compression(&[0x1f, 0x8b, 8, 0]), Compression::Gzip);
+        assert_eq!(detect_compression(&[0x28, 0xb5, 0x2f, 0xfd]), Compression::Zstd);
+        assert_eq!(detect_compression(b"etc/"), Compression::None);
+        assert_eq!(detect_compression(&[0x1f]), Compression::None);
+        assert_eq!(layer_compression(layer_media_type(Compression::Zstd)).unwrap(), Compression::Zstd);
     }
 }

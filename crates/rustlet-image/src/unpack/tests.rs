@@ -335,6 +335,32 @@ fn whiteouts_and_opaque_markers_become_overlay_ones() {
 }
 
 #[test]
+fn without_whiteouts_their_names_are_ordinary_files() {
+    let tar = Archive::new()
+        .file("etc/.wh.gone", b"a", 0o644)
+        .file("share/doc/.wh..wh..opq", b"b", 0o600)
+        .file(".wh..wh.plnk", b"c", 0o644)
+        .tar();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("layer")).unwrap();
+    // Not empty: an archive extracted into a directory merges with it.
+    std::fs::create_dir_all(dir.path().join("layer/share/doc")).unwrap();
+    std::fs::write(dir.path().join("layer/share/doc/kept"), b"k").unwrap();
+    let fd = nix::fcntl::open(&dir.path().join("layer"), OFlag::O_RDONLY | OFlag::O_DIRECTORY, Mode::empty()).unwrap();
+    let options = UnpackOptions { whiteouts: false };
+    let u = Unpacked { result: super::unpack_with(&tar[..], Compression::None, fd.as_fd(), &options), dir };
+    let r = u.report();
+    assert_eq!((r.whiteouts, r.opaque_dirs), (0, 0));
+    assert!(r.skipped_other.is_empty(), "{:?}", r.skipped_other);
+    assert_eq!(
+        (u.read("etc/.wh.gone"), u.read("share/doc/.wh..wh..opq"), u.read(".wh..wh.plnk")),
+        ("a".into(), "b".into(), "c".into())
+    );
+    assert!(!u.opaque("share/doc"));
+    assert_eq!(u.read("share/doc/kept"), "k");
+}
+
+#[test]
 fn a_directory_meeting_its_own_whiteout_is_opaque() {
     // Whiteout first, then the directory (explicitly or implicitly), or the
     // directory first and then its whiteout: either way the lower `x` must

@@ -19,6 +19,12 @@
 //!  config.json  ──►  rustlet-runc                             [runspec, user]
 //! ```
 //!
+//! And back again, for the builder and `commit` (Phase 7): an upper
+//! directory becomes a layer (`diff`), `COPY`/`ADD` write into a mounted
+//! rootfs (`copy`), configs and manifests are stored by
+//! `import::write_image`, and `archive` reads and writes whole images as
+//! tar archives (`save`, `load`).
+//!
 //! The registry protocol itself (tokens, HTTP) is `oci-client`'s; this
 //! crate decides what to fetch, verifies and stores it, and does the
 //! filesystem work by hand: unpacking through `openat2` so that no archive
@@ -31,9 +37,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod archive;
 pub mod config;
 pub mod content;
+pub mod copy;
 pub mod copyup;
+pub mod diff;
 pub mod digest;
 pub mod error;
 pub mod image;

@@ -125,9 +125,36 @@ pub struct UnpackReport {
     pub tar_size: u64,
 }
 
+/// How [`unpack_with`] treats an archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnpackOptions {
+    /// It is an image layer: `.wh.<name>` entries become overlay whiteouts
+    /// and `.wh..wh..opq` an opaque directory (the default). Off for an
+    /// archive that is only files (a build context, an `ADD`ed tarball),
+    /// where such names are ordinary entries.
+    pub whiteouts: bool,
+}
+
+impl Default for UnpackOptions {
+    fn default() -> UnpackOptions {
+        UnpackOptions { whiteouts: true }
+    }
+}
+
 /// Unpacks the layer blob `blob` (compressed with `compression`) into the
 /// empty directory `dest`, and reports both digests for the caller to check.
 pub fn unpack(blob: impl Read, compression: Compression, dest: BorrowedFd<'_>) -> Result<UnpackReport> {
+    unpack_with(blob, compression, dest, &UnpackOptions::default())
+}
+
+/// [`unpack`], as `options` say. `dest` needn't be empty: entries replace
+/// what is there, and directories merge, as with `tar -x`.
+pub fn unpack_with(
+    blob: impl Read,
+    compression: Compression,
+    dest: BorrowedFd<'_>,
+    options: &UnpackOptions,
+) -> Result<UnpackReport> {
     let mut compressed = HashingReader::new(BufReader::with_capacity(1 << 16, blob));
     let mut report = {
         let decompressed: Box<dyn Read + '_> = match compression {
@@ -139,6 +166,7 @@ pub fn unpack(blob: impl Read, compression: Compression, dest: BorrowedFd<'_>) -
         };
         let mut tar_stream = HashingReader::new(decompressed);
         let mut unpacker = Unpacker::new(dest)?;
+        unpacker.whiteouts = options.whiteouts;
         {
             let mut archive = tar::Archive::new(&mut tar_stream);
             for entry in archive.entries().context("read the layer archive")? {
@@ -274,6 +302,8 @@ struct Unpacker<'a> {
     report: UnpackReport,
     /// Directory times, applied by [`finish`](Self::finish).
     dir_times: Vec<(PathBuf, TimeSpec, TimeSpec)>,
+    /// `.wh.` names are overlay markers ([`UnpackOptions::whiteouts`]).
+    whiteouts: bool,
 }
 
 impl<'a> Unpacker<'a> {
@@ -287,6 +317,7 @@ impl<'a> Unpacker<'a> {
             privileged: nix::unistd::geteuid().is_root(),
             report: UnpackReport::default(),
             dir_times: Vec::new(),
+            whiteouts: true,
         })
     }
 
@@ -325,6 +356,9 @@ impl<'a> Unpacker<'a> {
         let name: OsString = path.file_name().expect("a cleaned path ends in a name").to_owned();
         let name_bytes = name.as_bytes();
 
+        if !self.whiteouts {
+            return self.plain(kind, &parent, &name, &meta, &mut entry, &shown);
+        }
         if name_bytes == OPAQUE_MARKER {
             self.dir(&parent, &shown)?;
             let fd = self.open_dir_rw(&parent).with_context(|| format!("layer entry {shown:?}: open its directory"))?;
@@ -342,29 +376,42 @@ impl<'a> Unpacker<'a> {
             let dir = self.dir(&parent, &shown)?;
             return self.whiteout(dir.as_fd(), target, &shown);
         }
+        self.plain(kind, &parent, &name, &meta, &mut entry, &shown)
+    }
+
+    /// An entry that is what it says: a directory, file, link or FIFO.
+    fn plain<R: Read>(
+        &mut self,
+        kind: EntryType,
+        parent: &Path,
+        name: &OsStr,
+        meta: &Meta,
+        entry: &mut tar::Entry<'_, R>,
+        shown: &str,
+    ) -> Result<()> {
         match kind {
-            EntryType::Directory => self.directory(&parent, &name, &meta, &shown),
+            EntryType::Directory => self.directory(parent, name, meta, shown),
             EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse => {
-                self.file(&parent, &name, &meta, &mut entry, &shown)
+                self.file(parent, name, meta, entry, shown)
             }
             EntryType::Symlink => {
                 let target = entry.link_name_bytes().map(|t| t.into_owned()).unwrap_or_default();
                 if target.is_empty() || target.contains(&0) {
                     return Err(Error::invalid(format!("layer entry {shown:?}: a symlink needs a target")));
                 }
-                self.symlink(&parent, &name, OsStr::from_bytes(&target), &meta, &shown)
+                self.symlink(parent, name, OsStr::from_bytes(&target), meta, shown)
             }
             EntryType::Link => {
                 let target = entry.link_name_bytes().map(|t| t.into_owned()).unwrap_or_default();
-                self.hardlink(&parent, &name, &target, &shown)
+                self.hardlink(parent, name, &target, shown)
             }
-            EntryType::Fifo => self.fifo(&parent, &name, &meta, &shown),
+            EntryType::Fifo => self.fifo(parent, name, meta, shown),
             EntryType::Char | EntryType::Block => {
-                self.report.skipped_devices.push(shown);
+                self.report.skipped_devices.push(shown.to_owned());
                 Ok(())
             }
             _ => {
-                self.report.skipped_other.push(shown);
+                self.report.skipped_other.push(shown.to_owned());
                 Ok(())
             }
         }

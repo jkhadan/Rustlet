@@ -579,3 +579,115 @@ async fn nothing_is_read_after_an_error_line() {
     assert_eq!(entries.len(), 1, "{entries:?}");
     assert!(matches!(&entries[0], Err(Error::Stream(m)) if m == "gone"));
 }
+
+/// A build context streamed from a blocking writer reaches the daemon
+/// whole, the options arrive decoded, and the build's events come back; a
+/// build that fails ends with an `Err`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn builds_stream_their_context_and_their_events() {
+    use rustlet_spec::build::{BuildEvent, BuildOptions, BuildQuery};
+    async fn build(Query(q): Query<BuildQuery>, headers: HeaderMap, body: Body) -> Response {
+        assert_eq!(headers[header::CONTENT_TYPE], "application/x-tar");
+        let options = q.options().unwrap();
+        let mut stream = body.into_data_stream();
+        let mut received = 0u64;
+        while let Some(chunk) = stream.next().await {
+            received += chunk.unwrap().len() as u64;
+        }
+        let events = if options.tags == ["fail"] {
+            vec![
+                BuildEvent::Context { files: 1, bytes: received },
+                BuildEvent::Error { message: "step 2 failed".into() },
+            ]
+        } else {
+            vec![
+                BuildEvent::Context { files: 1, bytes: received },
+                BuildEvent::Done { id: "sha256:ab".into(), names: options.tags.clone() },
+            ]
+        };
+        let lines: String = events.iter().map(|e| serde_json::to_string(e).unwrap() + "\n").collect();
+        ([(header::CONTENT_TYPE, rustlet_spec::NDJSON)], lines).into_response()
+    }
+    let (_dir, client) = serve(Router::new().route(routes::pattern::BUILD, post(build)));
+    for (tag, ok) in [("app", true), ("fail", false)] {
+        let (body, mut writer) = rustlet_client::RequestBody::pipe();
+        let writing = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            for _ in 0..300 {
+                writer.write_all(&[b'x'; 1000])?;
+            }
+            writer.finish()
+        });
+        let options = BuildOptions { tags: vec![tag.into()], ..Default::default() };
+        let events: Vec<_> =
+            within(async { client.build(&options, body).await.unwrap().collect::<Vec<_>>().await }).await;
+        writing.await.unwrap().unwrap();
+        assert_eq!(events[0].as_ref().unwrap(), &BuildEvent::Context { files: 1, bytes: 300_000 });
+        if ok {
+            assert!(matches!(&events[1], Ok(BuildEvent::Done { names, .. }) if names == &["app"]));
+        } else {
+            assert!(matches!(&events[1], Err(Error::Stream(m)) if m == "step 2 failed"), "{events:?}");
+        }
+        assert_eq!(events.len(), 2);
+    }
+}
+
+/// `save` streams the archive back; `load` sends one read from a reader;
+/// `tag`, `commit` and `builder prune` are plain calls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn image_archives_tags_commits_and_cache_pruning() {
+    use rustlet_spec::build::{CommitRequest, CommitResponse};
+    use rustlet_spec::image::{ImageSaveRequest, ImageTagQuery, LoadEvent};
+    async fn save(Json(r): Json<ImageSaveRequest>) -> Response {
+        assert_eq!(r.names, ["a", "b"]);
+        let chunks = futures::stream::iter((0..4).map(|i| Ok::<_, std::io::Error>(Bytes::from(vec![i as u8; 70_000]))));
+        ([(header::CONTENT_TYPE, "application/x-tar")], Body::from_stream(chunks)).into_response()
+    }
+    async fn load(body: Body) -> Response {
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let e = LoadEvent::Loaded { id: format!("sha256:{}", bytes.len()), name: None };
+        ([(header::CONTENT_TYPE, rustlet_spec::NDJSON)], serde_json::to_string(&e).unwrap() + "\n").into_response()
+    }
+    async fn tag(Query(q): Query<ImageTagQuery>) -> StatusCode {
+        assert_eq!((q.source.as_str(), q.target.as_str()), ("sha256:ab", "app:2"));
+        StatusCode::NO_CONTENT
+    }
+    async fn commit(Json(r): Json<CommitRequest>) -> Response {
+        assert!(r.pause && r.changes == ["CMD [\"sh\"]"]);
+        (
+            StatusCode::CREATED,
+            Json(CommitResponse { id: "sha256:cd".into(), name: r.reference, layer: "sha256:ef".into() }),
+        )
+            .into_response()
+    }
+    async fn prune() -> Json<PruneResponse> {
+        Json(PruneResponse { deleted: vec!["sha256:01".into()], space_reclaimed: 0 })
+    }
+    let app = Router::new()
+        .route(routes::pattern::IMAGE_SAVE, post(save))
+        .route(routes::pattern::IMAGE_LOAD, post(load))
+        .route(routes::pattern::IMAGE_TAG, post(tag))
+        .route(routes::pattern::COMMIT, post(commit))
+        .route(routes::pattern::BUILD_PRUNE, post(prune));
+    let (_dir, client) = serve(app);
+    let archive = within(async {
+        let stream = client.save_images(&["a".into(), "b".into()]).await.unwrap();
+        stream.map(|c| c.unwrap()).collect::<Vec<_>>().await.concat()
+    })
+    .await;
+    assert_eq!(archive.len(), 280_000);
+    let body = rustlet_client::RequestBody::from_reader(std::io::Cursor::new(archive));
+    let loaded: Vec<_> = within(async { client.load_images(body).await.unwrap().collect::<Vec<_>>().await }).await;
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].as_ref().unwrap(), &LoadEvent::Loaded { id: "sha256:280000".into(), name: None });
+    within(client.tag_image("sha256:ab", "app:2")).await.unwrap();
+    let request = CommitRequest {
+        container: "web".into(),
+        reference: Some("app:3".into()),
+        changes: vec!["CMD [\"sh\"]".into()],
+        ..Default::default()
+    };
+    let committed = within(client.commit(&request)).await.unwrap();
+    assert_eq!((committed.id.as_str(), committed.name.as_deref()), ("sha256:cd", Some("app:3")));
+    assert_eq!(within(client.prune_build_cache()).await.unwrap().deleted, ["sha256:01"]);
+}

@@ -28,6 +28,7 @@ describe("format", () => {
       exit_code: null,
       oom_killed: false,
       error: null,
+      health: null,
       started_at: null,
       finished_at: null,
       restart_count: 0,

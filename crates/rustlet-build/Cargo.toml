@@ -1,5 +1,6 @@
 [package]
 name = "rustlet-build"
+description = "Containerfiles for Rustlets: the parser, variable expansion, .dockerignore, packing a build context, stages and ARGs, and the image config a build changes."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,3 +11,10 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
