@@ -438,7 +438,11 @@ Three shapes of response:
 - **WebSockets** for attach and exec, which go both ways: binary
   messages are `[stream id][bytes]` (0 stdin, 1 stdout, 2 stderr), text
   messages JSON controls (`resize`, `stdin_eof` from the client; `exit`,
-  `error` from the daemon).
+  `error` from the daemon). A client that just closes the socket
+  detaches, as Docker's does, and the process runs on; since Phase 6 an
+  exec client can first send `hangup`, and the process gets `SIGHUP`,
+  as a shell does when its terminal window closes ([chapter
+  17](17-tauri-ipc.md) §7).
 
 Errors carry a kind besides the message, and the kind gives a CLI its
 exit code, as Docker's does: 125 when Rustlets fails ("no such image"),
