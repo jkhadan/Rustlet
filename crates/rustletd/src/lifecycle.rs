@@ -169,12 +169,20 @@ impl Daemon {
             // with its error, rather than wait for the next start.
             c.fail_pending_attaches(e);
             let message = e.message.clone();
+            let mut gave_up = false;
             let _ = c.update(&self.db, |s| {
                 s.state.error = Some(message);
                 if s.state.status == ContainerStatus::Restarting {
                     s.state.status = ContainerStatus::Exited;
+                    gave_up = true;
                 }
             });
+            // A restart that couldn't start: it is no longer restarting,
+            // and only an event tells clients so (no run began, so no exit
+            // code).
+            if gave_up {
+                self.emit(c, "die", &[("error", e.message.clone())]);
+            }
         }
         result
     }
@@ -594,6 +602,9 @@ impl Daemon {
                     s.state.status = ContainerStatus::Exited;
                     s.manually_stopped = true;
                 })?;
+                // No exit follows (its run had ended): the event is all
+                // that tells clients.
+                self.emit(c, "stop", &[]);
                 return Ok(());
             }
             // Not running: nothing to do (Docker answers 304).

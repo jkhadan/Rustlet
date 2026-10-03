@@ -928,7 +928,11 @@ impl Daemon {
             self.connect_live(&c, run, &network, &cfg).await?;
         }
         configs.push(cfg);
-        c.update(&self.db, |s| s.networks = Some(configs))
+        c.update(&self.db, |s| s.networks = Some(configs))?;
+        // Whether it runs or not (its inspect shows its networks), and once
+        // its record says so: a client that refetches then sees it.
+        self.emit_connection(&c, &network.id, &network.name, "connect");
+        Ok(())
     }
 
     /// `network disconnect`: the container leaves the network, at once if
@@ -958,7 +962,10 @@ impl Daemon {
             self.disconnect_live(&c, run, at).await?;
         }
         configs.remove(index);
-        c.update(&self.db, |s| s.networks = Some(configs))
+        c.update(&self.db, |s| s.networks = Some(configs))?;
+        let id = network.as_ref().map_or(name.as_str(), |n| n.id.as_str());
+        self.emit_connection(&c, id, &name, "disconnect");
+        Ok(())
     }
 
     /// One more network for a running container: its endpoint recorded,
@@ -994,7 +1001,6 @@ impl Daemon {
             let _ = c.update(&self.db, |s| s.network = Some(run));
             return Err(e.context(format!("connect {} to {}", c.record.name, network.name)));
         }
-        self.emit_endpoint(c, &ep, "connect");
         Ok(())
     }
 
@@ -1005,9 +1011,7 @@ impl Daemon {
         let ep = run.endpoints.remove(at);
         self.unmake_endpoint(c, &ep).await;
         c.update(&self.db, |s| s.network = Some(run.clone()))?;
-        self.follow_endpoints(c, &pin, &run).await?;
-        self.emit_endpoint(c, &ep, "disconnect");
-        Ok(())
+        self.follow_endpoints(c, &pin, &run).await
     }
 
     /// What follows a change to a running container's endpoints: its live
@@ -1237,11 +1241,16 @@ impl Daemon {
     }
 
     fn emit_endpoint(&self, c: &Container, ep: &EndpointRun, action: &str) {
+        self.emit_connection(c, &ep.network_id, &ep.network_name, action);
+    }
+
+    /// `connect` or `disconnect` of container `c` and a network.
+    fn emit_connection(&self, c: &Container, network_id: &str, network_name: &str, action: &str) {
         self.events.emit(
             EventKind::Network,
             action,
-            &ep.network_id,
-            [("name".to_owned(), ep.network_name.clone()), ("container".to_owned(), c.id().to_owned())].into(),
+            network_id,
+            [("name".to_owned(), network_name.to_owned()), ("container".to_owned(), c.id().to_owned())].into(),
         );
     }
 

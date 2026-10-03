@@ -1021,3 +1021,45 @@ fn vol_a_create_cut_short_leaves_the_name_usable() {
     });
     assert!(left.is_dir() && !left.join("half").exists(), "a new, empty volume");
 }
+
+/// What the desktop app's views are built from (Phase 6): connecting and
+/// disconnecting a container that isn't running has its events too (its
+/// inspect lists its networks), and a container sharing another's network
+/// names it in its summary by the id it was created with, not by a name
+/// that another container may have taken since.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dn_events_and_summaries_for_the_desktop_app() {
+    let d = daemon();
+    block_on(async {
+        let c = d.client();
+        let net = c.create_network(&NetworkCreate { name: "back".into(), ..Default::default() }).await.unwrap().id;
+        let mut events = c.events(&Default::default()).await.unwrap();
+        let idle = c.create_container(&ContainerConfig { name: Some("idle".into()), ..sh("true") }).await.unwrap().id;
+        let connect = NetworkConnect { container: "idle".into(), ..Default::default() };
+        c.connect_network("back", &connect).await.unwrap();
+        c.disconnect_network("back", &NetworkDisconnect { container: "idle".into(), force: false }).await.unwrap();
+        let mut seen = Vec::new();
+        while seen.len() < 2 {
+            let e =
+                tokio::time::timeout(Duration::from_secs(10), events.next()).await.expect("an event").unwrap().unwrap();
+            if e.kind == rustlet_spec::event::EventKind::Network {
+                assert_eq!((e.id.as_str(), e.attributes["container"].as_str()), (net.as_str(), idle.as_str()), "{e:?}");
+                seen.push(e.action);
+            }
+        }
+        assert_eq!(seen, ["connect", "disconnect"]);
+
+        let web =
+            c.create_container(&ContainerConfig { name: Some("web".into()), ..sh("sleep 1000") }).await.unwrap().id;
+        c.start(&web).await.unwrap();
+        let side =
+            ContainerConfig { name: Some("side".into()), network: NetworkMode::Container("web".into()), ..sh("true") };
+        let side = c.create_container(&side).await.unwrap().id;
+        let summary = c.list_containers(true).await.unwrap().into_iter().find(|s| s.id == side).unwrap();
+        assert_eq!(summary.network_mode, NetworkMode::Container(web.clone()));
+        for id in [&idle, &web, &side] {
+            c.remove_container(id, true).await.unwrap();
+        }
+    });
+}

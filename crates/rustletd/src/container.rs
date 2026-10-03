@@ -159,7 +159,13 @@ impl Container {
             state: self.persisted().state,
             labels: r.config.labels.clone(),
             ports: self.persisted().network.map(|n| n.ports).unwrap_or_default(),
-            network_mode: r.config.network.clone(),
+            // `container:<x>` as created: x by the full id it resolved to
+            // then, not the name or prefix it was given (another container
+            // may have that name by now).
+            network_mode: match &r.network_container {
+                Some(id) => rustlet_spec::network::NetworkMode::Container(id.clone()),
+                None => r.config.network.clone(),
+            },
         }
     }
 

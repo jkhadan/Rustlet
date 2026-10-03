@@ -149,16 +149,25 @@ async fn events(State(d): D, Query(q): Query<EventsQuery>) -> ApiResult<Response
             let after = since.is_none_or(|s| {
                 chrono::DateTime::parse_from_rfc3339(&e.time).is_ok_and(|t| t.with_timezone(&chrono::Utc) >= s)
             });
-            if since.is_some() && after && wanted(&e) && tx.send(e).await.is_err() {
+            if since.is_some() && after && wanted(&e) && tx.send(EventLine::Event(e)).await.is_err() {
                 return;
             }
         }
         loop {
             tokio::select! {
                 got = live.recv() => match got {
-                    Ok(e) if wanted(&e) => if tx.send(e).await.is_err() { return },
+                    Ok(e) if wanted(&e) => if tx.send(EventLine::Event(e)).await.is_err() { return },
                     Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => tracing::warn!("an events client missed {n} events"),
+                    // A client that reads too slowly would go on with a gap
+                    // it can't see (the desktop app's views would show what
+                    // those events changed as it was): the stream ends
+                    // instead, so that it knows.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("an events client missed {n} events");
+                        let error = format!("too slow: {n} events were missed");
+                        let _ = tx.send(EventLine::Error(StreamError { error })).await;
+                        return;
+                    }
                     Err(_) => return,
                 },
                 () = tx.closed() => return,
@@ -166,6 +175,14 @@ async fn events(State(d): D, Query(q): Query<EventsQuery>) -> ApiResult<Response
         }
     });
     Ok(ndjson(rx))
+}
+
+/// A line of the `events` stream: an event, or the error it ended with.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum EventLine {
+    Event(rustlet_spec::event::Event),
+    Error(StreamError),
 }
 
 // ── containers ─────────────────────────────────────────────────────────────
@@ -369,14 +386,17 @@ async fn image_inspect(State(d): D, Query(q): Query<ImageQuery>) -> ApiResult<Js
 }
 
 async fn image_pull(State(d): D, Query(q): Query<PullQuery>) -> ApiResult<Response> {
-    rustlet_image::ImageRef::parse(&q.reference).map_err(|e| ApiError::invalid(e.to_string()))?;
+    // The event names the image as `index.json` does (`docker.io/library/
+    // alpine:latest`): the image a pull loads is loaded by digest, which
+    // has no name.
+    let name = rustlet_image::ImageRef::parse(&q.reference).map_err(|e| ApiError::invalid(e.to_string()))?.name();
     let (tx, rx) = mpsc::channel::<PullEvent>(256);
     tokio::spawn(async move {
         match d.images.pull(&q.reference, q.policy, tx).await {
             Ok(image) => d.events.emit(
                 EventKind::Image,
                 "pull",
-                &image.display_name(),
+                &name,
                 [("id".to_owned(), image.manifest_digest.to_string())].into(),
             ),
             Err(e) => tracing::info!("pull {}: {e}", q.reference),
@@ -389,13 +409,17 @@ async fn image_remove(
     State(d): D,
     Query(q): Query<ImageDeleteQuery>,
 ) -> ApiResult<Json<rustlet_spec::image::ImageDeleteResponse>> {
+    let id = d.images.resolve(&q.name)?.manifest_digest.to_string();
     let images = d.clone();
-    let r = to_the_end(async move { images.images.remove(&q.name, q.force, || images.image_users()).await }).await?;
+    let name = q.name.clone();
+    let r = to_the_end(async move { images.images.remove(&name, q.force, || images.image_users()).await }).await?;
     for name in &r.untagged {
-        d.events.emit(EventKind::Image, "untag", name, Default::default());
+        d.events.emit(EventKind::Image, "untag", name, [("id".to_owned(), id.clone())].into());
     }
-    for gone in &r.deleted {
-        d.events.emit(EventKind::Image, "delete", gone, Default::default());
+    // One `delete` for the image, once its manifest is collected; not one
+    // per blob and snapshot that went with it.
+    if r.deleted.contains(&id) {
+        d.events.emit(EventKind::Image, "delete", &q.name, [("id".to_owned(), id)].into());
     }
     Ok(Json(r))
 }

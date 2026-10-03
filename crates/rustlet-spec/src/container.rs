@@ -280,7 +280,8 @@ pub struct ContainerSummary {
     /// While it runs: its published ports.
     pub ports: Vec<PublishedPort>,
     /// `--network`: where its network namespace comes from (its addresses
-    /// on bridge networks are the networks' to list).
+    /// on bridge networks are the networks' to list). `container:<id>`
+    /// names the other container by the full id it had at create.
     pub network_mode: NetworkMode,
 }
 

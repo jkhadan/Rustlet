@@ -29,6 +29,7 @@ created: string, state: ContainerState, labels: { [key in string]: string },
 ports: Array<PublishedPort>, 
 /**
  * `--network`: where its network namespace comes from (its addresses
- * on bridge networks are the networks' to list).
+ * on bridge networks are the networks' to list). `container:<id>`
+ * names the other container by the full id it had at create.
  */
 network_mode: NetworkMode, };

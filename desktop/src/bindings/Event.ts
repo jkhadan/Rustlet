@@ -3,12 +3,15 @@ import type { EventKind } from "./EventKind";
 
 /**
  * One event. Container actions: `create`, `start`, `die` (attributes
- * `exit_code`, `oom_killed`), `oom`, `stop`, `kill` (`signal`), `pause`,
- * `unpause`, `restart` (by the restart policy), `destroy`, `exec_create`,
- * `exec_start`, `exec_die` (`exec_id`, `exit_code`). Image actions: `pull`,
- * `untag`, `delete`. Every container event carries `name` and `image`.
- * Network actions: `create`, `destroy`, `connect` and `disconnect`
- * (attribute `container`); volume actions: `create`, `destroy`.
+ * `exit_code`, `oom_killed`; or `error`, when the restart policy couldn't
+ * start it again), `oom`, `stop`, `kill` (`signal`), `pause`, `unpause`,
+ * `restart` (by the restart policy), `destroy`, `exec_create`,
+ * `exec_start`, `exec_die` (`exec_id`, `exit_code`). Every container event
+ * carries `name` and `image`. Image actions, by name, with the image's
+ * digest in `id`: `pull`, `untag`, and `delete` once the image itself is
+ * gone (named as `rmi` was given it). Network actions: `create`,
+ * `destroy`, `connect` and `disconnect` (attribute `container`, running or
+ * not); volume actions: `create`, `destroy`.
  */
 export type Event = { 
 /**

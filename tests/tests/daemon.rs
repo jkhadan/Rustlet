@@ -762,3 +762,77 @@ fn dm_exec_hangup() {
         c.remove_container(&id, true).await.unwrap();
     });
 }
+
+/// Changes that no exit reports have events of their own (Phase 6: the
+/// desktop app learns of every change through events): stopping a
+/// container the restart policy is about to start, a restart that can't
+/// start it, and an image removed (one `delete`, not one per blob).
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dm_events_for_changes_without_an_exit() {
+    use rustlet_spec::event::{Event, EventKind};
+    let d = daemon();
+    block_on(async {
+        let c = d.client();
+        let mut events = c.events(&Default::default()).await.unwrap();
+        let mut next = async |what: &str, want: &dyn Fn(&Event) -> bool| loop {
+            let e = tokio::time::timeout(Duration::from_secs(20), events.next())
+                .await
+                .unwrap_or_else(|_| panic!("no event: waiting for {what}"))
+                .unwrap()
+                .unwrap();
+            if want(&e) {
+                return e;
+            }
+        };
+        let restarting = async |id: &str| {
+            for _ in 0..400 {
+                if status(&c, id).await == ContainerStatus::Restarting {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("{id} never waited to restart");
+        };
+
+        // Stopped while it waits to restart: after its fifth exit, the next
+        // start is 1.6 s away. No exit comes; the event says it.
+        let always = RestartPolicy::parse("always").unwrap();
+        let id = c.create_container(&ContainerConfig { restart: always, ..sh("exit 1") }).await.unwrap().id;
+        c.start(&id).await.unwrap();
+        for _ in 0..5 {
+            next("an exit", &|e| e.id == id && e.action == "die").await;
+        }
+        restarting(&id).await;
+        c.stop(&id, None).await.unwrap();
+        let e = next("stop", &|e| e.kind == EventKind::Container && e.id == id).await;
+        assert_eq!(e.action, "stop", "{e:?}");
+        assert_eq!(status(&c, &id).await, ContainerStatus::Exited);
+        c.remove_container(&id, false).await.unwrap();
+
+        // A restart that can't start it: its bind mount's source is gone.
+        let dir = std::env::temp_dir().join(format!("rustlet-itest-gone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bind = rustlet_spec::volume::MountSpec::parse_volume(&format!("{}:/x", dir.display())).unwrap();
+        let cfg = ContainerConfig { restart: always, mounts: vec![bind], ..sh("exit 1") };
+        let id = c.create_container(&cfg).await.unwrap().id;
+        c.start(&id).await.unwrap();
+        restarting(&id).await;
+        std::fs::remove_dir(&dir).unwrap();
+        let e = next("a die with an error", &|e| e.id == id && e.action == "die" && e.attributes.contains_key("error"))
+            .await;
+        assert!(!e.attributes["error"].is_empty(), "{e:?}");
+        assert_eq!(status(&c, &id).await, ContainerStatus::Exited);
+        c.remove_container(&id, false).await.unwrap();
+
+        // An image removed: its name untagged, then the image deleted, once.
+        c.remove_image("alpine", false).await.unwrap();
+        let untag = next("untag", &|e| e.kind == EventKind::Image).await;
+        assert_eq!(untag.action, "untag", "{untag:?}");
+        let delete = next("delete", &|e| e.kind == EventKind::Image).await;
+        assert_eq!((delete.action.as_str(), delete.id.as_str()), ("delete", "alpine"), "{delete:?}");
+        assert_eq!(delete.attributes.get("id"), untag.attributes.get("id"), "both name the image's digest");
+        let more = tokio::time::timeout(Duration::from_millis(500), events.next()).await;
+        assert!(more.is_err(), "nothing more: {more:?}");
+    });
+}
