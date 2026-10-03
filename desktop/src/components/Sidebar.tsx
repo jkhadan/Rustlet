@@ -92,7 +92,7 @@ function ConnectionIndicator() {
               <span className="font-medium">{connection.error.kind === "denied" ? "Permission denied" : "Not connected"}</span>
             </div>
           </Tooltip>
-          {connection.error.kind === "unreachable" && (
+          {(connection.error.kind === "unreachable" || connection.error.kind === "denied") && (
             <Button size="sm" onClick={start} disabled={starting} className="w-full">
               {starting ? <Spinner className="size-3" /> : <Power />} Start daemon
             </Button>

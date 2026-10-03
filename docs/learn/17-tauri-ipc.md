@@ -269,7 +269,10 @@ the log view turns ANSI escapes into styled spans, never into markup; the
 permission list is the second wall. The real boundary stays the
 daemon's socket: the app runs as the desktop user, so a user who may not
 use the daemon gets `denied` and a page explaining the `rustlet` group,
-never more power through the GUI.
+never more power through the GUI. (`denied` can also mean a stopped
+daemon: `connect()` fails with `EACCES` on a run directory that is still
+root's alone, before it could find that there is no socket, so that page
+offers to start the daemon too.)
 
 ## 5. Streams over channels
 

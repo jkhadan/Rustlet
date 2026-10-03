@@ -140,16 +140,20 @@ export function DaemonDown() {
           </>
         )}
       </p>
-      {denied ? (
+      {denied && (
         <pre className="bg-muted selectable w-full rounded-md p-3 text-left font-mono text-xs">
           {"sudo groupadd --system rustlet\nsudo usermod -aG rustlet $USER\nsudo systemctl restart rustletd\n# then log out and in again"}
         </pre>
-      ) : (
-        <Button variant="primary" onClick={start} disabled={starting}>
-          {starting ? <Spinner className="text-primary-foreground" /> : <Power />}
-          Start rustletd
-        </Button>
       )}
+      {denied && (
+        <p className="text-muted-foreground text-sm">
+          A stopped daemon can look the same: its run directory may be root's alone until it starts.
+        </p>
+      )}
+      <Button variant={denied ? "outline" : "primary"} onClick={start} disabled={starting}>
+        {starting ? <Spinner className={denied ? undefined : "text-primary-foreground"} /> : <Power />}
+        Start rustletd
+      </Button>
       {error && <p className="text-muted-foreground/80 selectable text-xs break-all">{error.message}</p>}
     </div>
   );
