@@ -25,6 +25,12 @@
 #   9. ufw (if installed): route rules for every bridge, removed with
 #      their network
 #  10. a daemon restart: the containers, their ports and DNS still work
+#  11. build: examples/hits as smoke-hits (pulls python:3-slim, RUN pip
+#      install with the network), its image runs; built again, from the
+#      cache
+#  12. compose: examples/hits up -d (redis healthy before web starts), its
+#      page counts visits through redis, ps shows web healthy, down -v
+#      removes everything
 #
 # Everything it creates is named smoke-* (rlsmoke for the namespace and
 # its veth) and removed at the end, also on failure.
@@ -64,6 +70,8 @@ cleanup() {
   $R rm -f smoke-web smoke-db smoke-api smoke-web6 >/dev/null 2>&1
   $R network rm smoke-net smoke-net2 smoke-net6 >/dev/null 2>&1
   $R volume rm smoke-vol >/dev/null 2>&1
+  $R compose -f examples/hits/compose.yaml -p smoke-hits down -v >/dev/null 2>&1
+  $R rmi smoke-hits smoke-hits-web >/dev/null 2>&1
   sudo -n ip link del rlsmoke0 >/dev/null 2>&1
   sudo -n ip netns del rlsmoke >/dev/null 2>&1
   # `ip netns add` made /run/netns a mount point; leave the host as it was.
@@ -195,6 +203,33 @@ echo "$out" | grep -q "^$DB_IP " && ok "names still resolve" || fail "after the 
 for _ in $(seq 1 50); do curl -fs -o /dev/null -g "http://[::1]:$PORT6/" && break; sleep 0.2; done
 check "smoke-web6's port answers on [::1] again" curl -fsS -g "http://[::1]:$PORT6/"
 check "and from the LAN over IPv6" sudo -n ip netns exec rlsmoke curl -fsS -m 3 -g "http://[2001:db8:5::2]:$PORT6/"
+
+say "11. build"
+if $R build -t smoke-hits examples/hits >/tmp/smoke-build.$$ 2>&1; then
+  ok "examples/hits built ($(grep -c '^Step ' /tmp/smoke-build.$$) steps)"
+else
+  fail "build examples/hits: $(tail -3 /tmp/smoke-build.$$)"
+fi
+check "its image has the redis client" $R run --rm smoke-hits python -c 'import redis'
+$R build -t smoke-hits examples/hits >/tmp/smoke-build.$$ 2>&1
+cached=$(grep -c 'Using cache' /tmp/smoke-build.$$)
+[ "$cached" -ge 2 ] && ok "built again: $cached steps from the cache" || fail "built again: $cached steps from the cache"
+rm -f /tmp/smoke-build.$$
+
+say "12. compose"
+C="$R compose -f examples/hits/compose.yaml -p smoke-hits"
+$C up -d >/tmp/smoke-compose.$$ 2>&1 || fail "compose up: $(tail -3 /tmp/smoke-compose.$$)"
+rm -f /tmp/smoke-compose.$$
+first=$(curl -fsS http://127.0.0.1:8000/ 2>&1)
+second=$(curl -fsS http://127.0.0.1:8000/ 2>&1)
+echo "$first" | grep -q 'seen 1 times' && echo "$second" | grep -q 'seen 2 times' \
+  && ok "the page counts through redis" || fail "the page said '$first' then '$second'"
+for _ in $(seq 1 100); do $C ps | grep -q 'healthy' && break; sleep 0.2; done
+check "compose ps shows web healthy" sh -c "$C ps | grep smoke-hits-web-1 | grep -q '(healthy)'"
+$C down -v >/dev/null 2>&1 || fail "compose down"
+check "down removed the containers" sh -c "! $R ps -a | grep -q smoke-hits-"
+check "and the network" sh -c "! $R network ls | grep -q smoke-hits_default"
+check "and the volume (-v)" sh -c "! $R volume ls | grep -q smoke-hits_data"
 
 if [ "$FAILED" = 0 ]; then say "all checks passed"; else say "SOME CHECKS FAILED"; fi
 exit "$FAILED"
