@@ -726,6 +726,33 @@ fn dm_exec_hangup() {
         assert_eq!(got.exit, Some(129), "{got:?}");
         assert_eq!(c.inspect_exec(&exec).await.unwrap().exit_code, Some(129));
 
+        // As the desktop app closes a tab: hang up and go at once. The
+        // daemon still hears the exit, and records it, through the output
+        // that nobody reads any more (the trap's).
+        let script = "trap 'echo bye; exit 3' HUP; echo rea''dy; while :; do sleep 0.1; done";
+        let trapping = ExecConfig { cmd: vec!["sh".into(), "-c".into(), script.into()], ..shell.clone() };
+        let exec = c.create_exec(&id, &trapping).await.unwrap().id;
+        let (mut tx, mut rx) = c.start_exec(&exec).await.unwrap().split();
+        let mut seen = String::new();
+        while !seen.contains("ready") {
+            match tokio::time::timeout(Duration::from_secs(20), rx.recv()).await.expect("no output") {
+                Ok(Some(SessionEvent::Stdout(b))) => seen.push_str(&String::from_utf8_lossy(&b)),
+                other => panic!("{other:?} before the trap was set: {seen:?}"),
+            }
+        }
+        tx.hangup().await.unwrap();
+        tx.close().await.unwrap();
+        drop(rx);
+        let mut code = None;
+        for _ in 0..50 {
+            code = c.inspect_exec(&exec).await.unwrap().exit_code;
+            if code.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(code, Some(3), "the exit of an exec whose client hung up and left");
+
         let (mut tx, rx) = c.attach(&id, true).await.unwrap().split();
         tx.hangup().await.unwrap();
         tx.close().await.unwrap();

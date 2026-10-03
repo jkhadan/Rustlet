@@ -8,6 +8,7 @@
 //! registration happens before the upgrade's `101`: a client may send the
 //! start as soon as it has that, before the upgraded connection is served.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{Message, WebSocket};
@@ -157,9 +158,16 @@ pub enum Peer {
     Exec,
 }
 
+/// How long an exec whose client hung up and left may take to exit, for its
+/// exit to be recorded all the same. One that ignores `SIGHUP` runs on,
+/// detached.
+const HANGUP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Copies between the client and the shim until the process exits (the
 /// exit is the last thing sent) or the client goes away (detaching: the
-/// process goes on).
+/// process goes on). A client that hung up first (`Control::Hangup`) may
+/// leave at once: its exec's exit, which the `SIGHUP` brings, is still
+/// waited for and handed to `before_exit`.
 pub async fn bridge(
     mut sink: Sink,
     mut source: Source,
@@ -169,6 +177,7 @@ pub async fn bridge(
     before_exit: impl AsyncFnOnce(&ExitStatus),
 ) -> Option<ExitStatus> {
     let (mut reader, mut writer) = stream.split();
+    let hung_up = AtomicBool::new(false);
     let to_client = async {
         loop {
             let message = match reader.recv().await {
@@ -187,7 +196,9 @@ pub async fn bridge(
                     return None;
                 }
             };
-            if sink.send(message).await.is_err() {
+            // After a hangup, a client that is gone is no reason to stop:
+            // the exit is still to come.
+            if sink.send(message).await.is_err() && !hung_up.load(Ordering::Relaxed) {
                 return None;
             }
         }
@@ -208,7 +219,11 @@ pub async fn bridge(
                 Message::Text(t) => match serde_json::from_str::<Control>(&t) {
                     Ok(Control::Resize { rows, cols }) => writer.resize(rows, cols).await.is_ok(),
                     Ok(Control::StdinEof) => writer.close_stdin().await.is_ok(),
-                    Ok(Control::Hangup) if peer == Peer::Exec => writer.signal(libc::SIGHUP).await.is_ok(),
+                    Ok(Control::Hangup) if peer == Peer::Exec => {
+                        let sent = writer.signal(libc::SIGHUP).await.is_ok();
+                        hung_up.fetch_or(sent, Ordering::Relaxed);
+                        sent
+                    }
                     _ => true,
                 },
                 _ => true,
@@ -216,9 +231,14 @@ pub async fn bridge(
             shim_open &= sent;
         }
     };
+    let mut to_client = std::pin::pin!(to_client);
     tokio::select! {
-        exit = to_client => exit,
-        () = from_client => None,
+        exit = &mut to_client => exit,
+        () = from_client => if hung_up.load(Ordering::Relaxed) {
+            tokio::time::timeout(HANGUP_GRACE, to_client).await.ok().flatten()
+        } else {
+            None
+        },
     }
 }
 
