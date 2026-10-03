@@ -97,10 +97,10 @@ export function StatsTab({ container, running }: { container: ContainerInspect; 
       </div>
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
         <ChartCard title="CPU" legend={[["CPU", COLORS.cpu, percent(point.cpu)]]}>
-          <Chart data={charts.cpu} series={[{ label: "CPU", color: COLORS.cpu }]} format={(v) => `${v.toFixed(0)}%`} />
+          <Chart data={charts.cpu} series={[{ label: "CPU", color: COLORS.cpu }]} format={(v) => `${v.toFixed(v < 10 ? 1 : 0)}%`} floor={5} />
         </ChartCard>
         <ChartCard title="Memory" legend={[["in use", COLORS.memory, bytes(point.memory)]]}>
-          <Chart data={charts.memory} series={[{ label: "Memory", color: COLORS.memory }]} format={(v) => bytes(v, 0)} max={latest.memory_max ?? undefined} />
+          <Chart data={charts.memory} series={[{ label: "Memory", color: COLORS.memory }]} format={(v) => bytes(v, 0)} max={latest.memory_max ?? undefined} floor={16 << 20} />
         </ChartCard>
         <ChartCard
           title="Network"
@@ -116,6 +116,7 @@ export function StatsTab({ container, running }: { container: ContainerInspect; 
               { label: "tx", color: COLORS.tx },
             ]}
             format={(v) => `${bytes(v, 0)}/s`}
+            floor={4096}
           />
         </ChartCard>
         <ChartCard
@@ -132,6 +133,7 @@ export function StatsTab({ container, running }: { container: ContainerInspect; 
               { label: "write", color: COLORS.write },
             ]}
             format={(v) => `${bytes(v, 0)}/s`}
+            floor={4096}
           />
         </ChartCard>
       </div>

@@ -13,7 +13,7 @@ import { Empty, Mono, Spinner } from "@/components/ui/misc";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useNow } from "@/lib/daemon";
-import { ago, bytes } from "@/lib/format";
+import { ago, bytes, plural } from "@/lib/format";
 import { api } from "@/lib/ipc";
 import { useContainers, useVolumes } from "@/lib/queries";
 
@@ -62,7 +62,7 @@ export function VolumesPage() {
       {dialog}
       <PageHeader
         title="Volumes"
-        subtitle={volumes.data ? `${volumes.data.length} volumes · ${volumes.data.filter((v) => v.containers.length === 0).length} unused` : " "}
+        subtitle={volumes.data ? `${plural(volumes.data.length, "volume")} · ${volumes.data.filter((v) => v.containers.length === 0).length} unused` : " "}
         actions={
           <>
             <Button onClick={() => void prune()}>

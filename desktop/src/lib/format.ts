@@ -145,6 +145,11 @@ export function isLive(c: Pick<ContainerSummary, "state">): boolean {
   return c.state.status === "running" || c.state.status === "paused";
 }
 
+/** "1 volume", "2 volumes". */
+export function plural(n: number, word: string): string {
+  return `${n} ${word}${n === 1 ? "" : "s"}`;
+}
+
 export function percent(n: number, digits = 1): string {
   return Number.isFinite(n) ? `${n.toFixed(digits)}%` : "–";
 }

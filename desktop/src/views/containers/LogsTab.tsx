@@ -124,7 +124,7 @@ export function LogsTab({ container }: { container: ContainerInspect }) {
         <Checkbox checked={timestamps} onChange={setTimestamps} label="Timestamps" />
         <label className="flex items-center gap-2 text-sm">
           Last
-          <Select value={tail} onChange={(e) => setTail(e.target.value)} className="w-24">
+          <Select value={tail} onChange={(e) => setTail(e.target.value)} className="w-28">
             <option value="100">100</option>
             <option value="1000">1000</option>
             <option value="10000">10000</option>

@@ -64,6 +64,22 @@ export class WebDriver {
     }, timeout, `an element ${css}`);
   }
 
+  /** The first element matching an XPath expression, waiting for one. */
+  async findXPath(xpath, timeout = 10_000) {
+    return this.waitFor(async () => {
+      const v = await this.#call("POST", this.#s("/element"), { using: "xpath", value: xpath }).catch((e) => {
+        if (e.code === "no such element") return null;
+        throw e;
+      });
+      return v ? v[ELEMENT] : null;
+    }, timeout, `an element ${xpath}`);
+  }
+
+  /** The button whose text is `text`. */
+  button(text, timeout) {
+    return this.findXPath(`//button[normalize-space(.)=${JSON.stringify(text)}]`, timeout);
+  }
+
   async findAll(css) {
     const v = await this.#call("POST", this.#s("/elements"), { using: "css selector", value: css });
     return v.map((e) => e[ELEMENT]);
@@ -75,6 +91,23 @@ export class WebDriver {
 
   async type(el, text) {
     await this.#call("POST", this.#s(`/element/${el}/value`), { text });
+  }
+
+  /** Picks `value` in the `<select>` matching `css`. WebKitWebDriver
+   * can't click the options of a native select, and React ignores a plain
+   * `.value =`: the native setter plus a change event is what it sees. */
+  async select(css, value) {
+    await this.find(css);
+    const ok = await this.exec(
+      `const el = document.querySelector(arguments[0]);
+       if (![...el.options].some((o) => o.value === arguments[1])) return false;
+       Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set.call(el, arguments[1]);
+       el.dispatchEvent(new Event("change", { bubbles: true }));
+       return true;`,
+      css,
+      value,
+    );
+    if (!ok) throw new Error(`no option ${value} in ${css}`);
   }
 
   async text(el) {

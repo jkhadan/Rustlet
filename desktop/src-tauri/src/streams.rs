@@ -18,12 +18,16 @@
 //! that has an id has started. After that, a stream ends with one last
 //! message, `end` or `error`.
 //!
-//! **Batching.** A channel message is a JavaScript call in the webview, so
-//! a burst (the last 1000 lines of a log, or a busy container) would cost a
-//! call per line. [`forward`] waits for the first item, then takes every
-//! item that has *already* arrived (`now_or_never`), up to [`MAX_BATCH`],
-//! and sends them together. A quiet stream gets each item at once; a busy
-//! one gets fewer, bigger messages, with no timer adding latency.
+//! **Batching.** A channel message is a JavaScript call in the webview and,
+//! on the other side, a render, so a burst (the last 1000 lines of a log, a
+//! busy container) would cost a call and a render per line. [`forward`]
+//! waits for the first item, then collects what else arrives within
+//! [`BATCH_WINDOW`] (or up to [`MAX_BATCH`] items) and sends it all as one
+//! message. Taking only what had already arrived wasn't enough: the daemon
+//! writes a log line at a time, more slowly than the app reads them, and
+//! 591 lines came as 436 messages. The window costs a lone item at most
+//! 10 ms, which nobody sees in a log or a chart; terminal output, where a
+//! keystroke's echo should be immediate, is not batched (terminal.rs).
 //!
 //! **The daemon itself** ([`watch_daemon`]): one events stream for the
 //! whole app, kept open by reconnecting with backoff. Its `connected` and
@@ -37,7 +41,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use futures::{FutureExt, Stream, StreamExt};
+use futures::{Stream, StreamExt};
 use rustlet_client::Client;
 use rustlet_spec::event::{Event, EventsQuery};
 use rustlet_spec::system::Version;
@@ -52,6 +56,9 @@ pub type StreamId = u32;
 
 /// At most this many items per message.
 pub const MAX_BATCH: usize = 512;
+
+/// How long a batch waits for more items after its first.
+pub const BATCH_WINDOW: Duration = Duration::from_millis(10);
 
 /// Reconnecting to the daemon: the first retry after this, doubling up to
 /// [`MAX_RETRY`].
@@ -141,14 +148,16 @@ where
     }
 }
 
-/// Waits for an item, then takes what else has arrived. The second value is
-/// the stream's last message, once it has ended or failed.
+/// Waits for an item, then takes what else arrives within [`BATCH_WINDOW`].
+/// The second value is the stream's last message, once it has ended or
+/// failed.
 async fn next_batch<T, S>(stream: &mut S) -> (Vec<T>, Option<StreamMessage<T>>)
 where
     S: Stream<Item = rustlet_client::Result<T>> + Unpin,
 {
     let mut batch = Vec::new();
     let mut next = stream.next().await;
+    let window = tokio::time::Instant::now() + BATCH_WINDOW;
     loop {
         match next {
             Some(Ok(item)) => batch.push(item),
@@ -158,9 +167,11 @@ where
         if batch.len() >= MAX_BATCH {
             return (batch, None);
         }
-        match stream.next().now_or_never() {
-            Some(item) => next = item,
-            None => return (batch, None),
+        // `next()` of a Stream is cancel-safe: one that times out loses
+        // nothing, the item stays in the stream for the next batch.
+        match tokio::time::timeout_at(window, stream.next()).await {
+            Ok(item) => next = item,
+            Err(_) => return (batch, None),
         }
     }
 }
@@ -296,6 +307,22 @@ mod tests {
         drop(tx);
         task.await.unwrap();
         assert_eq!(got.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn what_arrives_within_the_window_goes_together() {
+        let (channel, got) = recorder();
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let task = tokio::spawn(forward(rx, channel));
+        // A line every 2 ms, as the daemon writes a log: one message.
+        for n in 1..=4 {
+            tx.unbounded_send(Ok(n)).unwrap();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        tokio::time::sleep(BATCH_WINDOW).await;
+        assert_eq!(*got.lock().unwrap(), [serde_json::json!({"type": "items", "items": [1, 2, 3, 4]})]);
+        drop(tx);
+        task.await.unwrap();
     }
 
     #[tokio::test]

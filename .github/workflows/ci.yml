@@ -18,18 +18,42 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: fmt
         run: cargo fmt --all --check
+      # The desktop app needs WebKitGTK to build: its own job, below.
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude rustlet-desktop --all-targets -- -D warnings
       - name: unit tests (unprivileged)
-        run: cargo nextest run --workspace
+        run: cargo nextest run --workspace --exclude rustlet-desktop
       - name: the desktop app's TypeScript types match rustlet-spec
         run: cargo xtask gen-ts --check
       - name: unsafe stays inside rustlet-sys
         run: |
           # every crate but rustlet-sys must forbid unsafe at the crate root
-          for f in $(git ls-files 'crates/*/src/lib.rs' 'crates/*/src/main.rs' xtask/src/main.rs tests/src/lib.rs | grep -v rustlet-sys); do
+          for f in $(git ls-files 'crates/*/src/lib.rs' 'crates/*/src/main.rs' xtask/src/main.rs tests/src/lib.rs desktop/src-tauri/src/lib.rs desktop/src-tauri/src/main.rs | grep -v rustlet-sys); do
             grep -q '#!\[forbid(unsafe_code)\]' "$f" || { echo "missing forbid(unsafe_code): $f"; exit 1; }
           done
+
+  desktop:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: taiki-e/install-action@nextest
+      - name: frontend (types, tests, bundle)
+        working-directory: desktop
+        run: pnpm install --frozen-lockfile && pnpm typecheck && pnpm test && pnpm build
+      - name: clippy
+        run: cargo clippy -p rustlet-desktop --all-targets -- -D warnings
+      - name: unit tests
+        run: cargo nextest run -p rustlet-desktop
 
   itest:
     # Privileged integration tests need root, cgroup v2 delegation and a

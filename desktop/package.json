@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "packageManager": "pnpm@12.6.0",
   "description": "Rustlets Desktop: the GUI for rustletd (Tauri v2 + React)",
   "scripts": {
     "dev": "vite",

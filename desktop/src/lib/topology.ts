@@ -1,8 +1,9 @@
 // The networks view's graph: the host on top, its bridge networks below it,
 // and the running containers below their networks, an edge per interface
 // (labelled with its address). A container on the host's network hangs off
-// the host, one in another's namespace off that container. Laid out in
-// three rows; each container sits under the middle of its networks.
+// the host, beside the networks; one in another's namespace hangs below
+// that container, in a fourth row. Each container sits under the middle of
+// its networks.
 
 import type { ContainerSummary, Network } from "@/bindings";
 
@@ -106,18 +107,30 @@ export function buildTopology(networks: Network[], containers: ContainerSummary[
   row2.forEach((r, i) => {
     nodes.push(containerNode(r.c, placed[i], y2));
     for (const e of r.eps) {
-      edges.push({ id: `${e.netId}-${r.c.id}`, source: `net:${e.netId}`, target: `ctr:${r.c.id}`, label: e.ip });
-    }
-  });
-  joined.forEach((c) => {
-    nodes.push(containerNode(c, next(), y2));
-    const target = c.network_mode.slice("container:".length);
-    const owner = running.find((o) => o.id === target || o.name === target || o.id.startsWith(target));
-    if (owner) {
-      edges.push({ id: `share-${c.id}`, source: `ctr:${owner.id}`, target: `ctr:${c.id}`, label: "shares its namespace", dashed: true });
+      edges.push({ id: `${e.netId}-${r.c.id}`, source: `net:${e.netId}`, target: `ctr:${r.c.id}`, label: e.ip.replace(/\/\d+$/, "") });
     }
   });
   isolated.forEach((c) => nodes.push(containerNode(c, next(), y2)));
+  // Row 3: under the container whose namespace each one joined.
+  const ownerOf = (c: ContainerSummary) => {
+    const target = c.network_mode.slice("container:".length);
+    return running.find((o) => o.id === target || o.name === target || o.id.startsWith(target));
+  };
+  const placedAt = new Map(nodes.map((n) => [n.id, n.x]));
+  const row3 = joined
+    .map((c) => ({ c, owner: ownerOf(c) }))
+    .map((j) => ({ ...j, want: (j.owner && placedAt.get(`ctr:${j.owner.id}`)) ?? next() }))
+    .sort((a, b) => a.want - b.want);
+  const xs3 = spread(
+    row3.map((j) => j.want),
+    LAYOUT.colGap,
+  );
+  row3.forEach((j, i) => {
+    nodes.push(containerNode(j.c, xs3[i], LAYOUT.rowGap * 3));
+    if (j.owner) {
+      edges.push({ id: `share-${j.c.id}`, source: `ctr:${j.owner.id}`, target: `ctr:${j.c.id}`, label: "same network namespace", dashed: true });
+    }
+  });
   return { nodes, edges };
 }
 

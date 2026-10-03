@@ -18,6 +18,7 @@ export function Chart({
   height = 140,
   min,
   max,
+  floor = 1,
 }: {
   /** `[x (unix seconds), ...one column per series]`. */
   data: number[][];
@@ -26,6 +27,9 @@ export function Chart({
   height?: number;
   min?: number;
   max?: number;
+  /** The top of the y axis is at least this (an idle container's chart
+   * still has a scale). */
+  floor?: number;
 }) {
   const host = useRef<HTMLDivElement>(null);
   const plot = useRef<uPlot | null>(null);
@@ -49,7 +53,7 @@ export function Chart({
       cursor: { drag: { x: false, y: false }, points: { size: 6 } },
       scales: {
         x: { time: true },
-        y: { range: (_u, lo, hi) => [min ?? Math.min(0, lo), Math.max(max ?? 0, hi * 1.1 || 1)] },
+        y: { range: (_u, lo, hi) => [min ?? Math.min(0, lo), Math.max(max ?? 0, floor, hi * 1.1)] },
       },
       axes: [
         { ...axis, space: 60 },
@@ -78,7 +82,7 @@ export function Chart({
       plot.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, height, min, max]);
+  }, [key, height, min, max, floor]);
 
   useEffect(() => {
     plot.current?.setData(data as uPlot.AlignedData);

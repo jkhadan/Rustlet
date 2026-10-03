@@ -111,8 +111,7 @@ export function TopologyGraph({
       target: e.target,
       label: e.label,
       type: "smoothstep",
-      animated: !e.dashed,
-      style: e.dashed ? { strokeDasharray: "5 4" } : undefined,
+      style: e.dashed ? { strokeDasharray: "5 4" } : { strokeWidth: 1.5 },
       labelStyle: { fontFamily: "var(--font-mono)", fontSize: 10, fill: "var(--muted-foreground)" },
       labelBgStyle: { fill: "var(--card)" },
       markerEnd: { type: MarkerType.ArrowClosed, width: 14, height: 14 },
@@ -121,7 +120,7 @@ export function TopologyGraph({
   }, [networks, containers, selected]);
 
   return (
-    <div className="h-[440px]" data-testid="topology">
+    <div className="h-[480px]" data-testid="topology">
       <ReactFlow
         nodes={nodes}
         edges={edges}

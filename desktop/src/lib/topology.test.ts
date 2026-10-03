@@ -62,11 +62,13 @@ describe("topology", () => {
     // a is on both networks: between them; b only on backend.
     expect(node("ctr:a").x).toBeLessThan(node("ctr:b").x);
     expect(edges.filter((e) => e.target === "ctr:a").map((e) => e.label).sort()).toEqual(["10.89.0.2", "10.89.1.3"]);
+    expect(buildTopology([net("n1", "bridge", [["a", "10.89.0.2/24"]])], [ctr("a")]).edges[1].label).toBe("10.89.0.2");
     // Host mode hangs off the host, in the networks' row.
     expect(node("ctr:h").y).toBe(LAYOUT.rowGap);
     expect(edges.find((e) => e.target === "ctr:h")).toMatchObject({ source: "host", dashed: true });
-    // Another's namespace: an edge from its owner.
+    // Another's namespace: below its owner, with an edge from it.
     expect(edges.find((e) => e.target === "ctr:j")).toMatchObject({ source: "ctr:a", dashed: true });
+    expect(node("ctr:j")).toMatchObject({ x: node("ctr:a").x, y: LAYOUT.rowGap * 3 });
     // No network: a node, no edge. Stopped containers aren't drawn.
     expect(node("ctr:x").flags).toEqual(["no network"]);
     expect(edges.some((e) => e.target === "ctr:x")).toBe(false);

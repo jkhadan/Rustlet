@@ -11,7 +11,7 @@ import { Empty, Mono, Spinner } from "@/components/ui/misc";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useNow } from "@/lib/daemon";
-import { ago, bytes, imageName, shortId } from "@/lib/format";
+import { ago, bytes, imageName, plural, shortId } from "@/lib/format";
 import { api } from "@/lib/ipc";
 import { useContainers, useImages } from "@/lib/queries";
 
@@ -59,7 +59,7 @@ export function ImagesPage() {
       {dialog}
       <PageHeader
         title="Images"
-        subtitle={images.data ? `${images.data.length} images · ${bytes(total)} compressed` : " "}
+        subtitle={images.data ? `${plural(images.data.length, "image")} · ${bytes(total)} compressed` : " "}
         actions={
           <Button variant="primary" onClick={() => setPulling(true)} data-testid="open-pull">
             <Download /> Pull
