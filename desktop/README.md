@@ -61,7 +61,7 @@ sudo systemd-run --unit=rustletd-dev -p Type=notify -p Delegate=yes -p DelegateS
 ## Build
 
 ```sh
-pnpm tauri build      # target/release/bundle/{deb,appimage}/
+pnpm tauri build      # ../target/release/bundle/{deb,appimage}/ (the workspace's target/)
 ```
 
 ## End-to-end

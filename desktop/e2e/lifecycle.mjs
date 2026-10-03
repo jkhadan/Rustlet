@@ -157,8 +157,11 @@ try {
   });
 
   await check("a network the CLI creates appears; connecting from the GUI gives the container an interface", async () => {
-    if (!rustlet("network", "create", "e2e-net")) throw new Error("rustlet network create failed");
+    // The page first, so that the new row comes from the event, not from
+    // the page's first fetch.
     await d.go("/networks");
+    await d.find('[data-testid="network-row"][data-name="bridge"]', 5_000);
+    if (!rustlet("network", "create", "e2e-net")) throw new Error("rustlet network create failed");
     // A table row isn't "interactable" to WebKitWebDriver; its first cell is.
     await d.click(await d.find('[data-testid="network-row"][data-name="e2e-net"] td', 5_000));
     const id = JSON.parse(rustlet("inspect", "e2e-cli"))[0].id;
@@ -187,8 +190,16 @@ try {
   if (process.env.E2E_RESTART) {
     await check("after a daemon restart the app reconnects and follows the CLI again", async () => {
       await d.go("/containers");
+      const connected = '[data-testid="connection"][data-state="connected"]';
+      const before = Number(await d.attribute(await d.find(connected), "data-generation"));
       execFileSync("sh", ["-c", process.env.E2E_RESTART], { stdio: "ignore" });
-      await d.find('[data-testid="connection"][data-state="connected"]', 20_000);
+      // A connection made since: the indicator says "connected" before
+      // the restart too.
+      await d.waitFor(
+        () => d.exec(`return Number(document.querySelector(arguments[0])?.dataset.generation ?? 0)`, connected).then((g) => g > before),
+        20_000,
+        "a new connection to the daemon",
+      );
       // The container outlived the restart, and new events arrive.
       await d.waitFor(async () => (await rowStatus("e2e-cli")) === "running", 10_000, "e2e-cli still running");
       if (rustlet("pause", "e2e-cli") == null) throw new Error("rustlet pause failed");

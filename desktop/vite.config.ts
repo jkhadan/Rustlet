@@ -2,7 +2,7 @@
 // Vite serves the frontend to the webview in development (`pnpm tauri dev`
 // starts it on port 1420, the `devUrl` of tauri.conf.json) and bundles it
 // into dist/ for `pnpm tauri build`. Vitest runs the unit tests with the
-// same configuration, in jsdom.
+// same configuration, in Node (a component test opts into jsdom).
 import { fileURLToPath, URL } from "node:url";
 
 import tailwindcss from "@tailwindcss/vite";

@@ -442,7 +442,8 @@ Three shapes of response:
   detaches, as Docker's does, and the process runs on; since Phase 6 an
   exec client can first send `hangup`, and the process gets `SIGHUP`,
   as a shell does when its terminal window closes ([chapter
-  17](17-tauri-ipc.md) §7).
+  17](17-tauri-ipc.md) §7). It may close the socket right after: the
+  daemon still waits a few seconds for the exit, and records it.
 
 Errors carry a kind besides the message, and the kind gives a CLI its
 exit code, as Docker's does: 125 when Rustlets fails ("no such image"),

@@ -24,13 +24,18 @@ type generation in [`xtask/src/gents.rs`](../../xtask/src/gents.rs) and
 [`isolation.rs`](../../crates/rustletd/src/isolation.rs), the `hangup`
 control ([`attach.rs`](../../crates/rustletd/src/attach.rs) `bridge`, the
 shim's [`reaper.rs`](../../crates/rustlet-shim/src/reaper.rs) `signal`).
-Tests: 28 Vitest tests in `desktop/src/lib/*.test.ts`, 11 Rust tests in
-`rustlet-desktop`, `dm_isolation_report` and `dm_exec_hangup` in
-[`daemon.rs`](../../tests/tests/daemon.rs), and the end-to-end scenario
+Tests: 74 Vitest tests (the logic in `desktop/src/lib/*.test.ts`, the
+views in `desktop/src/**/*.test.tsx`), 11 Rust tests in `rustlet-desktop`,
+`dm_isolation_report`, `dm_exec_hangup` and
+`dm_events_for_changes_without_an_exit` in
+[`daemon.rs`](../../tests/tests/daemon.rs),
+`dn_events_and_summaries_for_the_desktop_app` in
+[`daemon_network.rs`](../../tests/tests/daemon_network.rs), and the end-to-end scenario
 [`desktop/e2e/lifecycle.mjs`](../../desktop/e2e/lifecycle.mjs). Design:
 [architecture.md §2.8](../architecture.md#28-rustlets-desktop-tauri-v2--reactts).
 
-The transcripts were recorded on 2026-10-02 with a debug build of the app
+The transcripts were recorded on 2026-10-02 (§5's stream and §9's run
+again on 2026-10-03, after the phase's review) with a debug build of the app
 on a private Xvfb display (§9 says why), against a daemon of the same
 build run as a transient unit with its socket in the user's group, on
 kernel 7.0.0-34-generic. Tauri is 2.12.1, WebKitGTK 2.52.6.
@@ -85,9 +90,11 @@ everything goes through the Rust process:
 
 The Rust side is small on purpose. `commands.rs` has one function per API
 call, each a wrapper over the client of chapter 13: the API's own types
-in, the API's own types out. All the policy (what a stop means, what a
-restart policy does) stays in the daemon, so the window and the CLI can't
-disagree about it.
+in, the API's own types out. The few others are the app's own (the socket
+it uses, starting the service, the run dialog's `-p`/`-v` parsing,
+cancelling a stream, a terminal's input, size and close). All the policy
+(what a stop means, what a restart policy does) stays in the daemon, so
+the window and the CLI can't disagree about it.
 
 ## 2. A command, end to end
 
@@ -155,15 +162,20 @@ invoke("no_such_command")
 ```
 
 The second is our error type (`error.rs`): `kind` is the daemon's
-`ErrorKind` as the API spells it, or `unreachable` (nothing listens on
-the socket) or `denied` (the socket isn't this user's), which the client
-tells apart by the `io::ErrorKind` of the failed `connect()`. The
+`ErrorKind` as the API spells it; or `unreachable` (nothing listens on
+the socket) or `denied` (the socket isn't this user's), which `error.rs`
+tells apart by the `io::ErrorKind` of the failed `connect()` inside the
+client's error; or `invalid` (the run dialog's `-p`/`-v` values) or
+`failed` (anything else: a broken connection, a protocol error). The
 frontend acts on the kind: `no_such_image` makes the run dialog pull and
 try again, as `rustlet run` does; `unreachable` shows "Start rustletd".
-The last two are Tauri's own refusals, which §4 explains.
+The last two are Tauri's own refusals, which §4 explains. (A release
+build says less: `Command … not allowed by ACL`, without the permission
+to ask for.)
 
 **Where a command runs.** An `async` command is spawned on Tauri's Tokio
-runtime; a plain `fn` runs on the main thread, GTK's, before the reply.
+runtime, its arguments deserialized there too; a plain `fn` runs on the
+main thread, GTK's, before the reply.
 That difference cost a crash. `daemon_watch` (§6) is a plain `fn` that
 starts a task, and the task was started with `tokio::spawn`. The first
 time the app ran:
@@ -199,6 +211,7 @@ declaration per type, the Rust doc comments carried over as JSDoc:
 export type PullEvent = { "status": "resolving", reference: string, }
   | { "status": "downloading", kind: BlobKind, digest: string, current: number, total: number, }
   | { "status": "unpacked", chain_id: string, entries: number, bytes: number, … }
+  | …                                         // resolved, exists, downloaded, done, layer_exists, unpacking
   | { "status": "ready", reference: string, manifest: string, }
   | { "status": "error", message: string, };
 ```
@@ -223,9 +236,10 @@ The files are committed, so the frontend builds without Rust, and CI runs
 `cargo xtask gen-ts --check`, which generates them again into a scratch
 directory and fails on any difference. The few types the desktop crate
 defines itself (`CommandError`, the channel messages of §5 and §6) are
-written out in `src/lib/ipc.ts`; Rust tests pin their JSON
-(`daemon_messages_are_tagged`, `messages_are_tagged`), so a change on one
-side fails a test.
+written out by hand in `src/lib/ipc.ts`. Rust tests pin the JSON the Rust
+side sends (`daemon_messages_are_tagged`, `messages_are_tagged`), so a
+change there fails a test that points at `ipc.ts`; nothing checks the
+TypeScript copy itself.
 
 ## 4. What the page may call
 
@@ -253,8 +267,10 @@ commands.allow = ["container_stop"]
 Once an app declares its commands this way, a command no capability
 grants is refused. `capabilities/main.json` grants the `main` window
 exactly the 40 commands and `core:default`: the default sets of Tauri's
-core plugins (the app, events, paths, the window and webview, menus, the
-tray, images, resources), mostly getters. The
+core plugins. For the window, the webview and the app those are getters;
+but they also let the page emit and listen to events, resolve paths, and
+use the menu, tray and image APIs (creating a menu, setting a tray icon,
+loading an image from a path). None of them reaches the daemon. The
 build checks the capability: a misspelt permission fails `cargo build`,
 not the app. That is what refused `window.set_title` in §2: it is a core
 command, but `core:default` doesn't include changing the title. And
@@ -299,18 +315,21 @@ lines of a container's log, without `follow`:
 { "returned": 2,
   "messages": [
     { "index": 0, "message": { "type": "items", "items": [
-        { "stream": "stdout", "ts": "2026-10-03T01:01:07.087192481Z",
-          "log": "\u001b[1;31mERROR\u001b[0m connection refused\n" } ] } },
-    { "index": 1, "message": { "type": "items", "items": [ { "stream": "stdout", "…": "…" } ] } },
-    { "index": 2, "message": { "type": "items", "items": [ { "stream": "stderr", "log": "to stderr\n", "…": "…" } ] } },
-    { "index": 3, "message": { "type": "end" } },
-    { "index": 4, "end": true } ] }
+        { "stream": "stdout", "ts": "2026-10-03T07:15:32.151529917Z",
+          "log": "\u001b[1;31mERROR\u001b[0m connection refused\n" },
+        { "stream": "stdout", "ts": "2026-10-03T07:15:32.151565638Z",
+          "log": "\u001b[32mok\u001b[0m retrying\n" },
+        { "stream": "stderr", "ts": "2026-10-03T07:15:32.151588669Z",
+          "log": "to stderr\n" } ] } },
+    { "index": 1, "message": { "type": "end" } },
+    { "end": true, "index": 2 } ] }
 ```
 
-`returned: 2` is the command's own result, the stream's id. Messages 0 to
-3 are ours (`StreamMessage` in `streams.rs`: `items`, then `end` or
-`error`); message 4 is Tauri's, sent when the forwarding task finished and
-dropped the channel.
+`returned: 2` is the command's own result, the stream's id. Messages 0
+and 1 are ours (`StreamMessage` in `streams.rs`: `items`, then `end` or
+`error`); message 2 is Tauri's, sent when the forwarding task finished and
+dropped the channel. The three lines came in one message: they arrived
+within 10 ms of each other (batching, below).
 
 **How a stream starts and stops.** `container_logs` asks the client for
 the logs first, so an error the daemon gives before streaming (no such
@@ -334,7 +353,9 @@ and an id that arrives after its cleanup is cancelled at once.
 and on the page each is a React state update, so a re-render. The first
 version sent each item as it came, adding only what had *already*
 arrived (`now_or_never`) to the same message, with no timer. Measured
-on a log of 591 lines: 436 messages. The daemon writes a line at a time,
+on a container that prints a line now and then (591 lines then; 691 by
+the second measurement, as it went on printing): 436 messages for 591
+lines. The daemon writes a line at a time,
 more slowly than the app reads them, so there was rarely more than one
 waiting. Now a batch collects what arrives within 10 ms of its first item
 (`BATCH_WINDOW`, up to 512 items):
@@ -383,7 +404,9 @@ On the page, every piece of daemon state a view shows is a TanStack Query
 query with a key: `["containers", {all: true}]`, `["container", "web"]`,
 `["networks"]`. The cache serves what it has and refetches what is
 *stale*. `lib/events.ts` decides, for each event, which keys it can have
-made stale:
+made stale. (TanStack also counts data older than five seconds as stale
+when a view mounts or the window regains focus, `staleTime` in
+`main.tsx`: a second chance, not a poll.)
 
 | event | stale |
 |---|---|
@@ -391,7 +414,7 @@ made stale:
 | a container's `create`, `destroy` | the above, and images and volumes (what uses them) |
 | `exec_*` | nothing (no view lists execs) |
 | an image's | image lists and pages, the counts |
-| a network's `connect`, `disconnect` | networks, container lists and pages, the isolation reports |
+| a network's `connect`, `disconnect` (running or not) | networks, container lists and pages, the isolation reports |
 | a network's `create`, `destroy`; a volume's | their lists and pages, the counts |
 | a kind this app doesn't know | everything |
 
@@ -400,7 +423,8 @@ costs a few milliseconds, and a refetch too few shows something false.
 Two details keep them simple: an event names a container by its full id,
 but its page may have been opened by name, so details are invalidated by
 prefix (`["container"]` matches every `["container", x]`); and a burst
-(`rm -f` of ten containers) refetches each key once. Queries on screen
+(`rm -f` of ten containers) refetches each key once per batch of events
+(what arrived within 10 ms), not once per event. Queries on screen
 refetch at once; the rest are only marked, and refetch when shown.
 `connected` invalidates everything: whatever happened while the app wasn't
 listening (a daemon restart empties the daemon's event history too) is
@@ -436,7 +460,7 @@ draws it with xterm.js, a terminal emulator written for browsers. Bytes
 travel the whole way; nothing is a string until xterm.js decodes it:
 
 ```text
- keystroke → xterm.js onData("l") → TerminalInput → invoke("terminal_input", {session, data})
+ keystroke → xterm.js onData("l") → TerminalInput (UTF-8) → invoke("terminal_input", {session, data: [108]})
    → SessionSender::send_stdin → WebSocket binary [0]"l" → rustletd → shim frame Stdin
    → write(PTY master) → the line discipline echoes it → the shell reads it
 
@@ -461,6 +485,15 @@ end in the middle of a UTF-8 character; xterm.js's decoder keeps the
 half for the next chunk, which a `String` conversion per chunk would have
 turned into U+FFFD. The session's end comes on the same channel as JSON
 (`{"type":"exit","code":0}`): one channel can carry both.
+
+Input is bytes too, for a reason of its own. xterm.js reports what is
+typed as a JavaScript string (`onData`), which `TerminalInput` encodes as
+UTF-8. But a program that asks for mouse reports in the old X10 encoding
+gets a byte per coordinate, column + 32, and xterm.js hands those over
+through `onBinary`, as a string of one character per *byte*. Sent as
+text, a click in column 130 (byte `0xA2`) became `0xC2 0xA2` on the way;
+so `terminal_input` takes a list of bytes, and `onBinary`'s characters
+go into it one byte each.
 
 **Input in order.** Tauri may run two calls of an async command at the
 same time, on different threads, so two keystrokes sent back to back
@@ -487,10 +520,22 @@ child that has exited but isn't reaped is a zombie and keeps its pid, and
 the reaper removes a waiter in the same step as it reaps, on the shim's
 one thread, so a signal can never reach a process that inherited a reused
 pid. In an attach session `hangup` means nothing: the container's own
-process isn't the client's to hang up. `dm_exec_hangup` runs an
-interactive `sh`, hangs up, and expects 129 (128 + `SIGHUP`); the
+process isn't the client's to hang up. The app hangs up and closes the
+socket at once; the daemon then still waits, up to five seconds, for the
+exit the signal brings, so that it is recorded (`exec inspect`, an
+`exec_die` event) though nobody is there to hear it. `dm_exec_hangup` runs
+an interactive `sh`, hangs up, and expects 129 (128 + `SIGHUP`), then one
+that traps `SIGHUP`, prints, and exits 3 after its client has left; the
 end-to-end scenario checks, from the CLI, that the container's `ps`
 shows the shell while the tab is open and not after.
+
+Quitting the app hangs up every terminal it has open, the same way: on
+Tauri's `RunEvent::Exit` (the last window closed), and on `SIGTERM`,
+`SIGINT` and `SIGHUP`, which the app turns into that exit (a logout sends
+`SIGTERM`). Without it, the process would end, its sockets would close,
+the daemon would take that for a detach, and a shell per open tab would
+run on. The scenario's last step quits the app with `SIGTERM` and looks
+for the shell again.
 
 The shell itself is `sh -c 'if command -v bash >/dev/null 2>&1; then exec
 bash; fi; exec sh'`, with `TERM=xterm-256color`: bash where the image has
@@ -508,7 +553,8 @@ can read another user's namespace links, and it reads three places:
 - `/proc/<pid>` of the container's init: the inode behind each
   `ns/<kind>` link (`net:[4026532552]`), the five capability masks and
   `NoNewPrivs`, `Seccomp` and `Seccomp_filters` of `status`, the ids as
-  the host sees them, `uid_map`/`gid_map`, `oom_score_adj`;
+  the host sees them, `uid_map`/`gid_map` (through which they are mapped
+  back to the ids the container sees), `oom_score_adj`;
 - the run's `config.json`: which namespaces were made, which joined (and
   from where), the seccomp profile (summarized: default action, the calls
   allowed outright and with conditions), masked and read-only paths,
@@ -520,7 +566,13 @@ can read another user's namespace links, and it reads three places:
 Two processes share a namespace exactly when their links name the same
 inode, so the report compares each with the daemon's own (which are the
 host's) and with every other running container's: `--network
-container:web` shows as "shared with web" on both sides. The pid comes
+container:web` shows as "shared with web" on both sides. The ids are the
+process's own as it runs, not the user `config.json` named: an
+entrypoint that drops to another user (`su-exec`, `gosu`) shows as that
+user, inside and outside. (The first version took "inside" from
+`config.json` and "outside" from `status`, and for such a process
+reported uid 0 inside and 1065534 outside: a mapping that doesn't
+exist. `dm_isolation_report` now runs one.) The pid comes
 from the container's state, so before reading anything the report checks
 that `/proc/<pid>/cgroup` names the container's cgroup; a pid the kernel
 has handed to another process since an exit would describe that
@@ -545,7 +597,10 @@ functions so that it can be tested as such: the invalidation rules, the
 pull progress reducer, the stats arithmetic (the CLI's own: CPU time over
 wall time, memory without the inactive page cache), the ANSI parser, the
 ordered input queue, the graph layout. Vitest runs them in Node, in about
-a second. The Rust side's tests build a `tauri::ipc::Channel` around a
+a second. The views' behaviour (the run dialog's create, pull and start;
+a tab's stream that must reopen after a daemon restart; a terminal's
+input while its shell starts) is tested the same way, rendered in jsdom
+with Tauri's `invoke` and channels mocked. The Rust side's tests build a `tauri::ipc::Channel` around a
 closure that records what it is sent, so the forwarding, batching and
 cancellation are tested without a webview.
 
@@ -553,35 +608,44 @@ The milestone needs the real thing: the built app, clicked through, while
 the CLI acts. Browsers are driven through **WebDriver** (W3C), a JSON
 protocol over HTTP: start a session, find an element, click it, read its
 text, run a script, take a screenshot. WebKitGTK has a driver,
-`WebKitWebDriver`, and Tauri adds `tauri-driver`, which starts the app in
-the driver's place. The app has to agree to be driven: Tauri enables
-WebKit's automation when `TAURI_WEBVIEW_AUTOMATION=true`, which
-`tauri-driver` sets. `e2e/webdriver.mjs` is a client in about 150 lines
+`WebKitWebDriver`, and Tauri adds `tauri-driver`, a proxy in front of it:
+it starts `WebKitWebDriver` with `TAURI_WEBVIEW_AUTOMATION=true` in its
+environment, and rewrites a new session's request so that the driver
+launches our app as its browser. The app has to agree to be driven:
+Tauri enables WebKit's automation when `TAURI_WEBVIEW_AUTOMATION=true`,
+which the app inherits. (When the session ends, or its last window
+closes, the driver kills the app with `SIGKILL`.) `e2e/webdriver.mjs` is a client in about 150 lines
 of JavaScript with no dependencies; `e2e/lifecycle.mjs` is the scenario:
 
 ```console
-$ E2E_XVFB=:99 E2E_RESTART='sudo systemd-run -q --pipe --wait systemctl restart rustletd-dev' desktop/e2e/run.sh
+$ E2E_XVFB=:99 XVFB=.rustlet-dev/xvfb/root/usr/bin/Xvfb \
+  WEBKIT_WEBDRIVER=.rustlet-dev/webkit-driver/root/usr/bin/WebKitWebDriver \
+  E2E_RESTART='sudo systemd-run -q --pipe --wait systemctl restart rustletd-dev' desktop/e2e/run.sh
 lifecycle:
-  ✓ 1. the app connects to the daemon (677 ms)
-  ✓ 2. a container the CLI runs appears in the list, running (665 ms)
-  ✓ 3. the run dialog creates and starts a container (872 ms)
-  ✓ 4. its log shows what it printed (94 ms)
-  ✓ 5. the terminal runs a shell in it (1145 ms)
-  ✓ 6. leaving the terminal hangs its shell up (SIGHUP), leaving no shell behind (129 ms)
-  ✓ 7. pausing from the GUI freezes it (as the CLI sees it), resuming thaws it (238 ms)
-  ✓ 8. the isolation inspector reads its namespaces (236 ms)
-  ✓ 9. a stop by the CLI shows on its page at once (1091 ms)
-  ✓ 10. starting it from the GUI runs it again (215 ms)
-  ✓ 11. removing it from the GUI removes it (384 ms)
-  ✓ 12. a network the CLI creates appears; connecting from the GUI gives the container an interface (725 ms)
-  ✓ 13. a volume created in the GUI is the CLI's to see (326 ms)
-  ✓ 14. after a daemon restart the app reconnects and follows the CLI again (515 ms)
-  ✓ 15. a container removed by the CLI leaves the list (271 ms)
-all 15 steps passed
+  ✓ 1. the app connects to the daemon (1116 ms)
+  ✓ 2. a container the CLI runs appears in the list, running (623 ms)
+  ✓ 3. the run dialog creates and starts a container (1038 ms)
+  ✓ 4. its log shows what it printed (251 ms)
+  ✓ 5. the terminal runs a shell in it (1108 ms)
+  ✓ 6. leaving the terminal hangs its shell up (SIGHUP), leaving no shell behind (104 ms)
+  ✓ 7. pausing from the GUI freezes it (as the CLI sees it), resuming thaws it (101 ms)
+  ✓ 8. the isolation inspector reads its namespaces (187 ms)
+  ✓ 9. a stop by the CLI shows on its page at once (1414 ms)
+  ✓ 10. starting it from the GUI runs it again (203 ms)
+  ✓ 11. removing it from the GUI removes it (435 ms)
+  ✓ 12. a network the CLI creates appears; connecting from the GUI gives the container an interface (965 ms)
+  ✓ 13. a volume created in the GUI is the CLI's to see (222 ms)
+  ✓ 14. after a daemon restart the app reconnects and follows the CLI again (550 ms)
+  ✓ 15. a container removed by the CLI leaves the list (229 ms)
+  ✓ 16. quitting the app hangs up its terminals, leaving no shell behind (638 ms)
+all 16 steps passed
 ```
 
 (Step 9 includes `rustlet stop -t 1` itself: `sleep`, as PID 1, ignores
-`SIGTERM`, so the daemon waits its second and kills.)
+`SIGTERM`, so the daemon waits its second and kills. Step 14 runs only
+with `E2E_RESTART`, and waits for a connection made since the restart:
+the sidebar's indicator counts them, in `data-generation`. Step 16 quits
+the app with `SIGTERM`, as a logout does.)
 
 **Why a virtual display.** The first session against the app hung before
 creating a window, with one thread, blocked in `poll`. So did `xwd` and
@@ -642,8 +706,8 @@ on distributions that have a different one, or none.
   own; this is Tauri over WebKitGTK, 4.5 MiB packaged.
 - **The isolation inspector** has no counterpart: Docker Desktop shows a
   container's configuration, not what the kernel enforces.
-- **A closed terminal hangs up** (`SIGHUP`), where Docker leaves an
-  exec'd shell running.
+- **A closed terminal hangs up** (`SIGHUP`), and so does quitting the
+  app, where Docker leaves an exec'd shell running.
 - **Not yet:** compose stacks and image builds (Phase 7); the daemon
   packaged as a `.deb` with its unit; a "start daemon" button that works
   without a polkit agent; settings (another socket than `RUSTLET_HOST`).
@@ -661,8 +725,8 @@ In another terminal, `rustlet run -d --name web -p 8080:80 nginx` and
 watch it appear; open it, then its Isolation tab; `rustlet network create
 back && rustlet network connect back web` and watch the Networks graph
 grow an edge; open a terminal, type `exit`, and see the session end with
-code 0; open another and close the tab, then `rustlet exec web ps` and
-look for the shell.
+code 0; open another and close the tab, then `rustlet exec web sh -c 'cat
+/proc/[0-9]*/comm'` and look for the shell (nginx's image has no `ps`).
 
 ![The networks view: bridges, containers, their addresses](img/17-topology.png)
 
@@ -693,9 +757,11 @@ look for the shell.
 12. Why are the invalidation rules coarse, and why are detail pages
     invalidated by prefix?
 13. What is `ESC [ 6 n`, and how does its answer get back to the shell?
-14. Why is terminal output sent as bytes, and terminal input as text?
+14. Why is terminal output sent as bytes, and why is input, which is
+    typed text, sent as bytes too?
 15. Why does closing a terminal tab give the shell `SIGHUP`, and why can
-    that signal never reach the wrong process?
+    that signal never reach the wrong process? What does quitting the app
+    do to the terminals it has open?
 16. How does the inspector decide that two containers share a network
     namespace, and why does it first read `/proc/<pid>/cgroup`?
 17. What was wrong with `oom_score_adj`, and why did nothing before the
@@ -713,12 +779,17 @@ look for the shell.
 - **Batching.** Set `BATCH_WINDOW` to zero (or put `now_or_never` back),
   run a container that prints 10 000 lines, and open its logs. Count the
   channel messages with a callback of your own, as §5 did.
-- **A missed event.** Comment out the `network` case in
-  `invalidationsFor`, then `rustlet network connect` a container while
-  its overview tab is open. What goes stale, and what brings it back?
+- **A missed event.** Make the `network` case of `invalidationsFor`
+  return `[]` (removing the case wouldn't do: a kind it doesn't know
+  marks everything stale), then `rustlet network connect` a container
+  while its overview tab is open. What goes stale, and what brings it
+  back?
 - **The hangup.** Open a terminal tab, run `trap 'echo got HUP >
-  /tmp/hup' HUP; sleep 1000`, close the tab, and look at `/tmp/hup` with
-  `rustlet exec`. Then `trap '' HUP` and do it again: what runs on?
+  /tmp/hup; exit' HUP; sleep 1000 & wait`, close the tab, and look at
+  `/tmp/hup` with `rustlet exec`. (Why `& wait`? A shell runs a trap only
+  once its foreground command is done, and only the shell gets the
+  signal; `wait` returns at once when a trapped signal arrives.) Then
+  `trap '' HUP` and do it again: what runs on?
 - **Your own namespace sharing.** Run two containers, the second with
   `--network container:<first>`, and compare their Isolation tabs. Then
   run one with `--network host --userns remap` and find each difference
