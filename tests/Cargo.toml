@@ -25,6 +25,8 @@ rustlet-sys.workspace = true
 rustlet-shim.workspace = true
 rustlet-spec.workspace = true
 rustlet-client.workspace = true
+rustlet-compose.workspace = true
+rustlet-build.workspace = true
 tokio.workspace = true
 futures.workspace = true
 # Building image layers in the image tests.

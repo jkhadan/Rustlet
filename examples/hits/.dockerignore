@@ -1,0 +1,4 @@
+# Only what the image needs goes to the daemon.
+*
+!app.py
+!Containerfile

@@ -1,0 +1,25 @@
+# web counts its visitors in redis; it starts once redis answers PING.
+name: hits
+
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+    volumes:
+      - data:/data
+
+volumes:
+  data:

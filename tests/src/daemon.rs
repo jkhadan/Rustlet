@@ -157,6 +157,16 @@ impl TestDaemon {
         content.set_ref(&rustlet_image::content::RefEntry { name, target, repo_digest: None }).unwrap();
     }
 
+    /// Imports the cached Alpine minirootfs with `extra` layers on top (a
+    /// symlink planted by a test, …) as `name`.
+    pub fn import_alpine_layers(&self, name: &str, extra: &[Vec<u8>]) {
+        let store = Store::open(&self.data).unwrap();
+        let env = ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"];
+        let mut layers = vec![alpine_layer()];
+        layers.extend(extra.iter().cloned());
+        import(store.content(), name, &layers, config(&["/bin/sh"], &env, None).unwrap()).unwrap();
+    }
+
     /// The mounts the daemon made below its data root.
     pub fn mounts(&self) -> Vec<String> {
         let data = self.data.canonicalize().unwrap_or_else(|_| self.data.clone());
