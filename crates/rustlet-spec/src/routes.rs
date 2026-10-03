@@ -46,7 +46,9 @@ pub mod action {
     pub const STATS: &str = "stats";
     pub const ATTACH: &str = "attach";
     pub const EXEC: &str = "exec";
-    pub const ALL: [&str; 11] = [START, STOP, KILL, RESTART, PAUSE, UNPAUSE, WAIT, LOGS, STATS, ATTACH, EXEC];
+    pub const ISOLATION: &str = "isolation";
+    pub const ALL: [&str; 12] =
+        [START, STOP, KILL, RESTART, PAUSE, UNPAUSE, WAIT, LOGS, STATS, ATTACH, EXEC, ISOLATION];
 }
 
 /// `GET` (inspect).

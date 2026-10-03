@@ -22,6 +22,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: unit tests (unprivileged)
         run: cargo nextest run --workspace
+      - name: the desktop app's TypeScript types match rustlet-spec
+        run: cargo xtask gen-ts --check
       - name: unsafe stays inside rustlet-sys
         run: |
           # every crate but rustlet-sys must forbid unsafe at the crate root

@@ -7,9 +7,10 @@
 //! a minute is forgotten.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// `POST /v1/containers/{id}/exec`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct ExecConfig {
     /// The program and its arguments (looked up in the container's `PATH`).
@@ -31,14 +32,14 @@ pub struct ExecConfig {
 }
 
 /// `201` from `POST /v1/containers/{id}/exec`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct ExecCreated {
     pub id: String,
 }
 
 /// `POST /v1/exec/{id}/start` (detached).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct ExecStarted {
     /// Host PID of the process.
@@ -46,7 +47,7 @@ pub struct ExecStarted {
 }
 
 /// `GET /v1/exec/{id}`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct ExecInspect {
     pub id: String,

@@ -11,9 +11,10 @@
 //! (and `.1` to `.2`, …) and a new one is started.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// One record: also one line of the NDJSON `logs` response.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct LogEntry {
     /// When the shim read it: RFC 3339 with nanoseconds, UTC.
@@ -24,7 +25,7 @@ pub struct LogEntry {
     pub log: String,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum LogStream {
     #[default]
@@ -33,7 +34,7 @@ pub enum LogStream {
 }
 
 /// Query of `GET /v1/containers/{id}/logs`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct LogsQuery {
     /// Keep the response open and send new entries as they are written,

@@ -4,13 +4,14 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// One sample. The cgroup fields are what `rustlet-runc events --stats`
 /// reports (`rustlet_runtime::cgroups::stats::Stats`), with the same names.
 /// Counters are cumulative: a CPU percentage is the difference of
 /// `cpu["usage_usec"]` between two samples, over the time between their
 /// `read`s, divided by `cpus_online` (or not, for Docker's "100% per CPU").
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct StatsSample {
     pub id: String,
@@ -43,7 +44,7 @@ pub struct StatsSample {
 }
 
 /// `memory.events`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct MemoryEvents {
     pub low: u64,
@@ -56,7 +57,7 @@ pub struct MemoryEvents {
 
 /// One PSI line: shares of time (percent) stalled, averaged over 10, 60 and
 /// 300 seconds, and the total stall time in microseconds.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct Pressure {
     pub avg10: f64,
@@ -66,7 +67,7 @@ pub struct Pressure {
 }
 
 /// One interface.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct NetDev {
     pub name: String,
@@ -81,7 +82,7 @@ pub struct NetDev {
 }
 
 /// Query of `GET /v1/containers/{id}/stats`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct StatsQuery {
     /// A sample every second until the client hangs up (or the container

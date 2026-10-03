@@ -23,7 +23,7 @@ use rustlet_image::content::ContentStore;
 use rustlet_image::snapshot::Snapshot;
 use rustlet_image::{Digest, Image, ImageRef, Store};
 use rustlet_runtime::cgroups::{Cgroup, CgroupPath, Setting, SystemdDelegated};
-use rustlet_spec::image::{ImageDeleteResponse, ImageInspect, ImageSummary, PullEvent, PullPolicy};
+use rustlet_spec::image::{ImageDeleteResponse, ImageInspect, ImageLayer, ImageSummary, PullEvent, PullPolicy};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{RwLock, RwLockReadGuard, mpsc};
 
@@ -135,12 +135,25 @@ impl Images {
             .collect();
         let config_json =
             self.store.content().read_blob(&image.config_digest, rustlet_image::config::MAX_CONFIG_BYTES)?;
-        let unpacked = image.layers.iter().all(|l| matches!(self.store.snapshots().get(&l.chain_id), Ok(Some(_))));
+        let layer_details: Vec<ImageLayer> = image
+            .layers
+            .iter()
+            .map(|l| ImageLayer {
+                digest: l.blob.to_string(),
+                media_type: l.media_type.clone(),
+                size: l.size,
+                diff_id: l.diff_id.to_string(),
+                chain_id: l.chain_id.to_string(),
+                unpacked: matches!(self.store.snapshots().get(&l.chain_id), Ok(Some(_))),
+            })
+            .collect();
+        let unpacked = layer_details.iter().all(|l| l.unpacked);
         Ok(ImageInspect {
             summary: summary(&image, names, image.repo_digest.as_ref().map(Digest::to_string)),
             config: serde_json::from_slice(&config_json).unwrap_or(serde_json::Value::Null),
             diff_ids: image.layers.iter().map(|l| l.diff_id.to_string()).collect(),
             chain_ids: image.layers.iter().map(|l| l.chain_id.to_string()).collect(),
+            layer_details,
             unpacked,
             containers,
         })

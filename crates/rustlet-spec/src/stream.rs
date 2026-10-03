@@ -17,6 +17,7 @@
 //! hangs up (detaches) leaves the container running.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// Data stream ids, the first byte of a binary message.
 pub const STDIN: u8 = 0;
@@ -24,7 +25,7 @@ pub const STDOUT: u8 = 1;
 pub const STDERR: u8 = 2;
 
 /// A text message.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Control {
     /// Client → daemon: the terminal's size, in characters.

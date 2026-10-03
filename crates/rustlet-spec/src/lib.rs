@@ -34,6 +34,7 @@
 //! | GET | `/containers/{id}/logs?…` | → NDJSON [`logs::LogEntry`] ([`logs::LogsQuery`]) |
 //! | GET | `/containers/{id}/stats?stream=` | → NDJSON [`stats::StatsSample`], one a second (one JSON object with `stream=false`) |
 //! | GET | `/containers/{id}/attach?stdin=` | → WebSocket ([`stream`]) |
+//! | GET | `/containers/{id}/isolation` | → [`isolation::Isolation`] (running or paused containers) |
 //! | POST | `/containers/{id}/exec` | [`exec::ExecConfig`] → 201 [`exec::ExecCreated`] |
 //! | GET | `/exec/{id}` | → [`exec::ExecInspect`] |
 //! | GET | `/exec/{id}/start` | → WebSocket ([`stream`]): runs the process attached |
@@ -84,6 +85,7 @@ pub mod container;
 pub mod event;
 pub mod exec;
 pub mod image;
+pub mod isolation;
 pub mod logs;
 pub mod network;
 pub mod routes;
@@ -93,6 +95,7 @@ pub mod system;
 pub mod volume;
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// Where the daemon listens.
 pub const DEFAULT_SOCKET: &str = "/run/rustlet/rustlet.sock";
@@ -112,7 +115,7 @@ pub fn short_id(id: &str) -> &str {
 }
 
 /// The body of every error response.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct ErrorBody {
     pub message: String,
@@ -127,7 +130,7 @@ impl ErrorBody {
 
 /// What went wrong, for programs: the HTTP status says the same in less
 /// detail.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
     /// 400: the request itself is wrong (a bad option, an invalid name).
@@ -184,10 +187,70 @@ impl ErrorKind {
 }
 
 /// The last line of an NDJSON stream that failed after it had started.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct StreamError {
     pub error: String,
+}
+
+/// Writes the TypeScript declaration of every type of the API, and of the
+/// types they use, into `cfg`'s directory, one file per type (`cargo xtask
+/// gen-ts` puts them in `desktop/src/bindings/` for the desktop app, with
+/// 64-bit integers as `number`). A new type of the API belongs in this list.
+pub fn export_typescript(cfg: &ts_rs::Config) -> Result<(), ts_rs::ExportError> {
+    use ts_rs::TS;
+    macro_rules! export {
+        ($($t:ty),* $(,)?) => { $( <$t as TS>::export_all(cfg)?; )* };
+    }
+    export!(
+        ErrorBody,
+        ErrorKind,
+        StreamError,
+        container::ContainerConfig,
+        container::CreateResponse,
+        container::ContainerSummary,
+        container::ContainerInspect,
+        container::WaitCondition,
+        container::WaitResponse,
+        container::ListQuery,
+        container::RemoveQuery,
+        container::StopQuery,
+        container::KillQuery,
+        container::WaitQuery,
+        container::AttachQuery,
+        event::Event,
+        event::EventsQuery,
+        exec::ExecConfig,
+        exec::ExecCreated,
+        exec::ExecStarted,
+        exec::ExecInspect,
+        image::ImageSummary,
+        image::ImageInspect,
+        image::ImageQuery,
+        image::ImageDeleteQuery,
+        image::ImageDeleteResponse,
+        image::PullQuery,
+        image::PullEvent,
+        isolation::Isolation,
+        logs::LogEntry,
+        logs::LogsQuery,
+        network::NetworkCreate,
+        network::NetworkCreateResponse,
+        network::Network,
+        network::NetworkConnect,
+        network::NetworkDisconnect,
+        network::PruneResponse,
+        stats::StatsSample,
+        stats::StatsQuery,
+        stream::Control,
+        system::Version,
+        system::Info,
+        volume::VolumeCreate,
+        volume::Volume,
+        volume::VolumeRemoveQuery,
+        volume::VolumePruneQuery,
+    );
+    Ok(())
 }
 
 /// Is `name` a valid container name? Docker's rule:

@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// One event. Container actions: `create`, `start`, `die` (attributes
 /// `exit_code`, `oom_killed`), `oom`, `stop`, `kill` (`signal`), `pause`,
@@ -11,7 +12,7 @@ use serde::{Deserialize, Serialize};
 /// `untag`, `delete`. Every container event carries `name` and `image`.
 /// Network actions: `create`, `destroy`, `connect` and `disconnect`
 /// (attribute `container`); volume actions: `create`, `destroy`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct Event {
     /// RFC 3339 with nanoseconds, UTC.
@@ -23,7 +24,7 @@ pub struct Event {
     pub attributes: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
     #[default]
@@ -34,7 +35,7 @@ pub enum EventKind {
 }
 
 /// Query of `GET /v1/events`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct EventsQuery {
     /// Replay the recent events at or after this time (RFC 3339, or Unix

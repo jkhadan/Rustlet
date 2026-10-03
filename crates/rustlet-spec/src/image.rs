@@ -1,9 +1,10 @@
 //! Images: `pull`, `images`, `inspect`, `rmi`.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// One line of `rustlet images`: `GET /v1/images`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct ImageSummary {
     /// The manifest digest (`sha256:…`): the image's id.
@@ -23,7 +24,7 @@ pub struct ImageSummary {
 }
 
 /// `GET /v1/images/inspect?name=`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct ImageInspect {
     #[serde(flatten)]
@@ -33,21 +34,42 @@ pub struct ImageInspect {
     /// Per layer, bottom first.
     pub diff_ids: Vec<String>,
     pub chain_ids: Vec<String>,
+    /// The layers, bottom first: the manifest's blobs with what they became.
+    pub layer_details: Vec<ImageLayer>,
     /// Every layer has been unpacked into a snapshot.
     pub unpacked: bool,
     /// Containers created from it.
     pub containers: Vec<String>,
 }
 
+/// One layer of an image.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(default)]
+pub struct ImageLayer {
+    /// The compressed blob's digest (the manifest's).
+    pub digest: String,
+    pub media_type: String,
+    /// The compressed blob's size, bytes.
+    pub size: u64,
+    /// The digest of the uncompressed tar stream (the config's
+    /// `rootfs.diff_ids`).
+    pub diff_id: String,
+    /// The digest of this layer together with every layer below it: the
+    /// name of its snapshot.
+    pub chain_id: String,
+    /// Its snapshot exists.
+    pub unpacked: bool,
+}
+
 /// Query of `GET /v1/images/inspect`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct ImageQuery {
     pub name: String,
 }
 
 /// Query of `DELETE /v1/images`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct ImageDeleteQuery {
     pub name: String,
@@ -57,7 +79,7 @@ pub struct ImageDeleteQuery {
 }
 
 /// The answer of `DELETE /v1/images`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct ImageDeleteResponse {
     /// Names removed.
@@ -68,7 +90,7 @@ pub struct ImageDeleteResponse {
 }
 
 /// Query of `POST /v1/images/pull`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct PullQuery {
     pub reference: String,
@@ -76,7 +98,7 @@ pub struct PullQuery {
 }
 
 /// When to contact the registry.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum PullPolicy {
     /// Only if the store doesn't have the name yet.
@@ -89,7 +111,7 @@ pub enum PullPolicy {
 }
 
 /// Which blob a pull event is about.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum BlobKind {
     Config,
@@ -105,7 +127,7 @@ pub enum BlobKind {
 /// stored, the registry is never contacted: `ready` may follow `resolving`
 /// directly. The first part is the same JSON `rustlet_image::pull::Progress`
 /// writes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum PullEvent {
     Resolving {
@@ -188,6 +210,18 @@ mod tests {
             serde_json::to_string(&ready).unwrap(),
             r#"{"status":"ready","reference":"r","manifest":"sha256:cd"}"#
         );
+    }
+
+    #[test]
+    fn inspect_keeps_the_layer_count_and_the_layers_apart() {
+        let i = ImageInspect {
+            summary: ImageSummary { layers: 1, ..Default::default() },
+            layer_details: vec![ImageLayer { size: 7, ..Default::default() }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&i).unwrap();
+        assert_eq!(json.matches("\"layers\"").count(), 1, "{json}");
+        assert_eq!(serde_json::from_str::<ImageInspect>(&json).unwrap(), i);
     }
 
     #[test]

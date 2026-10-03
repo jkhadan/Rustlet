@@ -18,6 +18,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// The default network's name.
 pub const DEFAULT_NETWORK: &str = "bridge";
@@ -29,8 +30,9 @@ pub const RESERVED_NETWORK_NAMES: [&str; 4] = ["bridge", "host", "none", "defaul
 ///
 /// On the wire it is a string, as in Docker: `bridge`, `none`, `host`,
 /// `container:<name or id>`, or the name of a network.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(into = "String", try_from = "String")]
+#[ts(type = "string")]
 pub enum NetworkMode {
     /// A network namespace of its own on the default network (`bridge`, or
     /// `default`).
@@ -106,7 +108,7 @@ impl TryFrom<String> for NetworkMode {
 }
 
 /// A transport protocol of a published port.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     #[default]
@@ -135,7 +137,7 @@ impl FromStr for Protocol {
 }
 
 /// `-p`: a container port to publish on the host.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct PortMapping {
     /// The host address to listen on; `None` is every address, IPv4
@@ -250,7 +252,7 @@ impl fmt::Display for PortMapping {
 }
 
 /// A published port as a run set it up: the host port is known.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
 pub struct PublishedPort {
     /// `0.0.0.0`: every address, IPv4 and IPv6; `::`: every IPv6 address.
     pub host_ip: IpAddr,
@@ -309,7 +311,7 @@ pub fn valid_hostname(s: &str) -> bool {
 }
 
 /// `POST /v1/networks`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct NetworkCreate {
     pub name: String,
@@ -331,7 +333,7 @@ pub struct NetworkCreate {
 }
 
 /// `201` from `POST /v1/networks`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct NetworkCreateResponse {
     pub id: String,
@@ -340,7 +342,7 @@ pub struct NetworkCreateResponse {
 
 /// A network: `GET /v1/networks` lists them, `GET /v1/networks/{id}`
 /// shows one (`{id}` is its id, a unique prefix of it, or its name).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct Network {
     pub id: String,
@@ -370,7 +372,7 @@ pub struct Network {
 }
 
 /// A container's place on a network.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct NetworkEndpoint {
     pub container_id: String,
@@ -389,7 +391,7 @@ pub struct NetworkEndpoint {
 /// The top-level addresses are those of its **primary** network: the one
 /// its IPv4 default route goes through (else its first), which is also
 /// where its published ports lead. `networks` has every network.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct NetworkSettings {
     /// `--network`, as given (the first, if it was given more than once).
@@ -421,7 +423,7 @@ pub struct NetworkSettings {
 }
 
 /// A container on one of its networks, as `inspect` shows it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct EndpointSettings {
     /// The network's name.
@@ -456,7 +458,7 @@ pub struct EndpointSettings {
 
 /// `POST /v1/networks/{id}/connect`: connects a container to the network,
 /// at once if it runs, otherwise from its next start.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct NetworkConnect {
     /// Its name, id, or a unique prefix of its id.
@@ -470,7 +472,7 @@ pub struct NetworkConnect {
 }
 
 /// `POST /v1/networks/{id}/disconnect`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct NetworkDisconnect {
     /// Its name, id, or a unique prefix of its id.
@@ -481,7 +483,7 @@ pub struct NetworkDisconnect {
 }
 
 /// The answer of the prune routes (networks, volumes).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct PruneResponse {
     /// Names of what was removed.

@@ -12,9 +12,10 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// What a mount is.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "lowercase")]
 pub enum MountType {
     #[default]
@@ -34,7 +35,7 @@ impl std::fmt::Display for MountType {
 }
 
 /// One mount of `-v`, `--mount` or `--tmpfs`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct MountSpec {
     #[serde(rename = "type")]
@@ -297,7 +298,7 @@ pub fn valid_volume_name(name: &str) -> bool {
 }
 
 /// `POST /v1/volumes`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct VolumeCreate {
     /// Default: a random 64-hex-digit name (an anonymous volume).
@@ -307,7 +308,7 @@ pub struct VolumeCreate {
 
 /// A volume: `GET /v1/volumes` lists them, `GET /v1/volumes/{name}` shows
 /// one.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct Volume {
     pub name: String,
@@ -326,7 +327,7 @@ pub struct Volume {
 }
 
 /// Query of `DELETE /v1/volumes/{name}`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct VolumeRemoveQuery {
     /// No error if it doesn't exist.
@@ -334,7 +335,7 @@ pub struct VolumeRemoveQuery {
 }
 
 /// Query of `POST /v1/volumes/prune`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct VolumePruneQuery {
     /// Named volumes too, not only anonymous ones (Docker's `--all`).
@@ -342,7 +343,7 @@ pub struct VolumePruneQuery {
 }
 
 /// A container's mount, as `inspect` shows it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct MountPoint {
     #[serde(rename = "type")]

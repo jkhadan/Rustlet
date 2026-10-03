@@ -1,8 +1,9 @@
 //! `GET /v1/version` and `GET /v1/info`.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct Version {
     /// The daemon's version (`CARGO_PKG_VERSION`).
@@ -14,7 +15,7 @@ pub struct Version {
     pub kernel: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct Info {
     pub containers: usize,

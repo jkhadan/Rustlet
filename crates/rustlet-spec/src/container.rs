@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 use crate::network::{NetworkMode, NetworkSettings, PortMapping, PublishedPort};
 use crate::volume::{MountPoint, MountSpec};
@@ -11,7 +12,7 @@ use crate::volume::{MountPoint, MountSpec};
 /// `POST /v1/containers`: everything `rustlet run`/`create` can say about a
 /// container. Fields left out take the image's value (command, environment,
 /// user, working directory) or Rustlets' default.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct ContainerConfig {
     /// The image, as typed (`alpine`, `nginx:1.27`, `ghcr.io/o/n@sha256:…`).
@@ -102,7 +103,7 @@ pub struct ContainerConfig {
 }
 
 /// `--userns`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum UsernsMode {
     /// No user namespace: container root is host root (the rootful default).
@@ -114,7 +115,7 @@ pub enum UsernsMode {
 }
 
 /// When a container that has exited is started again.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct RestartPolicy {
     pub name: RestartPolicyName,
@@ -122,7 +123,7 @@ pub struct RestartPolicy {
     pub max_retries: u32,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "kebab-case")]
 pub enum RestartPolicyName {
     #[default]
@@ -180,7 +181,7 @@ impl std::fmt::Display for RestartPolicy {
 }
 
 /// `201` from `POST /v1/containers`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct CreateResponse {
     pub id: String,
@@ -199,7 +200,7 @@ pub struct CreateResponse {
 ///                        ▼ rm
 ///                     removing ──► (gone)
 /// ```
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ContainerStatus {
     /// Created and never started.
@@ -240,7 +241,7 @@ impl std::fmt::Display for ContainerStatus {
 }
 
 /// The part of a container that changes as it runs.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct ContainerState {
     pub status: ContainerStatus,
@@ -261,7 +262,7 @@ pub struct ContainerState {
 }
 
 /// One line of `rustlet ps`: `GET /v1/containers`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct ContainerSummary {
     pub id: String,
@@ -281,7 +282,7 @@ pub struct ContainerSummary {
 }
 
 /// `GET /v1/containers/{id}`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct ContainerInspect {
     pub id: String,
@@ -310,7 +311,7 @@ pub struct ContainerInspect {
 }
 
 /// `POST /v1/containers/{id}/wait?condition=`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "kebab-case")]
 pub enum WaitCondition {
     /// Return at once if the container isn't live, else when it exits
@@ -326,7 +327,7 @@ pub enum WaitCondition {
 }
 
 /// The answer of `wait`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct WaitResponse {
     /// Shell-style exit status.
@@ -336,7 +337,7 @@ pub struct WaitResponse {
 }
 
 /// Query of `GET /v1/containers`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct ListQuery {
     /// Include containers that aren't running.
@@ -344,7 +345,7 @@ pub struct ListQuery {
 }
 
 /// Query of `DELETE /v1/containers/{id}`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct RemoveQuery {
     /// Kill it first if it is live.
@@ -354,7 +355,7 @@ pub struct RemoveQuery {
 }
 
 /// Query of `stop` and `restart`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct StopQuery {
     /// Seconds to wait after the stop signal before killing.
@@ -362,7 +363,7 @@ pub struct StopQuery {
 }
 
 /// Query of `kill`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct KillQuery {
     /// `KILL`, `SIGKILL` or `9`; default `KILL`.
@@ -370,14 +371,14 @@ pub struct KillQuery {
 }
 
 /// Query of `wait`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct WaitQuery {
     pub condition: WaitCondition,
 }
 
 /// Query of `attach`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(default)]
 pub struct AttachQuery {
     /// Send this client's input to the container (it must have been

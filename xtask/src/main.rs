@@ -13,7 +13,7 @@
 //! | `image-run`   | pull an image and run it: registry → snapshots → overlay → rustlet-runc (`--userns`) |
 //! | `images`      | list the image store, inspect an image, `ls` inside snapshots and container layers |
 //! | `daemon`      | install rustletd as a systemd service (`install`, `uninstall`, `status`) |
-//! | `gen-ts`      | Phase 6                                                        |
+//! | `gen-ts`      | the desktop app's TypeScript types from rustlet-spec (`--check`: fail if stale) |
 //!
 //! Nothing here runs `sudo cargo`: builds always run as your user, and only
 //! finished binaries are run as root (docs/architecture.md §4.7).
@@ -24,6 +24,7 @@ mod daemon;
 mod demo;
 mod devices;
 mod devstorage;
+mod gents;
 mod imagerun;
 mod images;
 mod itest;
@@ -146,8 +147,12 @@ enum Task {
     /// The root half of `daemon`.
     #[command(subcommand, hide = true)]
     DaemonRoot(daemon::DaemonTask),
-    /// Generate TypeScript types for the desktop app (Phase 6).
-    GenTs,
+    /// Generate the desktop app's TypeScript types from rustlet-spec.
+    GenTs {
+        /// Fail if desktop/src/bindings differs from what would be generated.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -168,7 +173,7 @@ fn main() -> anyhow::Result<()> {
         Task::ImagesRoot(args) => images::run_as_root(&args),
         Task::Daemon(task) => daemon::run(&task),
         Task::DaemonRoot(task) => daemon::run_as_root(&task),
-        Task::GenTs => bail!("`gen-ts` arrives in Phase 6 (desktop app)"),
+        Task::GenTs { check } => gents::run(check),
     }
 }
 
