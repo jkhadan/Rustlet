@@ -4,4 +4,4 @@ import type { ErrorKind } from "./ErrorKind";
 /**
  * A text message.
  */
-export type Control = { "type": "resize", rows: number, cols: number, } | { "type": "stdin_eof" } | { "type": "exit", code: number, oom_killed: boolean, } | { "type": "error", message: string, kind: ErrorKind, };
+export type Control = { "type": "resize", rows: number, cols: number, } | { "type": "stdin_eof" } | { "type": "hangup" } | { "type": "exit", code: number, oom_killed: boolean, } | { "type": "error", message: string, kind: ErrorKind, };

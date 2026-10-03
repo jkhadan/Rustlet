@@ -102,6 +102,11 @@ impl Session {
         self.sender.stdin_eof().await
     }
 
+    /// See [`SessionSender::hangup`].
+    pub async fn hangup(&mut self) -> Result<()> {
+        self.sender.hangup().await
+    }
+
     /// See [`SessionReceiver::recv`].
     pub async fn recv(&mut self) -> Result<Option<SessionEvent>> {
         self.receiver.recv().await
@@ -133,6 +138,13 @@ impl SessionSender {
     /// No more input will come.
     pub async fn stdin_eof(&mut self) -> Result<()> {
         self.control(&Control::StdinEof).await
+    }
+
+    /// In an exec session: this client's terminal is gone, and the process
+    /// gets `SIGHUP` (as a shell does when its window closes). The session
+    /// then ends with its exit; [`close`](Self::close) right after is fine.
+    pub async fn hangup(&mut self) -> Result<()> {
+        self.control(&Control::Hangup).await
     }
 
     /// Hangs up (a detach: the process keeps running).

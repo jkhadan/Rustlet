@@ -126,6 +126,12 @@ impl StreamWriter {
     pub async fn resize(&mut self, rows: u16, cols: u16) -> io::Result<()> {
         write_frame(&mut self.writer, &Frame::request(&Request::Resize { rows, cols })).await
     }
+
+    /// In an exec stream: a signal for the exec's process (the shim ignores
+    /// it in an attach stream).
+    pub async fn signal(&mut self, signal: i32) -> io::Result<()> {
+        write_frame(&mut self.writer, &Frame::request(&Request::Kill { signal, all: false })).await
+    }
 }
 
 fn invalid(what: &str) -> io::Error {

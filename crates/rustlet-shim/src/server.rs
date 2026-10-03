@@ -758,6 +758,12 @@ async fn exec(shim: Rc<Shim>, req: ExecRequest, mut r: OwnedReadHalf, mut w: Own
                 Ok(Request::CloseStdin) if io.is_none() => {
                     stdin.borrow_mut().take();
                 }
+                // The client's terminal hung up (`SIGHUP`): only this
+                // process, and only while the reaper still waits for it.
+                Ok(Request::Kill { signal, .. }) => {
+                    let sent = shim.reaper.signal(pid, signal);
+                    tracing::debug!(pid, signal, sent, "exec signal (not sent: it has exited)");
+                }
                 _ => {}
             },
             Ok(Some(_)) => {}

@@ -210,7 +210,7 @@ impl Daemon {
                 let recorded = async |exit: &rustlet_shim::protocol::ExitStatus| self.exec_died(&s, Some(exit.code));
                 // A client that detaches leaves the process running; its
                 // exit isn't seen here then.
-                crate::attach::bridge(sink, source, stream, s.config.stdin, recorded).await;
+                crate::attach::bridge(sink, source, stream, s.config.stdin, crate::attach::Peer::Exec, recorded).await;
             }
             Err(e) => {
                 let (mut sink, _) = ws.split();

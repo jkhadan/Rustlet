@@ -94,7 +94,7 @@ pub async fn attach(
         let done = state.wait_for(|s| s.exits > exits || s.removed);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(30), done).await;
     };
-    bridge(sink, source, stream, stdin, handled).await;
+    bridge(sink, source, stream, stdin, Peer::Container, handled).await;
 }
 
 /// Waits for `start` to hand over the stream. Returns it with the input
@@ -148,6 +148,15 @@ async fn wait_for_start(
     }
 }
 
+/// Who a bridge's client is talking to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Peer {
+    /// The container's own process (attach): a hangup is a detach.
+    Container,
+    /// An exec's process: a hangup gives it `SIGHUP`.
+    Exec,
+}
+
 /// Copies between the client and the shim until the process exits (the
 /// exit is the last thing sent) or the client goes away (detaching: the
 /// process goes on).
@@ -156,6 +165,7 @@ pub async fn bridge(
     mut source: Source,
     stream: ShimStream,
     stdin: bool,
+    peer: Peer,
     before_exit: impl AsyncFnOnce(&ExitStatus),
 ) -> Option<ExitStatus> {
     let (mut reader, mut writer) = stream.split();
@@ -198,6 +208,7 @@ pub async fn bridge(
                 Message::Text(t) => match serde_json::from_str::<Control>(&t) {
                     Ok(Control::Resize { rows, cols }) => writer.resize(rows, cols).await.is_ok(),
                     Ok(Control::StdinEof) => writer.close_stdin().await.is_ok(),
+                    Ok(Control::Hangup) if peer == Peer::Exec => writer.signal(libc::SIGHUP).await.is_ok(),
                     _ => true,
                 },
                 _ => true,

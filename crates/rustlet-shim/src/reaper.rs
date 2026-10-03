@@ -75,6 +75,21 @@ impl Reaper {
         rx
     }
 
+    /// Sends `signal` to `pid` if it is watched and not yet reaped. Its pid
+    /// can't belong to another process then: a child that has exited but
+    /// isn't reaped is a zombie, which keeps it. (The loop removes a waiter
+    /// in the same step as it reaps, and only runs when the caller yields.)
+    /// Returns whether the signal was sent.
+    pub fn signal(&self, pid: i32, signal: i32) -> bool {
+        if !self.inner.borrow().waiters.contains_key(&pid) {
+            return false;
+        }
+        let Ok(signal) = nix::sys::signal::Signal::try_from(signal) else {
+            return false;
+        };
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal).is_ok()
+    }
+
     /// Collects every child that has exited.
     fn reap(&self) {
         loop {

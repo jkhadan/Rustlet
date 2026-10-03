@@ -674,3 +674,41 @@ fn dm_isolation_report() {
         }
     });
 }
+
+/// A terminal that goes away hangs up its exec (Phase 6: a closed terminal
+/// tab in the desktop app): the process gets SIGHUP and the session ends
+/// with its exit, 128 + 1. In an attach session a hangup is a detach.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dm_exec_hangup() {
+    let d = daemon();
+    block_on(async {
+        let c = d.client();
+        let cfg = ContainerConfig { tty: true, open_stdin: true, ..sh("sleep 1000") };
+        let id = c.create_container(&cfg).await.unwrap().id;
+        c.start(&id).await.unwrap();
+        let shell = ExecConfig { cmd: vec!["sh".into()], tty: true, stdin: true, ..Default::default() };
+        let exec = c.create_exec(&id, &shell).await.unwrap().id;
+        let (mut tx, mut rx) = c.start_exec(&exec).await.unwrap().split();
+        tx.send_stdin(b"echo rea''dy\n").await.unwrap();
+        let mut seen = String::new();
+        while !seen.contains("ready") {
+            match tokio::time::timeout(Duration::from_secs(20), rx.recv()).await.expect("no output") {
+                Ok(Some(SessionEvent::Stdout(b))) => seen.push_str(&String::from_utf8_lossy(&b)),
+                other => panic!("{other:?} before the shell answered: {seen:?}"),
+            }
+        }
+        tx.hangup().await.unwrap();
+        let got = drain(&mut rx).await;
+        assert_eq!(got.exit, Some(129), "{got:?}");
+        assert_eq!(c.inspect_exec(&exec).await.unwrap().exit_code, Some(129));
+
+        let (mut tx, rx) = c.attach(&id, true).await.unwrap().split();
+        tx.hangup().await.unwrap();
+        tx.close().await.unwrap();
+        drop(rx);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(status(&c, &id).await, ContainerStatus::Running);
+        c.remove_container(&id, true).await.unwrap();
+    });
+}

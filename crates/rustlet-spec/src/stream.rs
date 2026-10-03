@@ -8,7 +8,8 @@
 //!
 //! With a terminal there is only stdout: a PTY merges the two outputs.
 //! The client sends `resize` whenever its terminal changes size (and once
-//! at the start), and `stdin_eof` when its input ends. The daemon sends
+//! at the start), `stdin_eof` when its input ends, and in an exec session
+//! `hangup` when its terminal goes away (the process gets `SIGHUP`). The daemon sends
 //! `exit` when the process has exited and its output has been sent, then
 //! closes the socket; `error` if the session fails (the start of an exec, a
 //! container that exited before it could be attached to).
@@ -32,6 +33,12 @@ pub enum Control {
     Resize { rows: u16, cols: u16 },
     /// Client → daemon: no more input.
     StdinEof,
+    /// Client → daemon, in an exec session: the client's terminal is gone
+    /// (a closed window or tab). The process gets `SIGHUP`, as a shell does
+    /// when its terminal closes, and the session ends with its exit as
+    /// usual. Without it, a client that hangs up detaches: the process runs
+    /// on. In an attach session it means nothing.
+    Hangup,
     /// Daemon → client: the process exited (shell-style status).
     Exit { code: i32, oom_killed: bool },
     /// Daemon → client: the session failed. `kind` as in [`crate::ErrorBody`].
@@ -72,5 +79,6 @@ mod tests {
         let e: Control = serde_json::from_str(r#"{"type":"exit","code":3,"oom_killed":false}"#).unwrap();
         assert_eq!(e, Control::Exit { code: 3, oom_killed: false });
         assert_eq!(serde_json::to_string(&Control::StdinEof).unwrap(), r#"{"type":"stdin_eof"}"#);
+        assert_eq!(serde_json::to_string(&Control::Hangup).unwrap(), r#"{"type":"hangup"}"#);
     }
 }
