@@ -107,8 +107,76 @@ pub fn created_by(op: &Op, state: &ImageConfigState) -> String {
 }
 
 /// Go's duration syntax (`300ms`, `1.5h`, `2h45m`; units `ns`, `us`/`µs`,
-/// `ms`, `s`, `m`, `h`), as `HEALTHCHECK`'s options take it.
+/// `ms`, `s`, `m`, `h`), as `HEALTHCHECK`'s options, compose files and the
+/// CLI's `--health-*` flags take it. `0` alone needs no unit; negative
+/// durations are refused (none of those uses has a meaning for one).
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
-    let _ = s;
-    unimplemented!("parse_duration: agent A")
+    let bad = || format!("invalid duration {s:?} (examples: 30s, 1m30s, 500ms)");
+    let text = s.trim().strip_prefix('+').unwrap_or(s.trim());
+    if text == "0" {
+        return Ok(Duration::ZERO);
+    }
+    if text.is_empty() || text.starts_with('-') {
+        return Err(bad());
+    }
+    let mut total: u128 = 0;
+    let mut rest = text;
+    while !rest.is_empty() {
+        let number_len = rest.find(|c: char| !(c.is_ascii_digit() || c == '.')).ok_or_else(bad)?;
+        let (number, after) = rest.split_at(number_len);
+        let unit_len = after.find(|c: char| c.is_ascii_digit() || c == '.').unwrap_or(after.len());
+        let (unit, next) = after.split_at(unit_len);
+        let nanos_per: u128 = match unit {
+            "ns" => 1,
+            "us" | "µs" | "μs" => 1_000,
+            "ms" => 1_000_000,
+            "s" => 1_000_000_000,
+            "m" => 60_000_000_000,
+            "h" => 3_600_000_000_000,
+            _ => return Err(bad()),
+        };
+        let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+        if whole.is_empty() && fraction.is_empty() {
+            return Err(bad());
+        }
+        let whole: u128 = if whole.is_empty() { 0 } else { whole.parse().map_err(|_| bad())? };
+        let mut part = whole.checked_mul(nanos_per).ok_or_else(bad)?;
+        // The fraction, digit by digit, to the nanosecond.
+        let mut scale = nanos_per;
+        for digit in fraction.chars() {
+            let d = digit.to_digit(10).ok_or_else(bad)? as u128;
+            scale /= 10;
+            part += d * scale;
+        }
+        total = total.checked_add(part).ok_or_else(bad)?;
+        rest = next;
+    }
+    u64::try_from(total).map(Duration::from_nanos).map_err(|_| bad())
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::*;
+
+    #[test]
+    fn go_durations() {
+        let d = |s| parse_duration(s).unwrap();
+        assert_eq!(d("30s"), Duration::from_secs(30));
+        assert_eq!(d("1m30s"), Duration::from_secs(90));
+        assert_eq!(d("2h45m"), Duration::from_secs(2 * 3600 + 45 * 60));
+        assert_eq!(d("1.5h"), Duration::from_secs(5400));
+        assert_eq!(d("300ms"), Duration::from_millis(300));
+        assert_eq!(d(".5s"), Duration::from_millis(500));
+        assert_eq!(d("1us"), Duration::from_micros(1));
+        assert_eq!(d("1µs"), Duration::from_micros(1));
+        assert_eq!(d("10ns"), Duration::from_nanos(10));
+        assert_eq!(d("0"), Duration::ZERO);
+        assert_eq!(d("0s"), Duration::ZERO);
+        assert_eq!(d("1h0m0.25s"), Duration::from_millis(3_600_250));
+        for bad in ["", "10", "s", "1x", "-1s", "1.2.3s", "1 s", "ms5", "."] {
+            assert!(parse_duration(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(d(" 1s "), Duration::from_secs(1), "surrounding whitespace is trimmed");
+        assert!(parse_duration("99999999999h").is_err(), "too long for u64 nanoseconds");
+    }
 }
