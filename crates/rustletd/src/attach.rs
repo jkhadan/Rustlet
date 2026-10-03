@@ -36,6 +36,14 @@ pub struct Waiting {
     resize: Arc<Mutex<Option<(u16, u16)>>>,
 }
 
+impl Waiting {
+    /// The stream the next start connects (for the daemon's own attaches:
+    /// a build's `RUN` output).
+    pub async fn stream(self) -> ApiResult<ShimStream> {
+        self.rx.await.unwrap_or_else(|_| Err(ApiError::internal("the start never connected the attach")))
+    }
+}
+
 /// Registers an attach with `c`, which isn't running: its next start
 /// connects it.
 pub fn register(c: &Container, stdin: bool) -> Waiting {

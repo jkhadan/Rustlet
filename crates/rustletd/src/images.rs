@@ -76,8 +76,7 @@ impl Images {
         let hex = name.strip_prefix("sha256:").unwrap_or(name);
         if hex.len() >= 4 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
             let mut found = BTreeSet::new();
-            for r in content.refs()? {
-                let d = r.manifest_digest()?;
+            for d in self.listed_digests()? {
                 if d.hex().starts_with(hex) {
                     found.insert(d);
                 }
@@ -101,7 +100,22 @@ impl Images {
         Ok(false)
     }
 
-    /// Every named image, one entry per manifest.
+    /// The images `images` lists: every named one and every kept unnamed
+    /// one (not the build cache's).
+    fn listed_digests(&self) -> ApiResult<BTreeSet<Digest>> {
+        let content = self.store.content();
+        let mut out = BTreeSet::new();
+        for r in content.refs()? {
+            out.insert(r.manifest_digest()?);
+        }
+        for d in content.kept()? {
+            out.insert(Digest::from_oci(d.digest())?);
+        }
+        Ok(out)
+    }
+
+    /// Every named image and every kept unnamed one (without names: Docker's
+    /// `<none>`), one entry per manifest.
     pub fn list(&self) -> ApiResult<Vec<ImageSummary>> {
         let mut by_digest: BTreeMap<Digest, Vec<String>> = BTreeMap::new();
         let mut repo: BTreeMap<Digest, String> = BTreeMap::new();
@@ -111,6 +125,9 @@ impl Images {
                 repo.insert(d.clone(), rd.to_string());
             }
             by_digest.entry(d).or_default().push(r.name.clone());
+        }
+        for d in self.store.content().kept()? {
+            by_digest.entry(Digest::from_oci(d.digest())?).or_default();
         }
         let mut out = Vec::new();
         for (digest, names) in by_digest {
@@ -373,8 +390,77 @@ impl Images {
                 response.untagged.push(n);
             }
         }
+        // An unnamed image kept in the store goes with its last name, or
+        // when it is removed by its id.
+        if last_name {
+            content.unkeep(&image.manifest_digest)?;
+        }
         response.deleted = self.collect_garbage(|| containers().into_keys().collect()).await?;
         Ok(response)
+    }
+
+    /// `tag`: gives the image `source` (a name, an id, a prefix of one) the
+    /// name `target`, taken from whatever it named before. Returns the full
+    /// name and the image's id. An unnamed image kept in the store is no
+    /// longer kept: its name keeps it now.
+    pub fn tag(&self, source: &str, target: &str) -> ApiResult<(String, Image)> {
+        let image = self.resolve(source)?;
+        let name = ImageRef::parse(target).map_err(|e| ApiError::invalid(format!("{target:?}: {e}")))?.name();
+        self.name_image(&image, &name)?;
+        Ok((name, image))
+    }
+
+    /// Points `name` at `image` (no longer kept unnamed, if it was).
+    pub fn name_image(&self, image: &Image, name: &str) -> ApiResult<()> {
+        let content = self.store.content();
+        let target = self.descriptor(image)?;
+        content.set_ref(&rustlet_image::content::RefEntry { name: name.to_owned(), target, repo_digest: None })?;
+        content.unkeep(&image.manifest_digest)?;
+        Ok(())
+    }
+
+    /// Keeps `image` without a name.
+    pub fn keep_image(&self, image: &Image) -> ApiResult<()> {
+        Ok(self.store.content().keep(&self.descriptor(image)?)?)
+    }
+
+    /// The `index.json` descriptor of a stored image's manifest.
+    fn descriptor(&self, image: &Image) -> ApiResult<rustlet_runtime::oci_spec::image::Descriptor> {
+        let content = self.store.content();
+        let size = content
+            .blob_size(&image.manifest_digest)?
+            .ok_or_else(|| ApiError::internal(format!("manifest {} vanished", image.manifest_digest)))?;
+        Ok(rustlet_image::content::manifest_descriptor(
+            rustlet_image::media::OCI_MANIFEST,
+            &image.manifest_digest,
+            size,
+        ))
+    }
+
+    /// The store, for the builder, commit, save and load.
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// The images `names` asks `save` for, each once, with the names it was
+    /// asked by (none for one asked by id).
+    pub fn for_save(&self, names: &[String]) -> ApiResult<Vec<(Image, Vec<String>)>> {
+        if names.is_empty() {
+            return Err(ApiError::invalid("save: name at least one image"));
+        }
+        let mut out: Vec<(Image, Vec<String>)> = Vec::new();
+        for name in names {
+            let image = self.resolve(name)?;
+            let by_name = ImageRef::parse(name)
+                .ok()
+                .map(|r| r.name())
+                .filter(|n| self.store.content().resolve(n).ok().flatten().is_some());
+            match out.iter_mut().find(|(i, _)| i.manifest_digest == image.manifest_digest) {
+                Some((_, names)) => names.extend(by_name.filter(|n| !names.contains(n))),
+                None => out.push((image, by_name.into_iter().collect())),
+            }
+        }
+        Ok(out)
     }
 
     /// Deletes blobs and snapshots that nothing in `index.json` and no

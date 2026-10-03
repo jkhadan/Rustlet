@@ -134,6 +134,8 @@ pub struct Paths {
     pub netns: PathBuf,
     /// `<data>/volumes/<name>/_data`.
     pub volumes: PathBuf,
+    /// `<data>/builds/<build id>/context`: build contexts, while built.
+    pub builds: PathBuf,
     /// The host sysctls' values from before Rustlets changed them, for
     /// `scripts/cleanup.sh`.
     pub sysctl_record: PathBuf,
@@ -152,6 +154,7 @@ impl Paths {
             data_lock: config.data_root.join("rustletd.lock"),
             netns: config.run_root.join("netns"),
             volumes: config.data_root.join("volumes"),
+            builds: config.data_root.join("builds"),
             sysctl_record: config.run_root.join("host-sysctl.orig"),
         }
     }

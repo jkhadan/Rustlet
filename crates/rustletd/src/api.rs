@@ -12,12 +12,15 @@ use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use rustlet_spec::build::{BuildEvent, BuildQuery, CommitRequest};
 use rustlet_spec::container::{
     AttachQuery, ContainerConfig, ContainerStatus, KillQuery, ListQuery, RemoveQuery, StopQuery, WaitQuery,
 };
 use rustlet_spec::event::{EventKind, EventsQuery};
 use rustlet_spec::exec::ExecConfig;
-use rustlet_spec::image::{ImageDeleteQuery, ImageQuery, PullEvent, PullQuery};
+use rustlet_spec::image::{
+    ImageDeleteQuery, ImageQuery, ImageSaveRequest, ImageTagQuery, LoadEvent, PullEvent, PullQuery,
+};
 use rustlet_spec::logs::LogsQuery;
 use rustlet_spec::network::{
     Network, NetworkConnect, NetworkCreate, NetworkCreateResponse, NetworkDisconnect, PruneResponse,
@@ -63,6 +66,12 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
         .route(pattern::IMAGES, get(images).delete(image_remove))
         .route(pattern::IMAGE_PULL, post(image_pull))
         .route(pattern::IMAGE_INSPECT, get(image_inspect))
+        .route(pattern::IMAGE_TAG, post(image_tag))
+        .route(pattern::IMAGE_SAVE, post(image_save))
+        .route(pattern::IMAGE_LOAD, post(image_load))
+        .route(pattern::COMMIT, post(commit))
+        .route(pattern::BUILD, post(build))
+        .route(pattern::BUILD_PRUNE, post(build_prune))
         .route(pattern::NETWORKS, get(networks).post(network_create))
         .route(pattern::NETWORK_PRUNE, post(network_prune))
         .route(pattern::NETWORK_CONNECT, post(network_connect))
@@ -422,6 +431,46 @@ async fn image_remove(
         d.events.emit(EventKind::Image, "delete", &q.name, [("id".to_owned(), id)].into());
     }
     Ok(Json(r))
+}
+
+async fn image_tag(State(d): D, Query(q): Query<ImageTagQuery>) -> ApiResult<Response> {
+    let (name, image) = d.images.tag(&q.source, &q.target)?;
+    d.events.emit(EventKind::Image, "tag", &name, [("id".to_owned(), image.manifest_digest.to_string())].into());
+    Ok(no_content())
+}
+
+async fn image_save(State(d): D, Json(req): Json<ImageSaveRequest>) -> ApiResult<Response> {
+    let body = d.save_images(&req.names)?;
+    Ok(([(header::CONTENT_TYPE, "application/x-tar")], body).into_response())
+}
+
+async fn image_load(State(d): D, body: Body) -> ApiResult<Response> {
+    // Made here: it takes the runtime's handle, for the blocking thread.
+    let input = crate::pipe::reader(body);
+    let (tx, rx) = mpsc::channel::<LoadEvent>(256);
+    tokio::spawn(async move { d.load_images(input, tx).await });
+    Ok(ndjson(rx))
+}
+
+// ── build and commit ───────────────────────────────────────────────────────
+
+async fn commit(State(d): D, Json(req): Json<CommitRequest>) -> ApiResult<Response> {
+    let r = to_the_end(async move { d.commit(req).await }).await?;
+    Ok((StatusCode::CREATED, Json(r)).into_response())
+}
+
+async fn build(State(d): D, Query(q): Query<BuildQuery>, body: Body) -> ApiResult<Response> {
+    let options = q.options().map_err(ApiError::invalid)?;
+    // What can be refused before the context arrives is.
+    crate::build::check_options(&options)?;
+    let input = crate::pipe::reader(body);
+    let (tx, rx) = mpsc::channel::<BuildEvent>(256);
+    tokio::spawn(async move { d.build(options, input, tx).await });
+    Ok(ndjson(rx))
+}
+
+async fn build_prune(State(d): D) -> ApiResult<Json<PruneResponse>> {
+    Ok(Json(to_the_end(async move { d.prune_build_cache().await }).await?))
 }
 
 // ── networks ───────────────────────────────────────────────────────────────

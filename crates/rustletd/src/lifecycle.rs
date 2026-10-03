@@ -900,7 +900,7 @@ fn unknown_exit() -> ExitStatus {
 }
 
 /// Sends `request`, expecting `Ok`.
-async fn shim_ok(socket: &Path, request: Request) -> ApiResult<()> {
+pub(crate) async fn shim_ok(socket: &Path, request: Request) -> ApiResult<()> {
     match shim::call(socket, &request).await {
         Ok(Response::Ok) => Ok(()),
         Ok(Response::Error { message, exit_code }) => Err(ApiError::runtime(message, exit_code)),

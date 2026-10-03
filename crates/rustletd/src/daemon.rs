@@ -13,7 +13,8 @@
 //!   6. the host's network: the netns pin directory, the bridges, the
 //!      firewall, then IP forwarding
 //!   7. every container reconciled with what is still running (the shims
-//!      that outlived the last daemon); the firewall again
+//!      that outlived the last daemon); the firewall again; what a build
+//!      cut short left (its context, scratch root filesystems, containers)
 //!   8. the API socket; READY=1 to systemd
 //! ```
 
@@ -138,6 +139,7 @@ impl Daemon {
         });
         daemon.networks.setup_host(netns_dir).await?;
         daemon.reconcile().await;
+        daemon.remove_build_leftovers().await;
         Ok(daemon)
     }
 

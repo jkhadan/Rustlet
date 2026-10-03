@@ -24,7 +24,9 @@
 //! | `health` | healthchecks: a command run in the container now and then |
 //! | `attach`, `exec` | WebSocket sessions bridged to shim streams |
 //! | `logs`, `stats`, `events` | the streams |
-//! | `images`, `worker` | pulls and unpacks in memory-limited children, rmi + GC |
+//! | `images`, `worker` | pulls and unpacks in memory-limited children, rmi + GC, tag |
+//! | `archive`, `commit` | save and load; a container's changes as an image |
+//! | `build` | building images: a Containerfile's steps, `RUN` in containers |
 //! | `network` | networks, a run's namespace, address, DNS names and published ports, the firewall |
 //! | `volumes` | volumes, mounts, copy-up |
 //! | `spec` | image + options → config.json |
@@ -32,7 +34,10 @@
 #![forbid(unsafe_code)]
 
 mod api;
+mod archive;
 mod attach;
+mod build;
+mod commit;
 mod config;
 mod container;
 mod daemon;
@@ -48,6 +53,7 @@ mod logs;
 mod names;
 mod network;
 mod notify;
+mod pipe;
 mod spec;
 mod stats;
 mod volumes;
