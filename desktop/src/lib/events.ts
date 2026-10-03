@@ -98,8 +98,10 @@ export function applyEvents(client: QueryClient, events: Event[]): void {
   }
 }
 
-/** One line for an event, as the activity feed shows it. */
-export function describeEvent(e: Event): string {
+/** One line for an event, as the activity feed shows it. `nameOf` gives
+ * a container's name from its id where the event has none (network
+ * events name the container by id). */
+export function describeEvent(e: Event, nameOf: (id: string) => string | undefined = () => undefined): string {
   const name = e.attributes.name ?? e.id.slice(0, 12);
   switch (e.kind) {
     case "container":
@@ -129,7 +131,8 @@ export function describeEvent(e: Event): string {
     case "network": {
       const net = e.attributes.name ?? e.id.slice(0, 12);
       if (e.action === "connect" || e.action === "disconnect") {
-        const c = e.attributes.container?.slice(0, 12) ?? "a container";
+        const id = e.attributes.container;
+        const c = (id && nameOf(id)) ?? id?.slice(0, 12) ?? "a container";
         return `${c} ${e.action}ed ${e.action === "connect" ? "to" : "from"} ${net}`;
       }
       return `network ${net} ${e.action === "create" ? "created" : "removed"}`;

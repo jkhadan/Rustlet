@@ -34,6 +34,12 @@ export function Dashboard() {
   }
   const i = info.data;
   const live = (containers.data ?? []).filter(isLive);
+  // Network events name containers by id: the names come from the
+  // containers' own events (removed ones too) and from those still here.
+  const names = new Map<string, string>();
+  for (const e of events) if (e.kind === "container" && e.attributes.name) names.set(e.id, e.attributes.name);
+  for (const c of containers.data ?? []) names.set(c.id, c.name);
+  const nameOf = (id: string) => names.get(id);
 
   return (
     <div>
@@ -116,7 +122,7 @@ export function Dashboard() {
                 </li>
               )}
               {events.map((e, n) => (
-                <EventRow key={`${e.time}-${n}`} event={e} now={now} />
+                <EventRow key={`${e.time}-${n}`} event={e} now={now} nameOf={nameOf} />
               ))}
             </ul>
           </Card>
@@ -158,14 +164,14 @@ const DOT: Record<string, string> = {
   delete: "bg-destructive",
 };
 
-function EventRow({ event: e, now }: { event: Event; now: number }) {
+function EventRow({ event: e, now, nameOf }: { event: Event; now: number; nameOf: (id: string) => string | undefined }) {
   const failed = e.action === "die" && e.attributes.exit_code && e.attributes.exit_code !== "0";
   const link = e.kind === "container" && e.action !== "destroy" ? `/containers/${e.id}` : e.kind === "image" ? null : `/${e.kind}s`;
   const body = (
     <div className="flex items-start gap-3 px-4 py-2">
       <span className={cn("mt-1.5 size-2 shrink-0 rounded-full", failed ? "bg-destructive" : (DOT[e.action] ?? "bg-muted-foreground/50"))} />
       <div className="min-w-0 flex-1">
-        <div className="text-sm break-words">{describeEvent(e)}</div>
+        <div className="text-sm break-words">{describeEvent(e, nameOf)}</div>
         <div className="text-muted-foreground text-[11px]">
           {e.kind} {e.action} · {ago(e.time, now)}
         </div>

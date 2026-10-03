@@ -115,5 +115,9 @@ describe("activity feed lines", () => {
       "0123456789ab connected to backend",
     );
     expect(describeEvent(event("volume", "destroy", "data"))).toBe("volume data removed");
+    const names = (id: string) => (id === "0123456789abcdef" ? "web" : undefined);
+    expect(describeEvent(event("network", "disconnect", "n1", { name: "bridge", container: "0123456789abcdef" }), names)).toBe(
+      "web disconnected from bridge",
+    );
   });
 });
