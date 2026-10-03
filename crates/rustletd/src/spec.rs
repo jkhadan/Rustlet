@@ -224,6 +224,11 @@ pub fn build(image: &Image, rootfs: &Path, c: &ContainerConfig, plan: &RunPlan, 
     if let Some(nnp) = checked.no_new_privileges {
         spec.process_mut().get_or_insert_with(Default::default).set_no_new_privileges(Some(nnp));
     }
+    // The daemon runs with OOMScoreAdjust=-500, so that the kernel's OOM
+    // killer takes it last, and its shims inherit that. Without a value of
+    // its own, a container (and its execs) would too, and be spared before
+    // the host's ordinary processes. As with Docker, containers get 0.
+    spec.process_mut().get_or_insert_with(Default::default).set_oom_score_adj(Some(0));
     for (host, container, access) in &checked.devices {
         rustlet_runtime::spec::add_host_device(&mut spec, Path::new(host), Path::new(container), access)
             .map_err(|e| ApiError::invalid(format!("--device {host}: {e}")))?;

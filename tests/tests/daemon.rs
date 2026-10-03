@@ -631,6 +631,8 @@ fn dm_isolation_report() {
         let null = r.devices.iter().find(|d| (d.kind.as_str(), d.major, d.minor) == ("c", Some(1), Some(3)));
         assert!(null.is_some_and(|d| d.allow && d.access == "rwm"), "/dev/null: {:?}", r.devices);
         assert_eq!((r.credentials.uid, r.credentials.host_uid), (0, 0));
+        // Not the daemon's -500 (the test daemon has it, as the service).
+        assert_eq!(r.oom_score_adj, 0);
         assert!(r.cgroup.path.ends_with(&web), "{:?}", r.cgroup);
         assert_eq!(r.cgroup.memory_max, None);
         assert!(r.cgroup.pids_current >= 1);

@@ -84,6 +84,10 @@ impl TestDaemon {
             .stdout(log.try_clone().unwrap())
             .stderr(log);
         let child = self.net.host.spawn(&mut cmd);
+        // As the service's OOMScoreAdjust=-500: what the daemon's children
+        // inherit unless the daemon says otherwise (root may lower it).
+        // Nothing has been forked yet: the daemon isn't listening.
+        let _ = std::fs::write(format!("/proc/{}/oom_score_adj", child.id()), "-500");
         self.child = Some(child);
         let deadline = Instant::now() + Duration::from_secs(30);
         while std::os::unix::net::UnixStream::connect(&self.socket).is_err() {
