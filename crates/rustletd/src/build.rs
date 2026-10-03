@@ -118,6 +118,17 @@ impl StageState {
         }
     }
 
+    /// When its filesystem last changed: its last history entry's time, or
+    /// its base config's, or now.
+    fn last_change(&self) -> String {
+        self.history
+            .iter()
+            .rev()
+            .find_map(|h| h["created"].as_str())
+            .or_else(|| self.base["created"].as_str())
+            .map_or_else(now, str::to_owned)
+    }
+
     /// The chain ID of its top layer: what identifies its filesystem.
     fn top_chain_id(&self) -> String {
         let ids: Vec<Digest> = self.layers.iter().map(|l| l.diff_id.clone()).collect();
@@ -362,7 +373,10 @@ impl Build {
                     let line = created_by(&op, &st.config);
                     st.config.apply(&op).map_err(at)?;
                     st.key = next_key(&st.key, &line);
-                    st.history.push(json!({"created": now(), "created_by": line, "empty_layer": true}));
+                    // Dated as the last change of the filesystem, so that a
+                    // build whose layers all come from the cache makes the
+                    // same config, and so the same image, as the one before.
+                    st.history.push(json!({"created": st.last_change(), "created_by": line, "empty_layer": true}));
                     None
                 }
             };
@@ -426,7 +440,7 @@ impl Build {
         let mut config = st.base.clone();
         config["architecture"] = json!("amd64");
         config["os"] = json!("linux");
-        config["created"] = json!(now());
+        config["created"] = json!(st.last_change());
         config["config"] = st.config.to_value();
         config["rootfs"] =
             json!({"type": "layers", "diff_ids": st.layers.iter().map(|l| l.diff_id.to_string()).collect::<Vec<_>>()});
@@ -472,11 +486,15 @@ impl Build {
         Some((LayerRef { descriptor, diff_id: image.layers[n].diff_id.clone() }, entry))
     }
 
-    /// Adds `layer` to `st` and records the result under `key`.
-    fn add_layer(&self, st: &mut StageState, key: String, layer: LayerRef, history: Value) -> ApiResult<()> {
+    /// Adds `layer` to `st`, and records the result under `key` (unless it
+    /// came from there).
+    fn add_layer(&self, st: &mut StageState, key: String, layer: LayerRef, history: Value, record: bool) -> ApiResult<()> {
         st.layers.push(layer);
         st.history.push(history);
         st.key = key;
+        if !record {
+            return Ok(());
+        }
         let image = self.write_image(st)?;
         let content = self.d.images.store().content();
         let size = content.blob_size(&image.manifest_digest)?.unwrap_or_default();
@@ -501,7 +519,7 @@ impl Build {
         if let Some((layer, history)) = self.cached(st, &key) {
             self.emit(BuildEvent::Cached { step: self.step }).await?;
             let digest = layer.descriptor.digest().to_string();
-            self.add_layer(st, key, layer, history)?;
+            self.add_layer(st, key, layer, history, false)?;
             return Ok(digest);
         }
         let parent = self.write_image(st)?;
@@ -543,7 +561,7 @@ impl Build {
         let layer = layer?;
         let digest = layer.descriptor.digest().to_string();
         let history = json!({"created": now(), "created_by": line});
-        self.add_layer(st, key, LayerRef { descriptor: layer.descriptor, diff_id: layer.diff_id }, history)?;
+        self.add_layer(st, key, LayerRef { descriptor: layer.descriptor, diff_id: layer.diff_id }, history, true)?;
         Ok(digest)
     }
 
@@ -641,7 +659,7 @@ impl Build {
         if let Some((layer, history)) = self.cached(st, &key) {
             self.emit(BuildEvent::Cached { step: self.step }).await?;
             let digest = layer.descriptor.digest().to_string();
-            self.add_layer(st, key, layer, history)?;
+            self.add_layer(st, key, layer, history, false)?;
             return Ok(digest);
         }
         // The source's root filesystem, for --from.
@@ -701,7 +719,7 @@ impl Build {
         let layer = layer?;
         let digest = layer.descriptor.digest().to_string();
         let history = json!({"created": now(), "created_by": line});
-        self.add_layer(st, key, LayerRef { descriptor: layer.descriptor, diff_id: layer.diff_id }, history)?;
+        self.add_layer(st, key, LayerRef { descriptor: layer.descriptor, diff_id: layer.diff_id }, history, true)?;
         Ok(digest)
     }
 

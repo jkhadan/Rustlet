@@ -204,6 +204,7 @@ fn bd_the_cache_runs_nothing_twice() {
             async move { c.inspect_image(&id).await.unwrap().diff_ids }
         };
         assert_eq!(layers(first.id()).await, layers(second.id()).await, "the same layers");
+        assert_eq!(first.id(), second.id(), "from the cache alone: the same image");
         // A file's mtime alone doesn't count; its content does.
         let changed =
             build(&c, tagged("app"), &[("Containerfile", file, 0o644), ("hello.txt", b"hello again\n", 0o644)]).await;
