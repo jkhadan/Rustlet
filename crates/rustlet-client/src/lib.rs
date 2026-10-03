@@ -73,6 +73,7 @@ use rustlet_spec::exec::{ExecConfig, ExecCreated, ExecInspect, ExecStarted};
 use rustlet_spec::image::{
     ImageDeleteQuery, ImageDeleteResponse, ImageInspect, ImageQuery, ImageSummary, PullEvent, PullPolicy, PullQuery,
 };
+use rustlet_spec::isolation::Isolation;
 use rustlet_spec::logs::{LogEntry, LogsQuery};
 use rustlet_spec::network::{
     Network, NetworkConnect, NetworkCreate, NetworkCreateResponse, NetworkDisconnect, PruneResponse,
@@ -259,6 +260,12 @@ impl Client {
     }
 
     // --- exec ---
+
+    /// `GET /containers/{id}/isolation`: what separates a running container
+    /// from the host (a conflict for one that isn't running).
+    pub async fn isolation(&self, id: &str) -> Result<Isolation> {
+        self.get(action(id, routes::action::ISOLATION)).await
+    }
 
     /// Checks `config` and returns an exec id, to be started within a
     /// minute.

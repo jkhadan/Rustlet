@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 use crate::daemon::Daemon;
 use crate::error::{ApiError, ApiResult};
 use crate::lifecycle::blocking;
-use crate::{logs, stats};
+use crate::{isolation, logs, stats};
 
 type D = State<Arc<Daemon>>;
 
@@ -57,6 +57,7 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
         .route(&c(action::STATS), get(container_stats))
         .route(&c(action::ATTACH), get(attach))
         .route(&c(action::EXEC), post(exec_create))
+        .route(&c(action::ISOLATION), get(container_isolation))
         .route(pattern::EXEC, get(exec_inspect))
         .route(pattern::EXEC_START, get(exec_start_attached).post(exec_start_detached))
         .route(pattern::IMAGES, get(images).delete(image_remove))
@@ -188,6 +189,14 @@ async fn create(State(d): D, Json(config): Json<ContainerConfig>) -> ApiResult<R
 async fn inspect(State(d): D, Path(id): Path<String>) -> ApiResult<Json<rustlet_spec::container::ContainerInspect>> {
     let c = d.find(&id)?;
     Ok(Json(c.inspect(&d.paths, &d.cgroup_parent, d.mount_points(&c))))
+}
+
+async fn container_isolation(
+    State(d): D,
+    Path(id): Path<String>,
+) -> ApiResult<Json<rustlet_spec::isolation::Isolation>> {
+    let c = d.find(&id)?;
+    blocking(move || isolation::report(&d, &c)).await.map(Json)
 }
 
 async fn remove(State(d): D, Path(id): Path<String>, Query(q): Query<RemoveQuery>) -> ApiResult<Response> {

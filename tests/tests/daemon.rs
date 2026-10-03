@@ -560,3 +560,117 @@ fn dm_images_and_garbage_collection() {
         assert!(c.list_images().await.unwrap().is_empty());
     });
 }
+
+/// The isolation report (Phase 6, the desktop app's inspector): namespaces
+/// made, joined and shared (with the host and between containers), the
+/// capability sets, seccomp, the user namespace's maps and the cgroup's
+/// limits, read from a running container; a stopped one has none.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn dm_isolation_report() {
+    use rustlet_spec::isolation::{NamespaceMode, SeccompMode};
+    use rustlet_spec::network::NetworkMode;
+    let d = daemon();
+    block_on(async {
+        let c = d.client();
+        let run = async |cfg: ContainerConfig| {
+            let id = c.create_container(&cfg).await.unwrap().id;
+            c.start(&id).await.unwrap();
+            id
+        };
+        let web = run(ContainerConfig { name: Some("web".into()), ..sh("sleep 1000") }).await;
+        let side = run(ContainerConfig {
+            name: Some("side".into()),
+            network: NetworkMode::Container("web".into()),
+            cap_drop: vec!["ALL".into()],
+            memory: Some(64 << 20),
+            pids_limit: Some(50),
+            cpus: Some(0.5),
+            ..sh("sleep 1000")
+        })
+        .await;
+        let remapped = run(ContainerConfig {
+            name: Some("remapped".into()),
+            userns: UsernsMode::Remap,
+            network: NetworkMode::Host,
+            read_only: true,
+            security_opt: vec!["seccomp=unconfined".into()],
+            ..sh("sleep 1000")
+        })
+        .await;
+
+        let r = c.isolation("web").await.unwrap();
+        assert_eq!(r.id, web);
+        let ns = |r: &rustlet_spec::isolation::Isolation, kind: &str| {
+            r.namespaces.iter().find(|n| n.kind == kind).unwrap_or_else(|| panic!("no {kind}")).clone()
+        };
+        assert_eq!(r.namespaces.len(), 8);
+        for kind in ["mnt", "uts", "ipc", "pid", "cgroup"] {
+            let n = ns(&r, kind);
+            assert!(n.mode == NamespaceMode::New && !n.shared_with_host && n.inode != 0, "{n:?}");
+        }
+        let user = ns(&r, "user");
+        assert!(user.mode == NamespaceMode::Host && user.shared_with_host, "{user:?}");
+        assert!(r.uid_map.is_empty(), "no user namespace of its own: {:?}", r.uid_map);
+        let net = ns(&r, "net");
+        assert_eq!(net.mode, NamespaceMode::Join, "a pinned namespace: {net:?}");
+        assert_eq!(net.shared_with, ["side"]);
+        assert!(!net.shared_with_host);
+        assert!(r.capabilities.effective.contains(&"CAP_CHOWN".to_string()), "{:?}", r.capabilities);
+        assert!(!r.capabilities.bounding.contains(&"CAP_SYS_ADMIN".to_string()));
+        assert!(r.capabilities.known.len() >= 41);
+        assert_eq!(r.seccomp.mode, SeccompMode::Filter);
+        assert!(r.seccomp.filters >= 1);
+        let profile = r.seccomp.profile.clone().expect("the default profile");
+        assert_eq!(profile.default_action, "SCMP_ACT_ERRNO");
+        assert!(profile.allowed.iter().any(|s| s == "read"), "{profile:?}");
+        assert!(!profile.allowed.iter().any(|s| s == "mount"), "mount needs CAP_SYS_ADMIN");
+        assert!(r.filesystem.masked_paths.iter().any(|p| p == "/proc/kcore"), "{:?}", r.filesystem);
+        assert!(!r.filesystem.read_only);
+        assert!(r.filesystem.mounts.iter().any(|m| m.destination == "/proc" && m.kind == "proc"));
+        let null = r.devices.iter().find(|d| (d.kind.as_str(), d.major, d.minor) == ("c", Some(1), Some(3)));
+        assert!(null.is_some_and(|d| d.allow && d.access == "rwm"), "/dev/null: {:?}", r.devices);
+        assert_eq!((r.credentials.uid, r.credentials.host_uid), (0, 0));
+        assert!(r.cgroup.path.ends_with(&web), "{:?}", r.cgroup);
+        assert_eq!(r.cgroup.memory_max, None);
+        assert!(r.cgroup.pids_current >= 1);
+
+        let s = c.isolation("side").await.unwrap();
+        assert_eq!(ns(&s, "net").shared_with, ["web"]);
+        assert_eq!(ns(&s, "net").inode, net.inode);
+        assert_ne!(ns(&s, "pid").inode, ns(&r, "pid").inode);
+        assert!(s.capabilities.effective.is_empty() && s.capabilities.bounding.is_empty(), "{:?}", s.capabilities);
+        assert_eq!(s.cgroup.memory_max, Some(64 << 20));
+        assert_eq!(s.cgroup.pids_max, Some(50));
+        assert_eq!((s.cgroup.cpu_quota, s.cgroup.cpu_period), (Some(50_000), 100_000));
+
+        let m = c.isolation(&remapped).await.unwrap();
+        let user = ns(&m, "user");
+        assert!(user.mode == NamespaceMode::New && !user.shared_with_host, "{user:?}");
+        assert_eq!(m.uid_map.len(), 1);
+        assert_eq!((m.uid_map[0].container_id, m.uid_map[0].host_id, m.uid_map[0].size), (0, 1_000_000, 65536));
+        assert_eq!((m.credentials.uid, m.credentials.host_uid), (0, 1_000_000));
+        assert!(ns(&m, "net").shared_with_host && ns(&m, "net").mode == NamespaceMode::Host);
+        assert_eq!(m.seccomp.mode, SeccompMode::Disabled);
+        assert!(m.seccomp.profile.is_none());
+        assert!(m.filesystem.read_only);
+
+        // Not running: nothing to read.
+        c.kill(&side, None).await.unwrap();
+        c.wait(&side, WaitCondition::NotRunning).await.unwrap();
+        assert_eq!(c.isolation(&side).await.unwrap_err().kind(), Some(ErrorKind::Conflict));
+        assert_eq!(c.isolation("nope").await.unwrap_err().kind(), Some(ErrorKind::NoSuchContainer));
+
+        // The image's layers, with their sizes and snapshots.
+        let image = c.inspect_image("alpine").await.unwrap();
+        assert_eq!(image.layer_details.len(), image.summary.layers);
+        let layer = &image.layer_details[0];
+        assert!(layer.digest.starts_with("sha256:") && layer.size > 0 && layer.unpacked, "{layer:?}");
+        assert_eq!(layer.chain_id, image.chain_ids[0]);
+        assert_eq!(layer.diff_id, image.diff_ids[0]);
+
+        for id in [&web, &side, &remapped] {
+            c.remove_container(id, true).await.unwrap();
+        }
+    });
+}

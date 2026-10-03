@@ -40,6 +40,7 @@ mod error;
 mod events;
 mod exec;
 mod images;
+mod isolation;
 mod lifecycle;
 mod logs;
 mod names;
