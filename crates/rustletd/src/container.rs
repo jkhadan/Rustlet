@@ -159,6 +159,7 @@ impl Container {
             state: self.persisted().state,
             labels: r.config.labels.clone(),
             ports: self.persisted().network.map(|n| n.ports).unwrap_or_default(),
+            network_mode: r.config.network.clone(),
         }
     }
 

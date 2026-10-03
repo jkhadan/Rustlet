@@ -279,6 +279,9 @@ pub struct ContainerSummary {
     pub labels: BTreeMap<String, String>,
     /// While it runs: its published ports.
     pub ports: Vec<PublishedPort>,
+    /// `--network`: where its network namespace comes from (its addresses
+    /// on bridge networks are the networks' to list).
+    pub network_mode: NetworkMode,
 }
 
 /// `GET /v1/containers/{id}`.
