@@ -15,9 +15,11 @@ members = [
     "crates/rustlet-cli",
     "xtask",
     "tests",
+    "desktop/src-tauri",
 ]
-# `desktop/src-tauri` is its own workspace member once Phase 6 lands; it is kept
-# out of `default-members` so a plain `cargo build` never needs webkit2gtk.
+# `desktop/src-tauri` (the desktop app) is kept out of `default-members`, so a
+# plain `cargo build` never needs webkit2gtk: build it with `-p rustlet-desktop`
+# or `pnpm tauri build` in desktop/.
 default-members = [
     "crates/rustlet-sys",
     "crates/rustlet-spec",
