@@ -331,6 +331,15 @@ fn merge(path: &mut Vec<String>, base: Value, over: Value) -> Result<Value> {
         }
         (Rule::AsMap, base, over) => {
             let mut map = as_map(base);
+            // `KEY: !reset …` takes the key away (`strip_tags` drops the
+            // entry, which alone would leave the earlier file's value).
+            if let Value::Mapping(entries) = &over {
+                for (key, value) in entries {
+                    if matches!(value, Value::Tagged(t) if t.tag == "reset") {
+                        map.remove(key);
+                    }
+                }
+            }
             map.extend(as_map(strip_tags(over, path)?));
             Value::Mapping(map)
         }
@@ -1199,6 +1208,12 @@ services:
         assert!(web.config.ports.is_empty());
         assert_eq!(web.config.env, ["C=3"]);
         assert_eq!(web.config.healthcheck, None);
+        // A key of a merged mapping, reset: gone (Compose's own example).
+        let p = merged(
+            "services:\n  web:\n    image: app\n    environment: {A: '1', DEBUG: '1'}\n",
+            "services:\n  web:\n    environment:\n      DEBUG: !reset null\n",
+        );
+        assert_eq!(p.service("web").unwrap().config.env, ["A=1"]);
         let dir = dir_with(&[("a.yaml", "services:\n  web:\n    image: !custom x\n")]);
         let e = load(&LoadOptions { files: vec![dir.path().join("a.yaml")], ..LoadOptions::default() }).unwrap_err();
         let expected =
