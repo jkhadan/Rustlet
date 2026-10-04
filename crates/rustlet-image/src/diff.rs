@@ -55,7 +55,10 @@
 //!   everything below them: a container's mount points (`/proc`, `/dev`,
 //!   `/etc/resolv.conf`, its volumes' targets) are made by the runtime when
 //!   the image lacks them, and are no change of the container's; what is
-//!   below one was hidden by the mount. The skipped paths are matched as
+//!   below one was hidden by the mount. A directory that held nothing but
+//!   such paths (`/etc` copied up for `/etc/resolv.conf`, the parents made
+//!   for a volume's target) goes with them; an empty directory of the
+//!   container's own stays. The skipped paths are matched as
 //!   written (`.`, `..` and repeated `/` aside), not through the image's
 //!   symlinks. So is an entry the container itself named `.wh.<something>`:
 //!   in a layer, that name means a whiteout.
@@ -200,6 +203,20 @@ struct Frame {
     rel: Vec<u8>,
     /// The entries still to write.
     names: std::vec::IntoIter<OsString>,
+    /// Its own entry, until something in it is written (see
+    /// [`Differ::finish_dir`]).
+    pending: Option<PendingDir>,
+    /// Something below it was left out as a mount point, or was a directory
+    /// that held only such.
+    held_mounts: bool,
+}
+
+/// A directory's entry, not written yet.
+struct PendingDir {
+    /// Its archive name, with the trailing `/`.
+    entry: Vec<u8>,
+    st: FileStat,
+    xattrs: Vec<(String, Vec<u8>)>,
 }
 
 struct Differ<'w, 'a> {
@@ -217,13 +234,15 @@ impl Differ<'_, '_> {
     /// The walk, depth first, from the upper directory `root`.
     fn walk(&mut self, root: OwnedFd) -> Result<()> {
         let names = entries(root.as_fd()).context("list the upper directory")?;
-        let mut stack = vec![Frame { dir: root, rel: Vec::new(), names: names.into_iter() }];
+        let mut stack =
+            vec![Frame { dir: root, rel: Vec::new(), names: names.into_iter(), pending: None, held_mounts: false }];
         while let Some(dir) = stack.last_mut() {
             let Some(name) = dir.names.next() else {
-                stack.pop();
+                let done = stack.pop().expect("the loop just looked at it");
+                self.finish_dir(&mut stack, done)?;
                 continue;
             };
-            if let Some(sub) = self.entry(dir, &name)? {
+            if let Some(sub) = self.entry(&mut stack, &name)? {
                 if stack.len() > MAX_DEPTH {
                     return Err(Error::unsupported(format!(
                         "{:?}: more than {MAX_DEPTH} levels deep",
@@ -236,12 +255,18 @@ impl Differ<'_, '_> {
         Ok(())
     }
 
-    /// Writes the entry `name` of `dir`, or leaves it out. A directory is
-    /// returned for the walk to enter.
-    fn entry(&mut self, dir: &Frame, name: &OsStr) -> Result<Option<Frame>> {
+    /// Writes the entry `name` of the directory atop `stack`, or leaves it
+    /// out. A directory is returned for the walk to enter.
+    fn entry(&mut self, stack: &mut [Frame], name: &OsStr) -> Result<Option<Frame>> {
+        let dir = stack.last_mut().expect("the walk is in a directory");
         let rel = child(&dir.rel, name.as_bytes());
         let path = in_container(&rel);
-        if self.skip.contains(&rel) || name.as_bytes().starts_with(WHITEOUT_PREFIX) {
+        if self.skip.contains(&rel) {
+            self.report.skipped.push(path.to_string_lossy().into_owned());
+            dir.held_mounts = true;
+            return Ok(None);
+        }
+        if name.as_bytes().starts_with(WHITEOUT_PREFIX) {
             self.report.skipped.push(path.to_string_lossy().into_owned());
             return Ok(None);
         }
@@ -249,30 +274,89 @@ impl Differ<'_, '_> {
         let st = nix::sys::stat::fstatat(&dir.dir, name, AtFlags::AT_SYMLINK_NOFOLLOW)
             .with_context(|| format!("{shown}: stat"))?;
         match st.st_mode & libc::S_IFMT {
-            libc::S_IFDIR => return self.directory(dir, name, rel, &st, &shown).map(Some),
-            libc::S_IFCHR if st.st_rdev == 0 => self.whiteout(&dir.rel, name)?,
-            libc::S_IFREG | libc::S_IFLNK | libc::S_IFIFO => self.leaf(dir, name, rel, &st, &shown)?,
+            libc::S_IFDIR => return self.directory(stack, name, rel, &st, &shown).map(Some),
+            libc::S_IFCHR if st.st_rdev == 0 => {
+                self.flush(stack)?;
+                let dir = stack.last().expect("the walk is in a directory");
+                self.whiteout(&dir.rel, name)?
+            }
+            libc::S_IFREG | libc::S_IFLNK | libc::S_IFIFO => {
+                self.flush(stack)?;
+                let dir = stack.last().expect("the walk is in a directory");
+                self.leaf(dir, name, rel, &st, &shown)?
+            }
             // Device nodes and sockets.
             _ => self.report.skipped.push(path.to_string_lossy().into_owned()),
         }
         Ok(None)
     }
 
-    /// A directory's entry, then its opaque marker if it has one. Returned
-    /// to be walked.
-    fn directory(&mut self, parent: &Frame, name: &OsStr, rel: Vec<u8>, st: &FileStat, shown: &str) -> Result<Frame> {
+    /// A directory, returned to be walked. Its entry waits until something
+    /// in it is written ([`flush`](Self::flush)) or its walk ends
+    /// ([`finish_dir`](Self::finish_dir)); an opaque one is written at once,
+    /// with its marker: hiding the lower layers' entries is a change in
+    /// itself.
+    fn directory(
+        &mut self,
+        stack: &mut [Frame],
+        name: &OsStr,
+        rel: Vec<u8>,
+        st: &FileStat,
+        shown: &str,
+    ) -> Result<Frame> {
+        let parent = stack.last().expect("the walk is in a directory");
         let dir = open_checked(parent.dir.as_fd(), name, st, shown)?;
         let attrs = self.xattrs(&Attrs::Fd(dir.as_fd()), shown)?;
         let mut entry = rel.clone();
         entry.push(b'/');
-        self.put(&EntryHeader { xattrs: &attrs.kept, ..self.header(&entry, EntryType::Directory, st) })?;
-        if attrs.opaque {
-            entry.extend_from_slice(OPAQUE_MARKER);
-            self.marker(&entry)?;
-            self.report.opaque_dirs += 1;
-        }
         let names = entries(dir.as_fd()).with_context(|| format!("{shown}: list it"))?;
-        Ok(Frame { dir, rel, names: names.into_iter() })
+        let pending = PendingDir { entry, st: *st, xattrs: attrs.kept };
+        if attrs.opaque {
+            self.flush(stack)?;
+            self.write_dir(&pending)?;
+            let mut marker = pending.entry;
+            marker.extend_from_slice(OPAQUE_MARKER);
+            self.marker(&marker)?;
+            self.report.opaque_dirs += 1;
+            return Ok(Frame { dir, rel, names: names.into_iter(), pending: None, held_mounts: false });
+        }
+        Ok(Frame { dir, rel, names: names.into_iter(), pending: Some(pending), held_mounts: false })
+    }
+
+    /// The directories being walked whose entries aren't written yet,
+    /// outermost first: something below them is about to be.
+    fn flush(&mut self, stack: &mut [Frame]) -> Result<()> {
+        for frame in stack.iter_mut() {
+            if let Some(pending) = frame.pending.take() {
+                self.write_dir(&pending)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A directory whose entries are all done, nothing of them written: an
+    /// empty directory of the container's own (a `mkdir`), written now;
+    /// unless all it held was mount points (and directories of nothing
+    /// else), which the runtime makes where the image lacks them (`/etc`
+    /// for `/etc/resolv.conf`, a volume's target and its parents) and are no
+    /// change of the container's: then it is left out too, as Docker's
+    /// init layer keeps such paths out of a container's diff.
+    fn finish_dir(&mut self, stack: &mut [Frame], done: Frame) -> Result<()> {
+        let Some(pending) = done.pending else { return Ok(()) };
+        if done.held_mounts {
+            self.report.skipped.push(in_container(&done.rel).to_string_lossy().into_owned());
+            if let Some(parent) = stack.last_mut() {
+                parent.held_mounts = true;
+            }
+            return Ok(());
+        }
+        self.flush(stack)?;
+        self.write_dir(&pending)
+    }
+
+    fn write_dir(&mut self, pending: &PendingDir) -> Result<()> {
+        let header = self.header(&pending.entry, EntryType::Directory, &pending.st);
+        self.put(&EntryHeader { xattrs: &pending.xattrs, ..header })
     }
 
     /// A file, symlink or FIFO; or a later name of one already written, as
@@ -1364,18 +1448,50 @@ mod tests {
             PathBuf::from("/etc/../dir/nothing"),
         ];
         let (tar, report) = u.diff_with(&DiffOptions { skip: &skip, ..DiffOptions::default() }).unwrap();
-        assert_eq!(names(&read(&tar)), ["data/", "dir/", "etc/", "etc/hosts", "run/"]);
+        // `data/` held only a skipped path: left out with it.
+        assert_eq!(names(&read(&tar)), ["dir/", "etc/", "etc/hosts", "run/"]);
         assert_eq!(
             report.skipped,
-            ["/.wh.x", "/data/sub", "/dir/.wh..wh..opq", "/etc/resolv.conf", "/proc", "/run/sock"]
+            ["/.wh.x", "/data/sub", "/data", "/dir/.wh..wh..opq", "/etc/resolv.conf", "/proc", "/run/sock"]
         );
-        assert_eq!(report.entries, 5);
+        assert_eq!(report.entries, 4);
 
         // A mount on `/`: nothing is the container's.
         let (tar, report) =
             u.diff_with(&DiffOptions { skip: &[PathBuf::from("/")], ..DiffOptions::default() }).unwrap();
         assert!(read(&tar).is_empty());
         assert_eq!(report.skipped, ["/"]);
+    }
+
+    #[test]
+    fn directories_made_only_for_mount_points_are_left_out() {
+        let u = Upper::new();
+        // /etc copied up for the runtime's /etc/resolv.conf; a volume's
+        // target and the parents the runtime made for it; an empty
+        // directory of the container's own; an opaque one whose only entry
+        // is a mount point.
+        u.dir("etc", 0o755)
+            .file("etc/resolv.conf", "", 0o644)
+            .dir("a", 0o755)
+            .dir("a/b", 0o755)
+            .dir("a/b/target", 0o755)
+            .dir("empty", 0o755)
+            .dir("opaque", 0o755)
+            .xattr("opaque", USER_OPAQUE_XATTR, b"y")
+            .file("opaque/hosts", "", 0o644);
+        let skip = [PathBuf::from("/etc/resolv.conf"), PathBuf::from("/a/b/target"), PathBuf::from("/opaque/hosts")];
+        let (tar, report) = u.diff_with(&DiffOptions { skip: &skip, ..DiffOptions::default() }).unwrap();
+        assert_eq!(names(&read(&tar)), ["empty/", "opaque/", "opaque/.wh..wh..opq"]);
+        for gone in ["/etc", "/a/b", "/a"] {
+            assert!(report.skipped.iter().any(|s| s == gone), "{gone}: {:?}", report.skipped);
+        }
+        // Nothing else: an empty layer, as a RUN that changes nothing.
+        let (tar, _) = Upper::new()
+            .dir("etc", 0o755)
+            .file("etc/resolv.conf", "", 0o644)
+            .diff_with(&DiffOptions { skip: &skip, ..DiffOptions::default() })
+            .unwrap();
+        assert!(read(&tar).is_empty());
     }
 
     #[test]
