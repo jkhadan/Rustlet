@@ -31,9 +31,9 @@
 //!   any scalar) is replaced. An empty value doesn't replace anything.
 //!   Compose's tags `!reset` (remove what earlier files set) and
 //!   `!override` (replace instead of merging) are understood.
-//! - **The project's name**: `-p`, else the file's `name:`, else
-//!   `COMPOSE_PROJECT_NAME`, else the project directory's name. **Deviation:**
-//!   Compose puts `COMPOSE_PROJECT_NAME` before `name:`. A name given (`-p`,
+//! - **The project's name**: `-p`, else `COMPOSE_PROJECT_NAME`, else the
+//!   file's `name:`, else the project directory's name, as Compose decides
+//!   it. A name given (`-p`,
 //!   `COMPOSE_PROJECT_NAME`) must be `[a-z0-9][a-z0-9_-]*` (lowercased
 //!   first); one taken from `name:` or the directory is made into one, as
 //!   Compose does (lowercased, other characters dropped).
@@ -528,11 +528,11 @@ fn project_name(
     if let Some(name) = &options.project_name {
         return given_name(name, "-p");
     }
-    if let Some(name) = from_file.filter(|n| !n.is_empty()) {
-        return made_name(name, "the file's name:");
-    }
     if let Some(name) = vars.get("COMPOSE_PROJECT_NAME").filter(|n| !n.is_empty()) {
         return given_name(name, "COMPOSE_PROJECT_NAME");
+    }
+    if let Some(name) = from_file.filter(|n| !n.is_empty()) {
+        return made_name(name, "the file's name:");
     }
     let base = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     made_name(&base, "the project directory's name")
@@ -1231,7 +1231,7 @@ services:
     }
 
     #[test]
-    fn the_project_name_comes_from_p_then_name_then_the_environment_then_the_directory() {
+    fn the_project_name_comes_from_p_then_the_environment_then_name_then_the_directory() {
         let vars = env(&[("COMPOSE_PROJECT_NAME", "from-env")]);
         let none = BTreeMap::new();
         let name = |p: Option<&str>, file: Option<&str>, vars: &BTreeMap<String, String>| {
@@ -1239,7 +1239,8 @@ services:
             project_name(&options, file, vars, Path::new("/home/me/My_App 2")).map_err(|e| e.to_string())
         };
         assert_eq!(name(Some("Cli"), Some("file"), &vars).unwrap(), "cli");
-        assert_eq!(name(None, Some("File Name!"), &vars).unwrap(), "filename");
+        assert_eq!(name(None, Some("File Name!"), &vars).unwrap(), "from-env");
+        assert_eq!(name(None, Some("File Name!"), &none).unwrap(), "filename");
         assert_eq!(name(None, None, &vars).unwrap(), "from-env");
         assert_eq!(name(None, None, &none).unwrap(), "my_app2");
         let e = name(Some("-x"), None, &none).unwrap_err();

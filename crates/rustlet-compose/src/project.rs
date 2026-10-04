@@ -14,7 +14,7 @@ use crate::Error;
 /// A loaded compose project.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Project {
-    /// `-p`, else the file's `name:`, else `COMPOSE_PROJECT_NAME`, else its
+    /// `-p`, else `COMPOSE_PROJECT_NAME`, else the file's `name:`, else its
     /// directory's name; lowercased, only `[a-z0-9_-]`.
     pub name: String,
     /// Where relative paths start: `--project-directory`, else the first
