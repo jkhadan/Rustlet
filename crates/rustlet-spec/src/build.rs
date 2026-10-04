@@ -98,8 +98,8 @@ pub enum BuildEvent {
         base: String,
     },
     /// An instruction starts: `step` of `total`, counted over the stages
-    /// built (the `FROM` lines included), as written but with variables
-    /// expanded.
+    /// built (the `FROM` lines included), as written (its continuation
+    /// lines joined), as Docker's classic builder shows it.
     Step {
         step: usize,
         total: usize,
