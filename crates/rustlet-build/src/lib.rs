@@ -33,6 +33,7 @@ pub mod expand;
 pub mod ignore;
 pub mod op;
 pub mod parser;
+mod path;
 pub mod plan;
 
 pub use op::Op;
