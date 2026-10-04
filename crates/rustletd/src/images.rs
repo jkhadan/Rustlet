@@ -225,6 +225,13 @@ impl Images {
         self.snapshots(image)?.ok_or_else(|| ApiError::internal("the unpack finished but layers are missing"))
     }
 
+    /// The directories of the image's layers, top first, as a diff of a
+    /// container's upper directory reads what is below it
+    /// ([`DiffOptions::lowers`](rustlet_image::diff::DiffOptions::lowers)).
+    pub async fn lowers(&self, image: &Image) -> ApiResult<Vec<PathBuf>> {
+        Ok(self.ensure_unpacked(image).await?.iter().rev().map(Snapshot::fs).collect())
+    }
+
     /// All of the image's snapshots, if they all exist.
     fn snapshots(&self, image: &Image) -> ApiResult<Option<Vec<Snapshot>>> {
         let mut out = Vec::with_capacity(image.layers.len());

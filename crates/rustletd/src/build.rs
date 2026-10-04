@@ -586,7 +586,10 @@ impl Build {
             Ok(()) => {
                 let skip = crate::commit::mount_points(&d.paths.container_dir(c.id()).join("config.json"));
                 let upper = d.paths.container_dir(c.id()).join("upper");
-                self.commit(upper, skip).await
+                match d.images.lowers(&parent).await {
+                    Ok(lowers) => self.commit(upper, skip, lowers).await,
+                    Err(e) => Err(e),
+                }
             }
             Err(e) => Err(e),
         };
@@ -641,12 +644,14 @@ impl Build {
         Ok(())
     }
 
-    /// The changes in `upper` as a layer.
-    async fn commit(&self, upper: PathBuf, skip: Vec<PathBuf>) -> ApiResult<CommittedLayer> {
+    /// The changes in `upper`, over the layers `lowers` (top first), as a
+    /// layer.
+    async fn commit(&self, upper: PathBuf, skip: Vec<PathBuf>, lowers: Vec<PathBuf>) -> ApiResult<CommittedLayer> {
         let store = self.d.images.store().clone();
         blocking(move || {
             let identity = |uid, gid| (uid, gid);
-            commit_layer(store.content(), &upper, &DiffOptions { skip: &skip, map_owner: &identity })
+            let options = DiffOptions { skip: &skip, map_owner: &identity, lowers: &lowers };
+            commit_layer(store.content(), &upper, &options)
         })
         .await
         .map_err(|e| e.context("commit the step's changes"))
@@ -749,7 +754,7 @@ impl Build {
             Ok(_) => {
                 let unmounted = dest.unmount().await;
                 match unmounted {
-                    Ok(()) => self.commit(upper, Vec::new()).await,
+                    Ok(()) => self.commit(upper, Vec::new(), Vec::new()).await,
                     Err(e) => Err(e),
                 }
             }

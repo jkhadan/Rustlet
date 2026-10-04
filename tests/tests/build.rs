@@ -401,6 +401,31 @@ CMD ["sleep", "600"]
     });
 }
 
+/// A RUN's layer keeps what the container changed in directories that
+/// hold mount points (a chown above a volume's target, a chmod of /etc),
+/// and nothing the runtime made for its mounts: a RUN that changes nothing
+/// adds an empty layer.
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn bd_changes_beside_mount_points_stay_and_mount_points_go() {
+    let d = daemon();
+    block_on(async {
+        let c = d.client();
+        let file =
+            b"FROM alpine\nVOLUME /var/lib/app/data\nRUN chown nobody /var/lib/app && chmod 700 /etc\nRUN true\n";
+        build(&c, tagged("beside"), &[("Containerfile", file, 0o644)]).await.id();
+        let (out, _) = run(&c, "beside", &["stat", "-c", "%U %a %n", "/var/lib/app", "/etc"]).await;
+        assert_eq!(out, "nobody 755 /var/lib/app\nroot 700 /etc\n");
+        let i = c.inspect_image("beside").await.unwrap();
+        let diff_ids: Vec<&str> =
+            i.config["rootfs"]["diff_ids"].as_array().unwrap().iter().map(|d| d.as_str().unwrap()).collect();
+        // An archive of nothing: two zero blocks.
+        let empty = "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef";
+        assert_eq!(diff_ids[diff_ids.len() - 2..], [diff_ids[diff_ids.len() - 2], empty], "{diff_ids:?}");
+        assert_ne!(diff_ids[diff_ids.len() - 2], empty);
+    });
+}
+
 /// commit: a container's changes (a new file, a deleted one) and its
 /// options as a new image, with --change on top; a running container keeps
 /// running.

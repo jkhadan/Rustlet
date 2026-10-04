@@ -67,6 +67,7 @@ impl Daemon {
         let image = self.images.resolve(&c.record.image_id).map_err(|e| e.context("the container's image"))?;
         let dir = self.paths.container_dir(c.id());
         let skip = mount_points(&dir.join("config.json"));
+        let lowers = self.images.lowers(&image).await?;
         let remap = c.record.config.userns == UsernsMode::Remap;
         let socket = self.paths.shim(c.id()).socket();
         let freeze = req.pause && c.status() == ContainerStatus::Running;
@@ -78,7 +79,7 @@ impl Daemon {
         let layer = blocking(move || {
             let identity = |uid, gid| (uid, gid);
             let map_owner: &dyn Fn(u32, u32) -> (u32, u32) = if remap { &unmap_remap } else { &identity };
-            commit_layer(store.content(), &upper, &DiffOptions { skip: &skip, map_owner })
+            commit_layer(store.content(), &upper, &DiffOptions { skip: &skip, map_owner, lowers: &lowers })
         })
         .await;
         if freeze && let Err(e) = shim_ok(&socket, Request::Resume).await {

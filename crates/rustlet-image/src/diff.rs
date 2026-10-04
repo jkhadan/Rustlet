@@ -57,8 +57,11 @@
 //!   the image lacks them, and are no change of the container's; what is
 //!   below one was hidden by the mount. A directory that held nothing but
 //!   such paths (`/etc` copied up for `/etc/resolv.conf`, the parents made
-//!   for a volume's target) goes with them; an empty directory of the
-//!   container's own stays. The skipped paths are matched as
+//!   for a volume's target) goes with them, if it is as the layers below
+//!   have it ([`DiffOptions::lowers`]), or, where they have none, as the
+//!   runtime makes one (`0755`, root's): a `chown` or `chmod` of it is the
+//!   container's change, and so is an empty directory of its own. The
+//!   skipped paths are matched as
 //!   written (`.`, `..` and repeated `/` aside), not through the image's
 //!   symlinks. So is an entry the container itself named `.wh.<something>`:
 //!   in a layer, that name means a whiteout.
@@ -111,11 +114,15 @@ pub struct DiffOptions<'a> {
     pub skip: &'a [PathBuf],
     /// Owners as stored in the upper directory → owners in the layer.
     pub map_owner: &'a dyn Fn(u32, u32) -> (u32, u32),
+    /// The layers below the upper directory, top first: overlay's lower
+    /// directories (the snapshots' `fs`). A directory that held only
+    /// mount points is compared with what they show at its path.
+    pub lowers: &'a [PathBuf],
 }
 
 impl Default for DiffOptions<'_> {
     fn default() -> Self {
-        DiffOptions { skip: &[], map_owner: &|uid, gid| (uid, gid) }
+        DiffOptions { skip: &[], map_owner: &|uid, gid| (uid, gid), lowers: &[] }
     }
 }
 
@@ -153,6 +160,7 @@ pub fn diff(upper: &Path, out: &mut dyn Write, options: &DiffOptions<'_>) -> Res
         tar: TarWriter::new(out),
         map_owner: options.map_owner,
         skip: options.skip.iter().map(|p| relative(p)).collect(),
+        lowers: options.lowers,
         links: HashMap::new(),
         report: DiffReport::default(),
     };
@@ -224,6 +232,7 @@ struct Differ<'w, 'a> {
     map_owner: &'a dyn Fn(u32, u32) -> (u32, u32),
     /// [`DiffOptions::skip`], relative to the upper directory.
     skip: HashSet<Vec<u8>>,
+    lowers: &'a [PathBuf],
     /// The archive name of each inode with more than one name, by
     /// `(st_dev, st_ino)`: the first one written.
     links: HashMap<(u64, u64), Vec<u8>>,
@@ -339,11 +348,12 @@ impl Differ<'_, '_> {
     /// unless all it held was mount points (and directories of nothing
     /// else), which the runtime makes where the image lacks them (`/etc`
     /// for `/etc/resolv.conf`, a volume's target and its parents) and are no
-    /// change of the container's: then it is left out too, as Docker's
+    /// change of the container's, and it is itself as the runtime left it
+    /// ([`as_made`](Self::as_made)): then it is left out too, as Docker's
     /// init layer keeps such paths out of a container's diff.
     fn finish_dir(&mut self, stack: &mut [Frame], done: Frame) -> Result<()> {
         let Some(pending) = done.pending else { return Ok(()) };
-        if done.held_mounts {
+        if done.held_mounts && self.as_made(&done.rel, &pending)? {
             self.report.skipped.push(in_container(&done.rel).to_string_lossy().into_owned());
             if let Some(parent) = stack.last_mut() {
                 parent.held_mounts = true;
@@ -352,6 +362,23 @@ impl Differ<'_, '_> {
         }
         self.flush(stack)?;
         self.write_dir(&pending)
+    }
+
+    /// Whether a directory that held only mount points is as the runtime
+    /// left it, so no change of the container's: as the layers below show
+    /// it, overlay having copied it up to make what is in it (a copy-up
+    /// keeps mode, owner and attributes), or, where they show nothing, as
+    /// the runtime makes one: `0755`, root's, no attributes. A `chown` or
+    /// `chmod` of it (of `/var/lib/app`, say, above a volume's target) is
+    /// a change, and the directory stays.
+    fn as_made(&self, rel: &[u8], dir: &PendingDir) -> Result<bool> {
+        let mode = dir.st.st_mode & 0o7777;
+        let owner = (self.map_owner)(dir.st.st_uid, dir.st.st_gid);
+        Ok(match below(self.lowers, rel)? {
+            Below::Dir { mode: m, owner: o, xattrs } => (mode, owner) == (m, o) && dir.xattrs == xattrs,
+            Below::Nothing => mode == 0o755 && owner == (0, 0) && dir.xattrs.is_empty(),
+            Below::Other => false,
+        })
     }
 
     fn write_dir(&mut self, pending: &PendingDir) -> Result<()> {
@@ -450,31 +477,94 @@ impl Differ<'_, '_> {
     /// The attributes `from` has, as the layer keeps them (see the module
     /// docs), and whether overlay's own mark it opaque.
     fn xattrs(&self, from: &Attrs<'_>, shown: &str) -> Result<Xattrs> {
-        let mut out = Xattrs { kept: Vec::new(), opaque: false };
-        let names = match from.list() {
-            Ok(names) => names,
-            // A filesystem without attributes has none to keep.
-            Err(Errno::ENOTSUP) => return Ok(out),
-            Err(e) => return Err(e).with_context(|| format!("{shown}: list the attributes")),
-        };
-        for name in names {
-            let value = || from.get(&name).with_context(|| format!("{shown}: read attribute {name}"));
-            if OVERLAY_XATTRS.iter().any(|p| name.starts_with(p)) {
-                if name == OPAQUE_XATTR || name == USER_OPAQUE_XATTR {
-                    out.opaque |= value()? == b"y";
-                }
-                continue;
-            }
-            if name.contains('=') {
-                // A PAX record's key ends at its first `=`.
-                return Err(Error::unsupported(format!("{shown}: attribute {name:?}: a tar archive can't hold it")));
-            }
-            let value = map_ids(&name, value()?, self.map_owner);
-            out.kept.push((name, value));
-        }
-        out.kept.sort();
-        Ok(out)
+        read_xattrs(from, shown, self.map_owner)
     }
+}
+
+/// An entry's attributes: overlay's own aside (but for the opaque mark),
+/// the ids in the others' values mapped by `map_owner`.
+fn read_xattrs(from: &Attrs<'_>, shown: &str, map_owner: &dyn Fn(u32, u32) -> (u32, u32)) -> Result<Xattrs> {
+    let mut out = Xattrs { kept: Vec::new(), opaque: false };
+    let names = match from.list() {
+        Ok(names) => names,
+        // A filesystem without attributes has none to keep.
+        Err(Errno::ENOTSUP) => return Ok(out),
+        Err(e) => return Err(e).with_context(|| format!("{shown}: list the attributes")),
+    };
+    for name in names {
+        let value = || from.get(&name).with_context(|| format!("{shown}: read attribute {name}"));
+        if OVERLAY_XATTRS.iter().any(|p| name.starts_with(p)) {
+            if name == OPAQUE_XATTR || name == USER_OPAQUE_XATTR {
+                out.opaque |= value()? == b"y";
+            }
+            continue;
+        }
+        if name.contains('=') {
+            // A PAX record's key ends at its first `=`.
+            return Err(Error::unsupported(format!("{shown}: attribute {name:?}: a tar archive can't hold it")));
+        }
+        let value = map_ids(&name, value()?, map_owner);
+        out.kept.push((name, value));
+    }
+    out.kept.sort();
+    Ok(out)
+}
+
+/// What the layers below an upper directory show at a path.
+enum Below {
+    /// A directory: its mode bits, owner and attributes (as stored).
+    Dir { mode: u32, owner: (u32, u32), xattrs: Vec<(String, Vec<u8>)> },
+    /// Nothing: no layer has it, or a whiteout or an opaque directory
+    /// hides what one has.
+    Nothing,
+    /// Something other than a directory.
+    Other,
+}
+
+/// What `lowers` (top first) show at `rel`, as overlay merges them: the
+/// first layer to have it decides, a whiteout says it is gone, and an
+/// opaque directory on the way hides the layers below it. Nothing is
+/// followed.
+fn below(lowers: &[PathBuf], rel: &[u8]) -> Result<Below> {
+    let names: Vec<&OsStr> = rel.split(|&b| b == b'/').filter(|n| !n.is_empty()).map(OsStr::from_bytes).collect();
+    let identity = |uid, gid| (uid, gid);
+    'layers: for lower in lowers {
+        let shown = format!("{:?}", lower.join(OsStr::from_bytes(rel)));
+        let mut dir = nix::fcntl::open(
+            lower,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("open {}", lower.display()))?;
+        // An opaque directory on the way: the layers below don't show
+        // through it.
+        let mut opaque = false;
+        for (i, name) in names.iter().enumerate() {
+            let last = i + 1 == names.len();
+            let st = match nix::sys::stat::fstatat(&dir, *name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+                Ok(st) => st,
+                Err(Errno::ENOENT) if opaque => return Ok(Below::Nothing),
+                Err(Errno::ENOENT) => continue 'layers,
+                Err(e) => return Err(e).with_context(|| format!("{shown}: stat")),
+            };
+            match st.st_mode & libc::S_IFMT {
+                libc::S_IFDIR => {
+                    let sub = open_checked(dir.as_fd(), name, &st, &shown)?;
+                    let attrs = read_xattrs(&Attrs::Fd(sub.as_fd()), &shown, &identity)?;
+                    if last {
+                        let owner = (st.st_uid, st.st_gid);
+                        return Ok(Below::Dir { mode: st.st_mode & 0o7777, owner, xattrs: attrs.kept });
+                    }
+                    opaque |= attrs.opaque;
+                    dir = sub;
+                }
+                libc::S_IFCHR if st.st_rdev == 0 => return Ok(Below::Nothing),
+                // A file on the way hides the layers below too.
+                _ => return Ok(if last { Below::Other } else { Below::Nothing }),
+            }
+        }
+    }
+    Ok(Below::Nothing)
 }
 
 /// An entry's attributes, as [`Differ::xattrs`] found them.
@@ -1229,7 +1319,7 @@ mod tests {
         let map = |uid: u32, gid: u32| {
             (if uid == me { 3_000_000 } else { uid + 1 }, if gid == my_group { 7 } else { gid + 1 })
         };
-        let (tar, _) = u.diff_with(&DiffOptions { skip: &[], map_owner: &map }).unwrap();
+        let (tar, _) = u.diff_with(&DiffOptions { map_owner: &map, ..DiffOptions::default() }).unwrap();
         let entries = read(&tar);
         for name in ["dir/", "dir/file", "dir/link"] {
             let e = find(&entries, name);
@@ -1447,7 +1537,10 @@ mod tests {
             PathBuf::from("/missing"),
             PathBuf::from("/etc/../dir/nothing"),
         ];
-        let (tar, report) = u.diff_with(&DiffOptions { skip: &skip, ..DiffOptions::default() }).unwrap();
+        // As the runtime would have made it: 0755 and root's.
+        let as_root = |_, _| (0, 0);
+        let (tar, report) =
+            u.diff_with(&DiffOptions { skip: &skip, map_owner: &as_root, ..DiffOptions::default() }).unwrap();
         // `data/` held only a skipped path: left out with it.
         assert_eq!(names(&read(&tar)), ["dir/", "etc/", "etc/hosts", "run/"]);
         assert_eq!(
@@ -1478,20 +1571,114 @@ mod tests {
             .dir("empty", 0o755)
             .dir("opaque", 0o755)
             .xattr("opaque", USER_OPAQUE_XATTR, b"y")
-            .file("opaque/hosts", "", 0o644);
-        let skip = [PathBuf::from("/etc/resolv.conf"), PathBuf::from("/a/b/target"), PathBuf::from("/opaque/hosts")];
-        let (tar, report) = u.diff_with(&DiffOptions { skip: &skip, ..DiffOptions::default() }).unwrap();
-        assert_eq!(names(&read(&tar)), ["empty/", "opaque/", "opaque/.wh..wh..opq"]);
+            .file("opaque/hosts", "", 0o644)
+            // The container's chmod of a directory that holds a mount point.
+            .dir("private", 0o700)
+            .dir("private/target", 0o755);
+        let skip = [
+            PathBuf::from("/etc/resolv.conf"),
+            PathBuf::from("/a/b/target"),
+            PathBuf::from("/opaque/hosts"),
+            PathBuf::from("/private/target"),
+        ];
+        // No layers below: what the runtime makes is 0755 and root's.
+        let as_root = |_, _| (0, 0);
+        let options = DiffOptions { skip: &skip, map_owner: &as_root, ..DiffOptions::default() };
+        let (tar, report) = u.diff_with(&options).unwrap();
+        assert_eq!(names(&read(&tar)), ["empty/", "opaque/", "opaque/.wh..wh..opq", "private/"]);
         for gone in ["/etc", "/a/b", "/a"] {
             assert!(report.skipped.iter().any(|s| s == gone), "{gone}: {:?}", report.skipped);
         }
+        // Owned by anyone else, they are changes too.
+        let (tar, _) = u.diff_with(&DiffOptions { skip: &skip, map_owner: &|_, _| (0, 1), ..options }).unwrap();
+        assert_eq!(names(&read(&tar)), ["a/", "a/b/", "empty/", "etc/", "opaque/", "opaque/.wh..wh..opq", "private/"]);
         // Nothing else: an empty layer, as a RUN that changes nothing.
-        let (tar, _) = Upper::new()
-            .dir("etc", 0o755)
-            .file("etc/resolv.conf", "", 0o644)
-            .diff_with(&DiffOptions { skip: &skip, ..DiffOptions::default() })
-            .unwrap();
+        let (tar, _) = Upper::new().dir("etc", 0o755).file("etc/resolv.conf", "", 0o644).diff_with(&options).unwrap();
         assert!(read(&tar).is_empty());
+    }
+
+    #[test]
+    fn a_directory_that_held_mount_points_is_compared_with_the_layers_below() {
+        // Two layers below the upper directory, the top one first.
+        let top = Upper::new();
+        let bottom = Upper::new();
+        bottom
+            .dir("etc", 0o755)
+            .dir("srv", 0o755)
+            .dir("srv/app", 0o755)
+            .dir("old", 0o750)
+            .dir("opq", 0o755)
+            .dir("opq/m", 0o700)
+            .dir("same", 0o755)
+            .xattr("same", "user.note", b"a")
+            .dir("same2", 0o755)
+            .xattr("same2", "user.note", b"a")
+            .dir("gone", 0o755);
+        // `old` and `gone` deleted, `opq` made again (hiding `opq/m`), `blk`
+        // a file.
+        top.whiteout("old")
+            .whiteout("gone")
+            .dir("opq", 0o755)
+            .xattr("opq", USER_OPAQUE_XATTR, b"y")
+            .file("blk", "", 0o644);
+        let lowers = [top.path(""), bottom.path("")];
+
+        let u = Upper::new();
+        u.dir("etc", 0o755)
+            .file("etc/resolv.conf", "", 0o644)
+            // chmod 700 /srv/app, whose only entry is a volume's target.
+            .dir("srv", 0o755)
+            .dir("srv/app", 0o700)
+            .dir("srv/app/data", 0o755)
+            // As the lower `old` was, but that one was deleted.
+            .dir("old", 0o750)
+            .dir("old/m", 0o755)
+            // As the hidden `opq/m` is.
+            .dir("opq", 0o755)
+            .dir("opq/m", 0o700)
+            .file("opq/m/x", "", 0o644)
+            // A directory where the layers below have a file.
+            .dir("blk", 0o755)
+            .dir("blk/x", 0o755)
+            // An attribute changed, and one as it was.
+            .dir("same", 0o755)
+            .xattr("same", "user.note", b"b")
+            .file("same/m", "", 0o644)
+            .dir("same2", 0o755)
+            .xattr("same2", "user.note", b"a")
+            .file("same2/m", "", 0o644);
+        let skip = ["/etc/resolv.conf", "/srv/app/data", "/old/m", "/opq/m/x", "/blk/x", "/same/m", "/same2/m"]
+            .map(PathBuf::from);
+        let (tar, report) =
+            u.diff_with(&DiffOptions { skip: &skip, lowers: &lowers, ..DiffOptions::default() }).unwrap();
+        let entries = read(&tar);
+        assert_eq!(names(&entries), ["blk/", "old/", "opq/", "opq/m/", "same/", "srv/", "srv/app/"]);
+        assert_eq!(find(&entries, "srv/app/").mode, 0o700);
+        for gone in ["/etc", "/same2"] {
+            assert!(report.skipped.iter().any(|s| s == gone), "{gone}: {:?}", report.skipped);
+        }
+
+        // With the owners mapped to root's: `etc`, the test's in the layer
+        // below, is a change now; `gone`, deleted below, and `new`, never
+        // there, are as the runtime makes them; where a file is below, a
+        // directory is a change whatever its owner.
+        let u = Upper::new();
+        u.dir("etc", 0o755)
+            .file("etc/resolv.conf", "", 0o644)
+            .dir("gone", 0o755)
+            .dir("gone/m", 0o755)
+            .dir("new", 0o755)
+            .dir("new/m", 0o755)
+            .dir("blk", 0o755)
+            .dir("blk/x", 0o755);
+        let skip = ["/etc/resolv.conf", "/gone/m", "/new/m", "/blk/x"].map(PathBuf::from);
+        let as_root = |_, _| (0, 0);
+        let options = DiffOptions { skip: &skip, map_owner: &as_root, lowers: &lowers };
+        let (tar, report) = u.diff_with(&options).unwrap();
+        assert_eq!(names(&read(&tar)), ["blk/", "etc/"]);
+        for gone in ["/gone", "/new"] {
+            assert!(report.skipped.iter().any(|s| s == gone), "{gone}: {:?}", report.skipped);
+        }
     }
 
     #[test]
