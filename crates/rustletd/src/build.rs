@@ -344,6 +344,8 @@ impl Build {
             Base::Stage(_) => st.config.config.get("OnBuild").and_then(Value::as_array).is_some_and(|a| !a.is_empty()),
             Base::Scratch => false,
         };
+        // As with an image's: not run, and not passed on.
+        st.config.config.remove("OnBuild");
         if triggers {
             let message = format!("{shown_base}'s ONBUILD triggers are not run");
             self.emit(BuildEvent::Warning { message }).await?;
