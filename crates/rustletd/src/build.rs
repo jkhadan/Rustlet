@@ -259,6 +259,9 @@ impl Daemon {
         if tags.is_empty() {
             self.images.keep_image(&image)?;
         }
+        // One for the image, named or not (clients refresh their lists on
+        // image events), then a `tag` per name.
+        self.events.emit(EventKind::Image, "build", &id, [("id".to_owned(), id.clone())].into());
         for name in &tags {
             self.images.name_image(&image, name)?;
             self.events.emit(EventKind::Image, "tag", name, [("id".to_owned(), id.clone())].into());

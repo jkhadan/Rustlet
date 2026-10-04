@@ -106,6 +106,8 @@ impl Daemon {
         let mut deleted: Vec<String> = entries.iter().map(ToString::to_string).collect();
         deleted.dedup();
         deleted.extend(self.images.collect_garbage(|| self.image_users().into_keys().collect()).await?);
+        let count = deleted.len().to_string();
+        self.events.emit(EventKind::Image, "prune", "build cache", [("deleted".to_owned(), count)].into());
         Ok(rustlet_spec::network::PruneResponse { deleted, space_reclaimed: 0 })
     }
 }

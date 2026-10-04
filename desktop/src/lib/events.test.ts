@@ -109,6 +109,8 @@ describe("event → stale queries", () => {
     for (const [action, id] of [
       ["tag", "docker.io/library/hits:latest"],
       ["load", `sha256:${"cd".repeat(32)}`],
+      ["build", `sha256:${"cd".repeat(32)}`],
+      ["prune", "build cache"],
     ]) {
       const client = clientWith(keys.images(), keys.image("hits"), keys.containers(true), keys.stacks());
       applyEvents(client, [event("image", action, id, { id: `sha256:${"cd".repeat(32)}` })]);
@@ -191,7 +193,13 @@ describe("activity feed lines", () => {
     expect(describeEvent(event("image", "tag", "docker.io/library/hits:latest", { id: digest }))).toBe("image hits:latest tagged");
     expect(describeEvent(event("image", "load", digest, { id: digest }))).toBe("image 4f4f4f4f4f4f loaded");
     // An action this app doesn't know yet says itself, rather than "deleted".
-    expect(describeEvent(event("image", "prune", "x"))).toBe("image x prune");
+    expect(describeEvent(event("image", "squash", "x"))).toBe("image x squash");
+  });
+
+  it("say a build's image, named or not, and a pruned build cache", () => {
+    const digest = `sha256:${"5e".repeat(32)}`;
+    expect(describeEvent(event("image", "build", digest, { id: digest }))).toBe("image 5e5e5e5e5e5e built");
+    expect(describeEvent(event("image", "prune", "build cache", { deleted: "7" }))).toBe("build cache pruned (7 removed)");
   });
 
   it("say a restart that couldn't start, not an exit", () => {

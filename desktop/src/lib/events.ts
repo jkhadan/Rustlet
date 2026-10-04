@@ -79,8 +79,9 @@ export function invalidationsFor(event: Event): QueryKey[] {
       return out;
     }
     case "image":
-      // `pull`, `tag` (a build, tag, commit or load named it), `untag`,
-      // `load` (an unnamed image loaded), `delete`.
+      // `pull`, `build` (a build's image, named or not), `tag` (a build,
+      // tag, commit or load named it), `untag`, `load` (an unnamed image
+      // loaded), `delete`, `prune` (the build cache).
       return [IMAGES, IMAGE, INFO];
     case "network":
       if (event.action === "connect" || event.action === "disconnect") {
@@ -152,12 +153,14 @@ export function describeEvent(e: Event, nameOf: (id: string) => string | undefin
           return `${name} ${pastTense(e.action)}`;
       }
     case "image": {
+      if (e.action === "prune") return `build cache pruned (${e.attributes.deleted ?? 0} removed)`;
       // By name, as the image list shows it (`alpine:latest`); a `delete`
       // names the image as `rmi` was given it, which may be its digest,
       // and a `load` of an unnamed image names it by its digest.
       const image = /^(sha256:)?[0-9a-f]{64}$/.test(e.id) ? shortId(e.id) : imageName(e.id);
       const done: Record<string, string> = {
         pull: "pulled",
+        build: "built",
         tag: "tagged",
         untag: "untagged",
         load: "loaded",
