@@ -118,15 +118,16 @@ impl StageState {
         }
     }
 
-    /// When its filesystem last changed: its last history entry's time, or
-    /// its base config's, or now.
-    fn last_change(&self) -> String {
+    /// When its filesystem last changed: its last dated history entry's
+    /// time, or its base config's; none if nothing says (an image without
+    /// dates, `scratch`).
+    fn last_change(&self) -> Option<String> {
         self.history
             .iter()
             .rev()
             .find_map(|h| h["created"].as_str())
             .or_else(|| self.base["created"].as_str())
-            .map_or_else(now, str::to_owned)
+            .map(str::to_owned)
     }
 
     /// The chain ID of its top layer: what identifies its filesystem.
@@ -227,7 +228,7 @@ impl Daemon {
             let message = format!("one or more build args were not consumed: {}", plan.unused_args.join(", "));
             send(events, BuildEvent::Warning { message }).await?;
         }
-        let global_args = global_args(&file, &options.build_args)?;
+        let global_args = plan.global_args.clone();
         // From here to the names, only this keeps garbage collection away
         // from what the build writes.
         let _pin = self.images.pin().await;
@@ -333,7 +334,14 @@ impl Build {
                 self.state_of(&image, args)?
             }
         };
-        if st.config.config.get("OnBuild").and_then(Value::as_array).is_some_and(|a| !a.is_empty()) {
+        // The base's triggers: in its own config (`ImageConfigState::new`
+        // leaves them out, as Docker does once it has run them).
+        let triggers = match &base {
+            Base::Image(_) => st.base["config"]["OnBuild"].as_array().is_some_and(|a| !a.is_empty()),
+            Base::Stage(_) => st.config.config.get("OnBuild").and_then(Value::as_array).is_some_and(|a| !a.is_empty()),
+            Base::Scratch => false,
+        };
+        if triggers {
             let message = format!("{shown_base}'s ONBUILD triggers are not run");
             self.emit(BuildEvent::Warning { message }).await?;
         }
@@ -376,7 +384,11 @@ impl Build {
                     // Dated as the last change of the filesystem, so that a
                     // build whose layers all come from the cache makes the
                     // same config, and so the same image, as the one before.
-                    st.history.push(json!({"created": st.last_change(), "created_by": line, "empty_layer": true}));
+                    let mut entry = json!({"created_by": line, "empty_layer": true});
+                    if let Some(time) = st.last_change() {
+                        entry["created"] = json!(time);
+                    }
+                    st.history.push(entry);
                     None
                 }
             };
@@ -440,7 +452,16 @@ impl Build {
         let mut config = st.base.clone();
         config["architecture"] = json!("amd64");
         config["os"] = json!("linux");
-        config["created"] = json!(st.last_change());
+        // Undated when nothing is dated: `now` would make every build of it
+        // another image.
+        match st.last_change() {
+            Some(time) => config["created"] = json!(time),
+            None => {
+                if let Some(c) = config.as_object_mut() {
+                    c.remove("created");
+                }
+            }
+        }
         config["config"] = st.config.to_value();
         config["rootfs"] =
             json!({"type": "layers", "diff_ids": st.layers.iter().map(|l| l.diff_id.to_string()).collect::<Vec<_>>()});
@@ -488,7 +509,14 @@ impl Build {
 
     /// Adds `layer` to `st`, and records the result under `key` (unless it
     /// came from there).
-    fn add_layer(&self, st: &mut StageState, key: String, layer: LayerRef, history: Value, record: bool) -> ApiResult<()> {
+    fn add_layer(
+        &self,
+        st: &mut StageState,
+        key: String,
+        layer: LayerRef,
+        history: Value,
+        record: bool,
+    ) -> ApiResult<()> {
         st.layers.push(layer);
         st.history.push(history);
         st.key = key;
@@ -523,9 +551,11 @@ impl Build {
             return Ok(digest);
         }
         let parent = self.write_image(st)?;
-        // ENV over ARG, as Docker: an ARG named as an ENV isn't passed.
+        // ENV over ARG, as Docker: an ARG named as an ENV isn't passed. The
+        // proxy build args (`HTTP_PROXY`…) go to every RUN, undeclared, and
+        // not into its cache key, as Docker's predefined args.
         let mut env = st.config.env();
-        for (name, value) in &vars {
+        for (name, value) in vars.iter().chain(&st.args.proxy_env()) {
             if st.config.env_var(name).is_none() {
                 env.push(format!("{name}={value}"));
             }
@@ -647,7 +677,12 @@ impl Build {
                 .to_string()
             }
             Some(FromSource::Stage(i)) => {
-                let src = self.done.get(i).ok_or_else(|| ApiError::internal(format!("stage {i} wasn't built")))?;
+                // Planned with the global variables only: a --from that only
+                // the stage's own ARGs make a stage's name wasn't built.
+                let from = copy.from.as_deref().unwrap_or_default();
+                let src = self.done.get(i).ok_or_else(|| {
+                    ApiError::invalid(format!("COPY --from={from}: stage {i} isn't built before this one"))
+                })?;
                 format!("stage:{}", src.top_chain_id())
             }
             Some(FromSource::Image(r)) => format!("image:{}", self.base_image(r).await?.manifest_digest),
@@ -808,28 +843,6 @@ fn now() -> String {
 
 async fn send(events: &mpsc::Sender<BuildEvent>, event: BuildEvent) -> ApiResult<()> {
     events.send(event).await.map_err(|_| ApiError::conflict("the build's client went away"))
-}
-
-/// The global `ARG`s' values, as `FROM` lines see them: build args over
-/// their defaults (expanded in order), plus the automatic platform args.
-fn global_args(
-    file: &Containerfile,
-    build_args: &BTreeMap<String, String>,
-) -> ApiResult<BTreeMap<String, Option<String>>> {
-    let mut values: BTreeMap<String, Option<String>> =
-        rustlet_build::plan::platform_args().into_iter().map(|(k, v)| (k, Some(v))).collect();
-    for decl in &file.global_args {
-        let default = match &decl.default {
-            Some(raw) => Some(
-                rustlet_build::expand::word(raw, file.escape, &|n| values.get(n).cloned().flatten())
-                    .map_err(|e| ApiError::invalid(format!("ARG {}: {e}", decl.name)))?,
-            ),
-            None => None,
-        };
-        let value = build_args.get(&decl.name).cloned().or(default);
-        values.insert(decl.name.clone(), value);
-    }
-    Ok(values)
 }
 
 /// The directory `path`, opened for `openat2`.

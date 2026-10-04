@@ -144,7 +144,8 @@ fn bd_a_build_and_its_image() {
         let b = build(&c, tagged("app"), files).await;
         assert_eq!(b.result.as_ref().map(|(_, n)| n.clone()), Ok(vec!["docker.io/library/app:latest".to_owned()]));
         assert_eq!(b.output(), "hello\n");
-        assert!(matches!(b.events[0], BuildEvent::Context { files: 2, bytes: 6 }), "{:?}", b.events[0]);
+        let bytes = BASIC.len() as u64 + 6;
+        assert!(matches!(b.events[0], BuildEvent::Context { files: 2, bytes: n } if n == bytes), "{:?}", b.events[0]);
         let steps: Vec<&str> = b
             .events
             .iter()
@@ -294,7 +295,13 @@ fn bd_copy_stays_inside_the_image() {
     let d = TestDaemon::start();
     let outside = tempfile::tempdir().unwrap();
     let target = outside.path().to_str().unwrap().trim_start_matches('/').to_owned();
-    let layer = LayerBuilder::new().symlink("app", &format!("/{target}"), (0, 0)).finish();
+    // The image has the directory the symlink names; the host has one of
+    // the same path too, which must stay empty.
+    let layer = LayerBuilder::new()
+        .dir(&format!("{target}/"), 0o755, (0, 0))
+        .symlink("app", &format!("/{target}"), (0, 0))
+        .symlink("dangling", "/nowhere/at/all", (0, 0))
+        .finish();
     d.import_alpine_layers("linked", &[layer]);
     block_on(async {
         let c = d.client();
@@ -303,6 +310,11 @@ fn bd_copy_stays_inside_the_image() {
         b.id();
         assert_eq!(b.output(), "inside\n");
         assert_eq!(run(&c, "copied", &["cat", &format!("/{target}/f.txt")]).await.0, "inside\n");
+        // Through a symlink to nothing: refused (BuildKit would make the
+        // directory; nothing is ever made outside the image either way).
+        let file = b"FROM linked\nCOPY f.txt /dangling/\n";
+        let b = build(&c, tagged("dangling"), &[("Containerfile", file, 0o644), ("f.txt", b"x\n", 0o644)]).await;
+        assert!(b.result.unwrap_err().contains("doesn't exist"));
     });
     assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0, "the host's directory was written");
 }
