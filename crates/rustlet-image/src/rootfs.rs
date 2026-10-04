@@ -5,7 +5,8 @@
 //! containers/<id>/
 //! ├─ upper/    the container's own changes (overlay's upperdir)
 //! ├─ work/     overlay's scratch space (must be on upper's filesystem)
-//! └─ rootfs/   the mount point: the merged view, what root.path names
+//! ├─ rootfs/   the mount point: the merged view, what root.path names
+//! └─ empty/    the one lower layer of an image without layers (made when needed)
 //!
 //!            rootfs/  =  upper/  over  layer N  over … over  layer 0
 //! ```
@@ -32,6 +33,13 @@
 //! layer should ever have one; unpacking drops `trusted.overlay.*` from
 //! images too. The mount is `nodev`, and its source reads `rustlet` in
 //! mountinfo.
+//!
+//! An image may have no layers at all: one built `FROM scratch` with only
+//! metadata, or the image a build step's container starts from on
+//! `scratch`. Overlay needs at least one lower layer, so such a rootfs gets
+//! an empty directory, `empty/` (`0755`), as its only one: the merged root
+//! directory takes its owner and mode from upper anyway, and nothing else
+//! is below.
 //!
 //! ## With a user namespace (`--userns=remap`)
 //!
@@ -155,10 +163,11 @@ impl ContainerRootfs {
         Ok(id(&self.rootfs())? != id(&self.dir)?)
     }
 
-    /// Mounts the overlay of `layers` (bottom first) with `upper/` on top at
-    /// `rootfs/`. With `idmap`, the layers are idmapped with the container's
-    /// mappings first, so files the image owns as root appear as the
-    /// container's root, and `upper/` is given to the mapped root.
+    /// Mounts the overlay of `layers` (bottom first; none: `empty/`, see
+    /// the module docs) with `upper/` on top at `rootfs/`. With `idmap`, the
+    /// layers are idmapped with the container's mappings first, so files the
+    /// image owns as root appear as the container's root, and `upper/` is
+    /// given to the mapped root.
     pub fn mount_layers(&mut self, layers: &[Snapshot], idmap: Option<&UsernsPlan>) -> Result<()> {
         check_layers(layers)?;
         if self.mounted || self.is_mounted()? {
@@ -177,11 +186,13 @@ impl ContainerRootfs {
                 // The merged root directory's owner is upper's.
                 std::os::unix::fs::chown(&upper, Some(uid), Some(gid))
                     .with_context(|| format!("chown {} to {uid}:{gid}", upper.display()))?;
-                Some(self.stage_idmapped(layers, maps)?)
+                // `empty/` has nothing whose owner could show.
+                if layers.is_empty() { None } else { Some(self.stage_idmapped(layers, maps)?) }
             }
         };
         let lowers: Vec<PathBuf> = match &staged {
             Some(s) => s.paths.clone(),
+            None if layers.is_empty() => vec![self.empty_lower()?],
             None => layers.iter().map(Snapshot::fs).collect(),
         };
         let result = mount_overlay(&lowers, &upper, &work, &target);
@@ -191,6 +202,24 @@ impl ContainerRootfs {
         result?;
         self.mounted = true;
         Ok(())
+    }
+
+    /// `empty/`, made if it isn't there yet: the lower layer of an image
+    /// without layers. (Overlay never writes to a lower layer, so a remount
+    /// finds it as empty as it was made.)
+    fn empty_lower(&self) -> Result<PathBuf> {
+        let dir = self.dir.join("empty");
+        match std::fs::DirBuilder::new().mode(0o755).create(&dir) {
+            // Explicitly: mkdir's mode is subject to the umask.
+            Ok(()) => std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("chmod {}", dir.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).with_context(|| format!("create {}", dir.display())),
+        }
+        if !std::fs::symlink_metadata(&dir).with_context(|| format!("stat {}", dir.display()))?.is_dir() {
+            return Err(Error::invalid(format!("{} is not a directory", dir.display())));
+        }
+        Ok(dir)
     }
 
     /// Attaches an idmapped clone of every layer under `lower/<n>`.
@@ -289,10 +318,8 @@ impl ContainerRootfs {
     }
 }
 
+/// Overlay's limit; none is fine (`empty/`).
 fn check_layers(layers: &[Snapshot]) -> Result<()> {
-    if layers.is_empty() {
-        return Err(Error::invalid("the image has no layers, so no filesystem to run"));
-    }
     if layers.len() > MAX_LAYERS {
         return Err(Error::unsupported(format!("{} layers; overlay stacks at most {MAX_LAYERS}", layers.len())));
     }
@@ -370,6 +397,48 @@ fn canonical_new(dir: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot(n: usize) -> Snapshot {
+        let digest = crate::Digest::of(n.to_string().as_bytes());
+        Snapshot {
+            info: crate::snapshot::SnapshotInfo {
+                chain_id: digest.clone(),
+                diff_id: digest.clone(),
+                parent: None,
+                blob: digest,
+                size: 0,
+                entries: 0,
+                created: String::new(),
+            },
+            dir: PathBuf::from(format!("/nonexistent/{n}")),
+        }
+    }
+
+    #[test]
+    fn an_image_may_have_no_layers_but_not_more_than_overlay_stacks() {
+        check_layers(&[]).unwrap();
+        let layers: Vec<Snapshot> = (0..=MAX_LAYERS).map(snapshot).collect();
+        check_layers(&layers[..MAX_LAYERS]).unwrap();
+        let err = check_layers(&layers).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "{err}");
+    }
+
+    #[test]
+    fn the_empty_lower_layer_is_made_once_and_left_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap().join("c");
+        let rootfs = ContainerRootfs::create(&dir).unwrap();
+        let empty = rootfs.empty_lower().unwrap();
+        assert_eq!(empty, dir.join("empty"));
+        let mode = std::fs::metadata(&empty).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o755);
+        assert_eq!(rootfs.empty_lower().unwrap(), empty, "a remount finds it");
+        assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
+        // `open` doesn't need it, and removal takes it along.
+        ContainerRootfs::open(&dir).unwrap();
+        ContainerRootfs::remove_dir(&dir).unwrap();
+        assert!(dir.symlink_metadata().is_err());
+    }
 
     #[test]
     fn a_half_removed_container_directory_can_still_be_removed() {

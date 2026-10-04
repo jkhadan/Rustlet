@@ -502,7 +502,7 @@ impl Attrs<'_> {
 /// lone id is passed to `map_owner` as both halves of the pair. Other
 /// values, and ones not well formed (the kernel judges those), stay as
 /// they are.
-fn map_ids(name: &str, mut value: Vec<u8>, map_owner: &dyn Fn(u32, u32) -> (u32, u32)) -> Vec<u8> {
+pub(crate) fn map_ids(name: &str, mut value: Vec<u8>, map_owner: &dyn Fn(u32, u32) -> (u32, u32)) -> Vec<u8> {
     fn le32(b: &[u8]) -> u32 {
         u32::from_le_bytes([b[0], b[1], b[2], b[3]])
     }
