@@ -3559,12 +3559,15 @@ name = "rustlet-desktop"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "rustlet-build",
  "rustlet-client",
+ "rustlet-compose",
  "rustlet-spec",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

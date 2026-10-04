@@ -130,11 +130,15 @@ impl Streams {
 }
 
 /// Forwards `stream` to `channel` until it ends, fails, or the frontend is
-/// gone, in batches of what arrives within [`BATCH_WINDOW`].
-pub async fn forward<T, S>(mut stream: S, channel: Channel<StreamMessage<T>>)
+/// gone, in batches of what arrives within [`BATCH_WINDOW`]. The stream is
+/// the daemon's (a [`rustlet_client::JsonStream`]) or the app's own (a
+/// compose project's progress), whose failure is already a
+/// [`CommandError`].
+pub async fn forward<T, E, S>(mut stream: S, channel: Channel<StreamMessage<T>>)
 where
     T: Serialize,
-    S: Stream<Item = rustlet_client::Result<T>> + Unpin,
+    E: Into<CommandError>,
+    S: Stream<Item = Result<T, E>> + Unpin,
 {
     loop {
         let (batch, last) = next_batch(&mut stream).await;
@@ -151,9 +155,10 @@ where
 /// Waits for an item, then takes what else arrives within [`BATCH_WINDOW`].
 /// The second value is the stream's last message, once it has ended or
 /// failed.
-async fn next_batch<T, S>(stream: &mut S) -> (Vec<T>, Option<StreamMessage<T>>)
+async fn next_batch<T, E, S>(stream: &mut S) -> (Vec<T>, Option<StreamMessage<T>>)
 where
-    S: Stream<Item = rustlet_client::Result<T>> + Unpin,
+    E: Into<CommandError>,
+    S: Stream<Item = Result<T, E>> + Unpin,
 {
     let mut batch = Vec::new();
     let mut next = stream.next().await;
@@ -257,10 +262,13 @@ mod tests {
         (channel, got)
     }
 
+    /// A stream of the daemon's, as `rustlet-client` hands them out.
+    type Daemon = rustlet_client::Result<u32>;
+
     #[tokio::test]
     async fn what_has_arrived_goes_in_one_message_and_the_end_follows() {
         let (channel, got) = recorder();
-        let items = futures::stream::iter((1..=3).map(Ok));
+        let items = futures::stream::iter((1..=3).map(Daemon::Ok));
         forward(items, channel).await;
         assert_eq!(
             *got.lock().unwrap(),
@@ -272,7 +280,7 @@ mod tests {
     async fn batches_are_capped() {
         let (channel, got) = recorder();
         let n = MAX_BATCH as u32 + 5;
-        forward(futures::stream::iter((0..n).map(Ok)), channel).await;
+        forward(futures::stream::iter((0..n).map(Daemon::Ok)), channel).await;
         let got = got.lock().unwrap();
         assert_eq!(got.len(), 3, "a full batch, the rest, the end");
         assert_eq!(got[0]["items"].as_array().unwrap().len(), MAX_BATCH);
@@ -296,7 +304,7 @@ mod tests {
     #[tokio::test]
     async fn items_still_to_come_are_not_waited_for() {
         let (channel, got) = recorder();
-        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let (tx, rx) = futures::channel::mpsc::unbounded::<Daemon>();
         tx.unbounded_send(Ok(1)).unwrap();
         let task = tokio::spawn(forward(rx, channel));
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -310,7 +318,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn what_arrives_within_the_window_goes_together() {
         let (channel, got) = recorder();
-        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let (tx, rx) = futures::channel::mpsc::unbounded::<Daemon>();
         let task = tokio::spawn(forward(rx, channel));
         // A line every 2 ms, as the daemon writes a log: one message.
         for n in 1..=4 {

@@ -11,12 +11,18 @@
 //! API's JSON. Every command is listed in `build.rs`, which makes Tauri
 //! generate a permission for it; `capabilities/main.json` grants exactly
 //! these to the app's window.
+//!
+//! A few do a client's work beyond one call, as the CLI does it: a build
+//! packs its context (`builder.rs`), compose runs a project
+//! (`compose.rs`), save and load write and read the user's files
+//! (`archive.rs`). What they decide stays the libraries' and the daemon's.
 
 use std::sync::Arc;
 
-use rustlet_client::Client;
+use rustlet_client::{Client, RequestBody};
+use rustlet_spec::build::{BuildEvent, BuildOptions, CommitRequest, CommitResponse};
 use rustlet_spec::container::{ContainerConfig, ContainerInspect, ContainerSummary, CreateResponse, RemoveQuery};
-use rustlet_spec::image::{ImageDeleteResponse, ImageInspect, ImageSummary, PullEvent, PullPolicy};
+use rustlet_spec::image::{ImageDeleteResponse, ImageInspect, ImageSummary, LoadEvent, PullEvent, PullPolicy};
 use rustlet_spec::isolation::Isolation;
 use rustlet_spec::logs::{LogEntry, LogsQuery};
 use rustlet_spec::network::{
@@ -28,9 +34,11 @@ use rustlet_spec::volume::{MountSpec, Volume, VolumeCreate};
 use tauri::State;
 use tauri::ipc::{Channel, InvokeResponseBody};
 
+use crate::compose::{self, ComposeProgress, Stack};
 use crate::error::{CommandError, CommandResult};
 use crate::streams::{self, DaemonMessage, StreamId, StreamMessage, Streams};
 use crate::terminal::{SessionId, TerminalRequest, Terminals};
+use crate::{archive, builder};
 
 /// What every command can reach.
 pub struct App {
@@ -101,13 +109,12 @@ pub struct RunOptions {
 
 #[tauri::command(rename_all = "snake_case")]
 pub fn parse_run_options(ports: Vec<String>, volumes: Vec<String>) -> CommandResult<RunOptions> {
-    let invalid = |message: String| CommandError { kind: "invalid".into(), message };
     let mut out = RunOptions::default();
     for p in ports.iter().map(|p| p.trim()).filter(|p| !p.is_empty()) {
-        out.ports.extend(PortMapping::parse(p).map_err(invalid)?);
+        out.ports.extend(PortMapping::parse(p).map_err(CommandError::invalid)?);
     }
     for v in volumes.iter().map(|v| v.trim()).filter(|v| !v.is_empty()) {
-        out.mounts.push(MountSpec::parse_volume(v).map_err(invalid)?);
+        out.mounts.push(MountSpec::parse_volume(v).map_err(CommandError::invalid)?);
     }
     Ok(out)
 }
@@ -192,6 +199,14 @@ pub async fn container_stats(
     Ok(app.streams.spawn(streams::forward(stats, channel)))
 }
 
+/// The container's changes as a new image (`rustlet commit`). `request`
+/// may leave out any field but `container`: a running container is paused
+/// while its changes are read, unless `pause` is `false`.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn container_commit(app: S<'_>, request: CommitRequest) -> CommandResult<CommitResponse> {
+    Ok(app.client.commit(&request).await?)
+}
+
 // ── streams and terminals ─────────────────────────────────────────────────
 
 /// Stops a stream (the view that showed it is gone). `false`: it had ended.
@@ -264,6 +279,91 @@ pub async fn image_pull(
 ) -> CommandResult<StreamId> {
     let pull = app.client.pull(&reference, policy.unwrap_or(PullPolicy::Always)).await?;
     Ok(app.streams.spawn(streams::forward(pull, channel)))
+}
+
+/// Gives the image `source` (a name, an id or a unique id prefix) the name
+/// `target` too.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn image_tag(app: S<'_>, source: String, target: String) -> CommandResult<()> {
+    Ok(app.client.tag_image(&source, &target).await?)
+}
+
+/// Saves the images `names` into a new file at `path` (absolute, or from
+/// `~/`); returns the archive's size. A failed save leaves no file.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn image_save(app: S<'_>, names: Vec<String>, path: String) -> CommandResult<u64> {
+    archive::save(&app.client, &names, &path).await
+}
+
+/// Loads the images of the archive at `path`, reporting each blob and
+/// image. The file is read as it is sent: stopping the stream stops the
+/// load.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn image_load(
+    app: S<'_>,
+    path: String,
+    channel: Channel<StreamMessage<LoadEvent>>,
+) -> CommandResult<StreamId> {
+    let file = archive::open(&path)?;
+    let load = app.client.load_images(RequestBody::from_reader(file)).await?;
+    Ok(app.streams.spawn(streams::forward(load, channel)))
+}
+
+/// Builds an image from the directory `context` with `containerfile`
+/// (relative to the context, absolute, or from `~/`; default its
+/// `Containerfile`, else its `Dockerfile`), as `options` say; the context
+/// is packed here and sent as it is packed. `options.dockerfile` is set
+/// from the file. Stopping the stream stops the build.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn image_build(
+    app: S<'_>,
+    context: String,
+    containerfile: Option<String>,
+    options: BuildOptions,
+    channel: Channel<StreamMessage<BuildEvent>>,
+) -> CommandResult<StreamId> {
+    let build = builder::start(&app.client, &context, containerfile.as_deref(), options).await?;
+    Ok(app.streams.spawn(streams::forward(builder::events(build), channel)))
+}
+
+/// Forgets the build cache (`rustlet builder prune`).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn build_prune(app: S<'_>) -> CommandResult<PruneResponse> {
+    Ok(app.client.prune_build_cache().await?)
+}
+
+// ── compose ───────────────────────────────────────────────────────────────
+
+/// The compose projects the daemon has containers of.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn stack_list(app: S<'_>) -> CommandResult<Vec<Stack>> {
+    compose::list(&app.client).await
+}
+
+/// `compose up -d` of the project in `files` (one or more, the later ones
+/// overriding the first), named `project_name` if given (`-p`; else as the
+/// files say) and rooted at `project_dir` if given (`--project-directory`;
+/// else the first file's directory). A file that doesn't load fails this;
+/// then the up's progress comes on `channel`, and it runs to its end even
+/// if the stream is stopped.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn compose_up(
+    app: S<'_>,
+    files: Vec<String>,
+    project_name: Option<String>,
+    project_dir: Option<String>,
+    channel: Channel<StreamMessage<ComposeProgress>>,
+) -> CommandResult<StreamId> {
+    let options = compose::load_options(&files, project_name, project_dir, compose::app_env())?;
+    let progress = compose::up(app.client.clone(), options).await?;
+    Ok(app.streams.spawn(streams::forward(progress, channel)))
+}
+
+/// `compose -p PROJECT down`: stops and removes the project's containers
+/// and networks, and with `volumes` its volumes.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn compose_down(app: S<'_>, project: String, volumes: bool) -> CommandResult<()> {
+    compose::down(&app.client, &project, volumes).await
 }
 
 // ── networks ──────────────────────────────────────────────────────────────
@@ -349,5 +449,31 @@ mod tests {
         assert_eq!(e.kind, "invalid");
         assert!(e.message.contains("neither an absolute host path nor a volume name"), "{e:?}");
         assert!(parse_run_options(vec!["99999".into()], vec![]).is_err());
+    }
+
+    /// The commit dialog sends what it asks for, nothing else: the API's
+    /// defaults (pause while committing) apply to the rest.
+    #[test]
+    fn a_commit_from_the_dialog_pauses_the_container() {
+        let r: CommitRequest =
+            serde_json::from_value(serde_json::json!({"container": "web", "reference": null, "comment": "fixed"}))
+                .unwrap();
+        assert_eq!((r.container.as_str(), r.reference, r.comment.as_deref()), ("web", None, Some("fixed")));
+        assert!(r.pause);
+    }
+
+    /// The build form sends only what it asks for: the rest takes the
+    /// API's defaults, and `dockerfile` is the app's to set.
+    #[test]
+    fn build_options_from_the_form_take_the_apis_defaults() {
+        let o: BuildOptions = serde_json::from_value(serde_json::json!({
+            "tags": ["hits:latest"], "build_args": {"V": "1"}, "target": null,
+            "no_cache": true, "pull": "always", "network": "host",
+        }))
+        .unwrap();
+        assert_eq!(o.tags, ["hits:latest"]);
+        assert_eq!((o.no_cache, o.pull, o.dockerfile), (true, PullPolicy::Always, None));
+        assert_eq!(o.network.to_string(), "host");
+        assert!(o.labels.is_empty());
     }
 }

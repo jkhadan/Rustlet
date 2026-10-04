@@ -20,6 +20,10 @@ tauri-build = { version = "2.7.1", features = [] }
 [dependencies]
 rustlet-client.workspace = true
 rustlet-spec.workspace = true
+# Packing a build context (the client's half of a build), and compose
+# projects, which are client-side: the app does what the CLI does.
+rustlet-build.workspace = true
+rustlet-compose.workspace = true
 tauri = { version = "2.12.1", features = [] }
 serde.workspace = true
 serde_json.workspace = true
@@ -32,3 +36,4 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 # Paused time, for the batching tests.
 tokio = { workspace = true, features = ["test-util"] }
+tempfile.workspace = true

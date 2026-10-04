@@ -10,6 +10,7 @@
 //! | `unreachable` | nothing listens on the socket (the daemon is stopped) | shows "start the daemon" |
 //! | `denied` | the socket isn't this user's to use | explains the `rustlet` group |
 //! | the daemon's [`ErrorKind`] (`no_such_image`, `conflict`, …) | the daemon refused | `no_such_image` makes "run" pull first |
+//! | `invalid` | also what the app itself refuses: a form's value, a path that isn't absolute, a compose file that doesn't parse, a build context that can't be packed | shows the message by the form |
 //! | `failed` | anything else (a broken connection, a protocol error) | shows the message |
 
 use std::io;
@@ -29,6 +30,11 @@ pub type CommandResult<T> = Result<T, CommandError>;
 impl CommandError {
     pub fn failed(message: impl Into<String>) -> CommandError {
         CommandError { kind: "failed".into(), message: message.into() }
+    }
+
+    /// What the user gave the app is wrong: the daemon's own word for it.
+    pub fn invalid(message: impl Into<String>) -> CommandError {
+        CommandError { kind: "invalid".into(), message: message.into() }
     }
 
     /// The daemon's own kind of error, as the API spells it.

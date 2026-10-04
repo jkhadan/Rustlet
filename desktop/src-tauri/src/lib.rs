@@ -13,6 +13,9 @@
 //!  │ streams.rs    NDJSON streams → channels, the daemon│
 //!  │               connection and its events            │
 //!  │ terminal.rs   exec sessions for xterm.js           │
+//!  │ builder.rs    a build's context, packed and sent   │
+//!  │ compose.rs    compose projects (client-side)       │
+//!  │ archive.rs    save and load, to and from files     │
 //!  └──────────────┬─────────────────────────────────────┘
 //!                 │ rustlet-client: HTTP/1.1, NDJSON, WebSocket
 //!                 ▼
@@ -28,8 +31,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod archive;
+pub mod builder;
 pub mod commands;
+pub mod compose;
 pub mod error;
+pub mod paths;
 pub mod streams;
 pub mod terminal;
 
@@ -101,6 +108,7 @@ pub fn run() {
             commands::container_isolation,
             commands::container_logs,
             commands::container_stats,
+            commands::container_commit,
             commands::stream_cancel,
             commands::terminal_open,
             commands::terminal_input,
@@ -110,6 +118,14 @@ pub fn run() {
             commands::image_inspect,
             commands::image_remove,
             commands::image_pull,
+            commands::image_tag,
+            commands::image_save,
+            commands::image_load,
+            commands::image_build,
+            commands::build_prune,
+            commands::stack_list,
+            commands::compose_up,
+            commands::compose_down,
             commands::network_list,
             commands::network_inspect,
             commands::network_create,
@@ -153,5 +169,38 @@ async fn exit_signal() -> Option<&'static str> {
         _ = term.recv() => Some("SIGTERM"),
         _ = int.recv() => Some("SIGINT"),
         _ = hup.recv() => Some("SIGHUP"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    /// A command missing from `build.rs` gets no permission, and one the
+    /// capability doesn't grant is refused at run time: both only show
+    /// when the app is used. So the three lists are compared here.
+    #[test]
+    fn every_command_registered_is_listed_and_granted_and_nothing_else() {
+        let read = |f: &str| std::fs::read_to_string(format!("{}/{f}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let between = |text: &str, start: &str| -> BTreeSet<String> {
+            let list = text.split(start).nth(1).and_then(|rest| rest.split(']').next()).expect(start);
+            list.split(',').map(|s| s.trim().trim_matches('"').to_owned()).filter(|s| !s.is_empty()).collect()
+        };
+        let handled: BTreeSet<String> = between(&read("src/lib.rs"), "generate_handler![")
+            .into_iter()
+            .map(|c| c.trim_start_matches("commands::").to_owned())
+            .collect();
+        let listed = between(&read("build.rs"), "COMMANDS: &[&str] = &[");
+        let capability: serde_json::Value = serde_json::from_str(&read("capabilities/main.json")).unwrap();
+        let granted: BTreeSet<String> = capability["permissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.as_str()?.strip_prefix("allow-"))
+            .map(|p| p.replace('-', "_"))
+            .collect();
+        assert!(handled.len() > 40, "{handled:?}");
+        assert_eq!(handled, listed, "generate_handler! in lib.rs and COMMANDS in build.rs");
+        assert_eq!(listed, granted, "COMMANDS in build.rs and capabilities/main.json");
     }
 }
