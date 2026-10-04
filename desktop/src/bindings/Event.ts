@@ -9,7 +9,7 @@ import type { EventKind } from "./EventKind";
  * `exec_start`, `exec_die` (`exec_id`, `exit_code`), `health_status`
  * (attribute `health_status`: `healthy` or `unhealthy`, when its
  * healthcheck's verdict changes; a start begins at `starting` without an
- * event), `commit` (attribute `image`: the new image's id). Every container
+ * event), `commit` (attribute `new_image`: the new image's id). Every container
  * event carries `name` and `image`. Image actions, by name, with the
  * image's digest in `id`: `pull`, `tag` (a build, `tag`, `commit` or `load`
  * gave it the name), `untag`, `load` (an unnamed image was loaded; by id),
