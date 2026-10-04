@@ -219,8 +219,9 @@ filesystem as upperdir".
 With all three off (`redirect_dir`'s "off" is spelled `nofollow` here, for
 the reason below), every entry in upper is complete: files have all
 their data, renamed directories are real copies, nothing points into a
-lower layer. Phase 7's `commit` and builder will make a layer by walking
-upper (architecture §2.4), which needs that self-contained diff. The
+lower layer. Phase 7's `commit` and builder make a layer by walking
+upper ([chapter 18](18-building-images.md) §5), which needs that
+self-contained diff. The
 defaults belong to whoever built the kernel (`CONFIG_OVERLAY_FS_INDEX`
 and friends) or loads the module. Here, `/sys/module/overlay/parameters/`
 reads `index=N`, `metacopy=N`, `redirect_dir=N` and
@@ -566,7 +567,7 @@ containers/3968ada2b41c…/upper/etc:
 ```
 
 Snapshots hold image ids, but a remapped container's upper holds host
-ids, so a commit of it (Phase 7) will have to map them back.
+ids, so a commit of it maps them back ([chapter 18](18-building-images.md) §5).
 `im_userns_idmapped_layers_show_container_root` checks this section, down
 to a single new host mount with no staged layer left.
 

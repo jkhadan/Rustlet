@@ -708,9 +708,10 @@ on distributions that have a different one, or none.
   container's configuration, not what the kernel enforces.
 - **A closed terminal hangs up** (`SIGHUP`), and so does quitting the
   app, where Docker leaves an exec'd shell running.
-- **Not yet:** compose stacks and image builds (Phase 7); the daemon
-  packaged as a `.deb` with its unit; a "start daemon" button that works
-  without a polkit agent; settings (another socket than `RUSTLET_HOST`).
+- **Not yet:** the daemon packaged as a `.deb` with its unit; a "start
+  daemon" button that works without a polkit agent; settings (another
+  socket than `RUSTLET_HOST`). Compose stacks and image builds, once on
+  this list, came with Phase 7 ([chapter 19](19-compose.md) §8).
 
 ## 12. Try it
 

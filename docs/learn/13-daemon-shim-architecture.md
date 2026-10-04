@@ -582,7 +582,8 @@ root: it holds an OFD lock on `rustletd.lock` in each.
   overlay driver does, and a later start mounts a new overlay on the same
   `upper/` and `work/` while the old one may live on.
 - **`/events`** is NDJSON (§8); `--format` and filters are not
-  implemented in the CLI; healthchecks wait for Phase 7.
+  implemented in the CLI; healthchecks came with Phase 7 ([chapter
+  19](19-compose.md) §4).
 
 ## 13. Try it
 
