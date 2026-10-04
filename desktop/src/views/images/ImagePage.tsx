@@ -1,4 +1,4 @@
-import { ArrowLeft, Layers, Play, Trash2 } from "lucide-react";
+import { ArrowLeft, Layers, Play, Save, Tag, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 
@@ -16,6 +16,7 @@ import { api, CommandFailed } from "@/lib/ipc";
 import { useContainers, useImage } from "@/lib/queries";
 
 import { RunDialog } from "../containers/RunDialog";
+import { SaveDialog, TagDialog } from "./ImageDialogs";
 
 /** The parts of an OCI image config this page shows. */
 interface OciConfig {
@@ -39,6 +40,8 @@ export function ImagePage() {
   const image = useImage(name);
   const containers = useContainers(true);
   const [running, setRunning] = useState(false);
+  const [tagging, setTagging] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [dialog, ask] = useConfirm();
   const navigate = useNavigate();
   const now = useNow();
@@ -113,6 +116,12 @@ export function ImagePage() {
           <>
             <Button variant="primary" onClick={() => setRunning(true)}>
               <Play /> Run
+            </Button>
+            <Button onClick={() => setTagging(true)}>
+              <Tag /> Tag…
+            </Button>
+            <Button onClick={() => setSaving(true)}>
+              <Save /> Save…
             </Button>
             <Button onClick={() => void remove()}>
               <Trash2 /> Remove
@@ -222,6 +231,8 @@ export function ImagePage() {
         </Card>
       </div>
       {running && <RunDialog open onOpenChange={(o) => !o && setRunning(false)} image={i.names[0] ? imageName(i.names[0]) : i.id} />}
+      {tagging && <TagDialog open source={i.names[0] ?? i.id} onOpenChange={setTagging} />}
+      {saving && <SaveDialog open names={i.names.length ? i.names : [i.id]} onOpenChange={setSaving} />}
     </div>
   );
 }

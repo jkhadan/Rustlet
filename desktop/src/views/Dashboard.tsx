@@ -3,14 +3,16 @@ import { useState } from "react";
 import { Link } from "react-router";
 
 import type { Event } from "@/bindings";
-import { ErrorState, PageHeader, StatusDot } from "@/components/common";
+import { ErrorState, HealthBadge, PageHeader, StatusDot } from "@/components/common";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Facts, Mono, Spinner } from "@/components/ui/misc";
 import { cn } from "@/lib/cn";
+import { hideBuildContainers } from "@/lib/containers";
 import { useDaemon, useNow } from "@/lib/daemon";
 import { describeEvent } from "@/lib/events";
-import { ago, bytes, imageName, isLive, statusText } from "@/lib/format";
+import { ago, bytes, imageName, isLive, plural, statusText } from "@/lib/format";
+import { shownHealth } from "@/lib/health";
 import { useContainers, useInfo } from "@/lib/queries";
 
 import { RunDialog } from "./containers/RunDialog";
@@ -22,6 +24,7 @@ export function Dashboard() {
   const { connection, events } = useDaemon();
   const [running, setRunning] = useState(false);
   const [pulling, setPulling] = useState(false);
+  const [builds, setBuilds] = useState(false);
   const now = useNow(5_000);
 
   if (info.error) {
@@ -33,7 +36,8 @@ export function Dashboard() {
     );
   }
   const i = info.data;
-  const live = (containers.data ?? []).filter(isLive);
+  // A build's RUN steps run in containers of their own, for a step each.
+  const { shown: live, hidden } = hideBuildContainers((containers.data ?? []).filter(isLive), builds);
   // Network events name containers by id: the names come from the
   // containers' own events (removed ones too) and from those still here.
   const names = new Map<string, string>();
@@ -67,26 +71,44 @@ export function Dashboard() {
         <div className="grid grid-cols-1 gap-4 xl:grid-cols-[1fr_26rem]">
           <div className="flex flex-col gap-4">
             <Card>
-              <CardHeader title="Running" description="Containers whose processes exist right now." />
+              <CardHeader
+                title="Running"
+                description="Containers whose processes exist right now."
+                actions={
+                  (hidden > 0 || builds) && (
+                    <Button size="sm" variant="ghost" onClick={() => setBuilds((b) => !b)} data-testid="toggle-build-containers">
+                      {builds ? "Hide build containers" : `Show ${plural(hidden, "build container")}`}
+                    </Button>
+                  )
+                }
+              />
               <CardContent className="p-0">
                 {containers.isPending ? (
                   <div className="flex justify-center py-8">
                     <Spinner />
                   </div>
                 ) : live.length === 0 ? (
-                  <p className="text-muted-foreground px-4 py-6 text-sm">Nothing is running.</p>
+                  <p className="text-muted-foreground px-4 py-6 text-sm">
+                    {hidden ? "Only a build's step containers are running." : "Nothing is running."}
+                  </p>
                 ) : (
-                  <ul className="divide-y">
-                    {live.map((c) => (
-                      <li key={c.id}>
-                        <Link to={`/containers/${c.id}`} className="hover:bg-muted/40 flex items-center gap-3 px-4 py-2.5">
-                          <StatusDot status={c.state.status} />
-                          <span className="font-medium">{c.name}</span>
-                          <span className="text-muted-foreground truncate text-sm">{imageName(c.image)}</span>
-                          <span className="text-muted-foreground ml-auto text-xs whitespace-nowrap">{statusText(c.state, now)}</span>
-                        </Link>
-                      </li>
-                    ))}
+                  <ul className="divide-y" data-testid="running">
+                    {live.map((c) => {
+                      const health = shownHealth(c.state);
+                      return (
+                        <li key={c.id}>
+                          <Link to={`/containers/${c.id}`} className="hover:bg-muted/40 flex items-center gap-3 px-4 py-2.5">
+                            <StatusDot status={c.state.status} />
+                            <span className="font-medium">{c.name}</span>
+                            <span className="text-muted-foreground truncate text-sm">{imageName(c.image)}</span>
+                            <span className="ml-auto flex items-center gap-2">
+                              {health && <HealthBadge health={health} />}
+                              <span className="text-muted-foreground text-xs whitespace-nowrap">{statusText(c.state, now)}</span>
+                            </span>
+                          </Link>
+                        </li>
+                      );
+                    })}
                   </ul>
                 )}
               </CardContent>
@@ -154,6 +176,9 @@ const DOT: Record<string, string> = {
   unpause: "bg-success",
   create: "bg-info",
   pull: "bg-info",
+  tag: "bg-info",
+  load: "bg-info",
+  commit: "bg-info",
   connect: "bg-info",
   die: "bg-muted-foreground",
   stop: "bg-muted-foreground",
@@ -165,11 +190,19 @@ const DOT: Record<string, string> = {
 };
 
 function EventRow({ event: e, now, nameOf }: { event: Event; now: number; nameOf: (id: string) => string | undefined }) {
-  const failed = e.action === "die" && e.attributes.exit_code && e.attributes.exit_code !== "0";
+  const failed =
+    (e.action === "die" && e.attributes.exit_code && e.attributes.exit_code !== "0") ||
+    (e.action === "health_status" && e.attributes.health_status === "unhealthy");
+  const healthy = e.action === "health_status" && e.attributes.health_status === "healthy";
   const link = e.kind === "container" && e.action !== "destroy" ? `/containers/${e.id}` : e.kind === "image" ? null : `/${e.kind}s`;
   const body = (
     <div className="flex items-start gap-3 px-4 py-2">
-      <span className={cn("mt-1.5 size-2 shrink-0 rounded-full", failed ? "bg-destructive" : (DOT[e.action] ?? "bg-muted-foreground/50"))} />
+      <span
+        className={cn(
+          "mt-1.5 size-2 shrink-0 rounded-full",
+          failed ? "bg-destructive" : healthy ? "bg-success" : (DOT[e.action] ?? "bg-muted-foreground/50"),
+        )}
+      />
       <div className="min-w-0 flex-1">
         <div className="text-sm break-words">{describeEvent(e, nameOf)}</div>
         <div className="text-muted-foreground text-[11px]">

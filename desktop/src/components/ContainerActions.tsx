@@ -1,14 +1,16 @@
-// Start, stop, restart, pause/resume, kill and remove, for whatever state
-// the container is in. The lists refresh from the daemon's events, as they
-// do when the CLI does the same thing, so nothing here updates the cache.
+// Start, stop, restart, pause/resume, kill, commit and remove, for whatever
+// state the container is in. The lists refresh from the daemon's events,
+// as they do when the CLI does the same thing, so nothing here updates the
+// cache.
 
-import { MoreHorizontal, Pause, Play, RotateCw, Square, Trash2, Zap } from "lucide-react";
+import { GitCommitHorizontal, MoreHorizontal, Pause, Play, RotateCw, Square, Trash2, Zap } from "lucide-react";
 import { useState } from "react";
 import { useNavigate } from "react-router";
 
 import type { ContainerState } from "@/bindings";
 import { api } from "@/lib/ipc";
 
+import { CommitDialog } from "./CommitDialog";
 import { attempt, useConfirm } from "./common";
 import { Button } from "./ui/button";
 import { Checkbox } from "./ui/input";
@@ -24,6 +26,7 @@ interface Target {
 
 export function ContainerActions({ container, compact, navigateOnRemove }: { container: Target; compact?: boolean; navigateOnRemove?: boolean }) {
   const [busy, setBusy] = useState<string | null>(null);
+  const [committing, setCommitting] = useState(false);
   const [dialog, ask] = useConfirm();
   const navigate = useNavigate();
   const { id, name, state } = container;
@@ -107,12 +110,16 @@ export function ContainerActions({ container, compact, navigateOnRemove }: { con
           <MenuItem disabled={!live} onSelect={() => void run("Kill", () => api.containers.kill(id, "KILL"))}>
             <Zap /> Kill (SIGKILL)
           </MenuItem>
+          <MenuItem onSelect={() => setCommitting(true)} data-testid="open-commit">
+            <GitCommitHorizontal /> Commit…
+          </MenuItem>
           <MenuSeparator />
           <MenuItem destructive onSelect={() => void remove()}>
             <Trash2 /> Remove…
           </MenuItem>
         </Menu>
       )}
+      {!compact && <CommitDialog container={id} live={live} open={committing} onOpenChange={setCommitting} />}
     </div>
   );
 }

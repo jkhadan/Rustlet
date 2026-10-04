@@ -1,11 +1,11 @@
 // Pieces every view uses: the page header, a container's status, errors,
 // confirmations, copy buttons.
 
-import { AlertTriangle, Check, Copy, PlugZap, Power } from "lucide-react";
-import { type ReactNode, useCallback, useState } from "react";
+import { AlertTriangle, Check, Copy, HeartPulse, PlugZap, Power } from "lucide-react";
+import { type HTMLAttributes, type ReactNode, useCallback, useState } from "react";
 import { toast } from "sonner";
 
-import type { ContainerStatus } from "@/bindings";
+import type { ContainerStatus, HealthStatus } from "@/bindings";
 import { cn } from "@/lib/cn";
 import { useDaemon } from "@/lib/daemon";
 import { api, CommandFailed } from "@/lib/ipc";
@@ -70,6 +70,29 @@ export function StatusBadge({ status, exitCode }: { status: ContainerStatus; exi
       <StatusDot status={status} className={failed ? "bg-destructive" : undefined} />
       {status}
       {status === "exited" && exitCode != null && ` (${exitCode})`}
+    </Badge>
+  );
+}
+
+const healthTone: Record<HealthStatus, Tone> = {
+  healthy: "success",
+  unhealthy: "destructive",
+  starting: "warning",
+};
+
+const healthTitle: Record<HealthStatus, string> = {
+  healthy: "Its healthcheck passes",
+  unhealthy: "Its healthcheck failed too many times in a row",
+  starting: "Its healthcheck hasn't passed yet",
+};
+
+/** What a container's healthcheck says (`lib/health.ts`'s `shownHealth`
+ * decides when it is shown). */
+export function HealthBadge({ health, ...props }: { health: HealthStatus } & HTMLAttributes<HTMLSpanElement>) {
+  return (
+    <Badge tone={healthTone[health]} title={healthTitle[health]} data-health={health} {...props}>
+      <HeartPulse className="size-3" aria-hidden />
+      {health}
     </Badge>
   );
 }

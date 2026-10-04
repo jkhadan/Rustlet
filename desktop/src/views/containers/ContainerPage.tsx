@@ -1,12 +1,13 @@
 import { ArrowLeft, Boxes, FileJson, Gauge, Info, ScrollText, ShieldCheck, SquareTerminal } from "lucide-react";
 import { Link, useNavigate, useParams } from "react-router";
 
-import { ErrorState, PageHeader, StatusBadge } from "@/components/common";
+import { ErrorState, HealthBadge, PageHeader, StatusBadge } from "@/components/common";
 import { ContainerActions } from "@/components/ContainerActions";
 import { Empty, Mono, Spinner } from "@/components/ui/misc";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useNow } from "@/lib/daemon";
 import { imageName, shortId, statusText } from "@/lib/format";
+import { shownHealth } from "@/lib/health";
 import { CommandFailed } from "@/lib/ipc";
 import { useContainer } from "@/lib/queries";
 
@@ -49,6 +50,7 @@ export function ContainerPage() {
   }
   const c = container.data;
   const running = c.state.status === "running" || c.state.status === "paused";
+  const health = shownHealth(c.state);
 
   return (
     <div className="flex h-full flex-col">
@@ -60,6 +62,7 @@ export function ContainerPage() {
             </Link>
             <span data-testid="container-name">{c.name}</span>
             <StatusBadge status={c.state.status} exitCode={c.state.exit_code} />
+            {health && <HealthBadge health={health} data-testid="container-health" />}
           </span>
         }
         subtitle={

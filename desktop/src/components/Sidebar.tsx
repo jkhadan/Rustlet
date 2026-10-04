@@ -1,4 +1,4 @@
-import { Boxes, HardDrive, Layers, LayoutDashboard, Network, Power } from "lucide-react";
+import { Blocks, Boxes, Hammer, HardDrive, Layers, LayoutDashboard, Network, Power } from "lucide-react";
 import { NavLink } from "react-router";
 
 import { cn } from "@/lib/cn";
@@ -12,7 +12,9 @@ import { Tooltip } from "./ui/tooltip";
 const nav = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
   { to: "/containers", label: "Containers", icon: Boxes },
+  { to: "/stacks", label: "Stacks", icon: Blocks },
   { to: "/images", label: "Images", icon: Layers },
+  { to: "/build", label: "Build", icon: Hammer },
   { to: "/networks", label: "Networks", icon: Network },
   { to: "/volumes", label: "Volumes", icon: HardDrive },
 ];

@@ -1,11 +1,11 @@
 // @vitest-environment jsdom
 // The overview against what the daemon means by the container's config.
 
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { ContainerInspect } from "@/bindings";
+import type { ContainerInspect, Health } from "@/bindings";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 import { OverviewTab } from "./OverviewTab";
@@ -106,5 +106,56 @@ describe("overview", () => {
     cleanup();
     show(inspect({ config: { security_opt: ["no-new-privileges=false", "no-new-privileges"] } }));
     expect(security()).toBe("defaults");
+  });
+});
+
+describe("health", () => {
+  const check = (second: number, exit_code: number, output: string) => ({
+    start: `2026-10-03T00:01:${String(second).padStart(2, "0")}.000000000Z`,
+    end: `2026-10-03T00:01:${String(second).padStart(2, "0")}.020000000Z`,
+    exit_code,
+    output,
+  });
+
+  function withHealth(health: Health | null, healthcheck: unknown = null, status = "running") {
+    const c = inspect({ config: { healthcheck } });
+    c.state = { ...c.state, status: status as ContainerInspect["state"]["status"], health };
+    return c;
+  }
+
+  it("shows the verdict, the streak, the check and its last results, newest first", () => {
+    const health: Health = {
+      status: "unhealthy",
+      failing_streak: 3,
+      log: [check(0, 0, "PONG\n"), check(10, 1, "Could not connect to Redis\n"), check(20, -1, "")],
+    };
+    show(withHealth(health, { test: ["CMD-SHELL", "redis-cli ping"], interval: 10e9, timeout: null, start_period: null, start_interval: null, retries: 3 }));
+    const card = screen.getByTestId("health");
+    expect(within(card).getByText("unhealthy")).toBeTruthy();
+    expect(within(card).getByText("3 checks failed in a row")).toBeTruthy();
+    expect(within(card).getByText("redis-cli ping")).toBeTruthy();
+    expect(within(card).getByText("every 10s · 3 retries")).toBeTruthy();
+    const rows = [...within(card).getByTestId("health-checks").querySelectorAll("tbody tr")] as HTMLElement[];
+    expect(rows.map((r) => r.dataset.outcome)).toEqual(["error", "failed", "passed"]);
+    expect(rows[0].textContent).toContain("timed out or couldn't run");
+    expect(rows[1].textContent).toContain("Could not connect to Redis");
+    expect(rows[2].textContent).toContain("20 ms");
+  });
+
+  it("of a container whose image has the check, says so; none without one", () => {
+    show(withHealth({ status: "starting", failing_streak: 0, log: [] }));
+    expect(within(screen.getByTestId("health")).getByText("the image's HEALTHCHECK")).toBeTruthy();
+    expect(screen.getByText("No check has run yet.")).toBeTruthy();
+    cleanup();
+    show(withHealth(null));
+    expect(screen.queryByTestId("health")).toBeNull();
+    cleanup();
+    show(withHealth(null, { test: ["NONE"], interval: null, timeout: null, start_period: null, start_interval: null, retries: null }));
+    expect(screen.queryByTestId("health")).toBeNull();
+  });
+
+  it("of a stopped container is what its last run's checks left", () => {
+    show(withHealth({ status: "healthy", failing_streak: 0, log: [check(0, 0, "")] }, null, "exited"));
+    expect(screen.getByText("as the checks of its last run left it")).toBeTruthy();
   });
 });

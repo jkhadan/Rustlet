@@ -1,12 +1,98 @@
 import { Link } from "react-router";
 
 import type { ContainerInspect } from "@/bindings";
+import { HealthBadge } from "@/components/common";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Facts, Mono } from "@/components/ui/misc";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { useNow } from "@/lib/daemon";
-import { ago, bytes, commandText, portsText } from "@/lib/format";
+import { ago, bytes, commandText, plural, portsText } from "@/lib/format";
+import { checkMillis, checkOutcome, checksNewestFirst, describeTest, healthSettings } from "@/lib/health";
+
+/** The healthcheck: its verdict, how it is checked, and the last checks
+ * (rustletd keeps five), for a container that has one. */
+function HealthCard({ container: c, now }: { container: ContainerInspect; now: number }) {
+  const h = c.state.health;
+  const test = describeTest(c.config.healthcheck);
+  if (!h && (test.kind === "image" || test.kind === "none")) return null;
+  const live = c.state.status === "running" || c.state.status === "paused";
+  const settings = healthSettings(c.config.healthcheck);
+  const checks = h ? checksNewestFirst(h) : [];
+  return (
+    <Card className="xl:col-span-2" data-testid="health">
+      <CardHeader title="Health" description="What its healthcheck says: a command rustletd runs in it now and then." />
+      <CardContent className="flex flex-col gap-4">
+        <Facts
+          rows={[
+            [
+              "Status",
+              h ? (
+                <span key="s" className="flex items-center gap-2">
+                  <HealthBadge health={h.status} />
+                  {!live && <span className="text-muted-foreground text-xs">as the checks of its last run left it</span>}
+                </span>
+              ) : (
+                "not checked yet"
+              ),
+            ],
+            ["Failing streak", h?.failing_streak ? `${plural(h.failing_streak, "check")} failed in a row` : "none"],
+            [
+              "Check",
+              test.kind === "shell" || test.kind === "exec" ? (
+                <span key="t">
+                  <Mono>{test.command}</Mono>
+                  {test.kind === "shell" && <span className="text-muted-foreground"> (by the image's shell)</span>}
+                </span>
+              ) : (
+                "the image's HEALTHCHECK"
+              ),
+            ],
+            ...(settings ? [["Settings", settings] as [string, string]] : []),
+          ]}
+        />
+        {checks.length === 0 ? (
+          <p className="text-muted-foreground text-sm">No check has run yet.</p>
+        ) : (
+          <Table data-testid="health-checks">
+            <thead>
+              <tr>
+                <Th>Checked</Th>
+                <Th>Took</Th>
+                <Th>Exit code</Th>
+                <Th className="w-full">Output</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {checks.map((r, i) => {
+                const outcome = checkOutcome(r);
+                const ms = checkMillis(r);
+                return (
+                  <Tr key={`${r.start}-${i}`} data-outcome={outcome}>
+                    <Td className="text-muted-foreground align-top whitespace-nowrap">{ago(r.start, now)}</Td>
+                    <Td className="align-top whitespace-nowrap tabular-nums">{ms == null ? "–" : `${ms} ms`}</Td>
+                    <Td className="align-top">
+                      <Badge tone={outcome === "passed" ? "success" : "destructive"}>
+                        {outcome === "error" ? "−1: timed out or couldn't run" : r.exit_code}
+                      </Badge>
+                    </Td>
+                    <Td className="align-top">
+                      {r.output.trim() ? (
+                        <pre className="max-h-28 overflow-auto font-mono text-xs break-all whitespace-pre-wrap">{r.output.trimEnd()}</pre>
+                      ) : (
+                        <span className="text-muted-foreground text-xs">no output</span>
+                      )}
+                    </Td>
+                  </Tr>
+                );
+              })}
+            </tbody>
+          </Table>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
 
 /** `--security-opt` values as rustletd reads them (spec.rs, `check`):
  * `key=value` or `key:value`, the last of a key winning. */
@@ -93,6 +179,8 @@ export function OverviewTab({ container: c }: { container: ContainerInspect }) {
           </p>
         </CardContent>
       </Card>
+
+      <HealthCard container={c} now={now} />
 
       <Card className="xl:col-span-2">
         <CardHeader title="Network" description={`Mode: ${net.mode}`} />

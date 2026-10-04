@@ -1,6 +1,7 @@
-import { Download, Layers, Play, Search, Trash2 } from "lucide-react";
+import { Download, Eraser, Layers, Play, Save, Search, Tag, Trash2, Upload } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router";
+import { toast } from "sonner";
 
 import type { ImageSummary } from "@/bindings";
 import { attempt, ErrorState, PageHeader, useConfirm } from "@/components/common";
@@ -16,13 +17,18 @@ import { api } from "@/lib/ipc";
 import { useContainers, useImages } from "@/lib/queries";
 
 import { RunDialog } from "../containers/RunDialog";
+import { LoadDialog, SaveDialog, TagDialog } from "./ImageDialogs";
 import { PullDialog } from "./PullDialog";
 
 export function ImagesPage() {
   const images = useImages();
   const containers = useContainers(true);
   const [pulling, setPulling] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [running, setRunning] = useState<string | null>(null);
+  // The image a Tag or Save dialog is for (a name, or an id).
+  const [tagging, setTagging] = useState<string | null>(null);
+  const [saving, setSaving] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [dialog, ask] = useConfirm();
   const now = useNow();
@@ -54,6 +60,23 @@ export function ImagesPage() {
     if (ok) await attempt(`Removing ${name} failed`, () => api.images.remove(name, used.length > 0));
   };
 
+  const pruneBuildCache = async () => {
+    const ok = await ask({
+      title: "Prune the build cache?",
+      body: "The results of earlier build steps, kept so that a build that repeats a step needn't run it again, are forgotten: the next builds run every step. Images are not touched.",
+      confirm: "Prune",
+      destructive: true,
+    });
+    if (!ok) return;
+    try {
+      const r = await api.images.pruneBuildCache();
+      // The cache's entries, and the blobs and snapshots only they kept.
+      toast.success(r.deleted.length ? `Pruned the build cache (${r.deleted.length} removed)` : "The build cache was empty");
+    } catch (e) {
+      toast.error("Pruning the build cache failed", { description: e instanceof Error ? e.message : String(e) });
+    }
+  };
+
   return (
     <div>
       {dialog}
@@ -61,9 +84,17 @@ export function ImagesPage() {
         title="Images"
         subtitle={images.data ? `${plural(images.data.length, "image")} · ${bytes(total)} compressed` : " "}
         actions={
-          <Button variant="primary" onClick={() => setPulling(true)} data-testid="open-pull">
-            <Download /> Pull
-          </Button>
+          <>
+            <Button onClick={() => void pruneBuildCache()} data-testid="prune-build-cache">
+              <Eraser /> Prune build cache
+            </Button>
+            <Button onClick={() => setLoading(true)} data-testid="open-load">
+              <Upload /> Load…
+            </Button>
+            <Button variant="primary" onClick={() => setPulling(true)} data-testid="open-pull">
+              <Download /> Pull
+            </Button>
+          </>
         }
       >
         <div className="relative mt-4 w-72">
@@ -128,6 +159,16 @@ export function ImagesPage() {
                               <Play />
                             </Button>
                           </Tooltip>
+                          <Tooltip content="Tag…">
+                            <Button size="icon-sm" variant="ghost" onClick={() => setTagging(name ?? i.id)} aria-label="Tag">
+                              <Tag />
+                            </Button>
+                          </Tooltip>
+                          <Tooltip content="Save to a file…">
+                            <Button size="icon-sm" variant="ghost" onClick={() => setSaving(name ?? i.id)} aria-label="Save">
+                              <Save />
+                            </Button>
+                          </Tooltip>
                           <Tooltip content="Remove">
                             <Button size="icon-sm" variant="ghost" onClick={() => void remove(i)} aria-label="Remove">
                               <Trash2 />
@@ -144,7 +185,10 @@ export function ImagesPage() {
         )}
       </div>
       <PullDialog open={pulling} onOpenChange={setPulling} />
+      <LoadDialog open={loading} onOpenChange={setLoading} />
       {running && <RunDialog open onOpenChange={(o) => !o && setRunning(null)} image={imageName(running)} />}
+      {tagging && <TagDialog open source={tagging} onOpenChange={(o) => !o && setTagging(null)} />}
+      {saving && <SaveDialog open names={[saving]} onOpenChange={(o) => !o && setSaving(null)} />}
     </div>
   );
 }
