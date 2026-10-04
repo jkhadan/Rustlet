@@ -26,6 +26,9 @@ services:
       test: ["CMD", "test", "-e", "/tmp/ready"]
       interval: 100ms
       retries: 3
+      # Failures before /tmp/ready don't count, however fast the checks.
+      start_period: 30s
+      start_interval: 100ms
   init:
     image: alpine
     command: ["sh", "-c", "echo seeded"]
