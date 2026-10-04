@@ -456,7 +456,7 @@ impl Copier<'_> {
 /// Opens the entry `name` of `dir`, which `st` says is a regular file or a
 /// directory, for reading, and checks it is still that inode (see the
 /// module docs for the flags).
-fn open_source(dir: BorrowedFd<'_>, name: &OsStr, st: &FileStat, shown: &str) -> Result<OwnedFd> {
+pub(crate) fn open_source(dir: BorrowedFd<'_>, name: &OsStr, st: &FileStat, shown: &str) -> Result<OwnedFd> {
     let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_NOCTTY | OFlag::O_CLOEXEC;
     let fd = nix::fcntl::openat(dir, name, flags, Mode::empty()).with_context(|| format!("{shown}: open"))?;
     let now = nix::sys::stat::fstat(&fd).with_context(|| format!("{shown}: stat"))?;
@@ -472,24 +472,24 @@ fn open_source(dir: BorrowedFd<'_>, name: &OsStr, st: &FileStat, shown: &str) ->
 /// (`/proc/self/fd/<dir>/<name>`). The `l*xattr` calls follow the magic
 /// link, a middle component, to exactly the directory held, and don't
 /// follow the name.
-enum Attrs<'a> {
+pub(crate) enum Attrs<'a> {
     Fd(BorrowedFd<'a>),
     At(PathBuf),
 }
 
 impl Attrs<'_> {
-    fn at(dir: BorrowedFd<'_>, name: &OsStr) -> Self {
+    pub(crate) fn at(dir: BorrowedFd<'_>, name: &OsStr) -> Self {
         Attrs::At(Path::new(&format!("/proc/self/fd/{}", dir.as_raw_fd())).join(name))
     }
 
-    fn list(&self) -> rustlet_sys::Result<Vec<String>> {
+    pub(crate) fn list(&self) -> rustlet_sys::Result<Vec<String>> {
         match self {
             Attrs::Fd(fd) => xattr::flist(*fd),
             Attrs::At(path) => xattr::llist(path),
         }
     }
 
-    fn get(&self, name: &str) -> rustlet_sys::Result<Vec<u8>> {
+    pub(crate) fn get(&self, name: &str) -> rustlet_sys::Result<Vec<u8>> {
         match self {
             Attrs::Fd(fd) => xattr::fget(*fd, name),
             Attrs::At(path) => xattr::lget(path, name),
@@ -528,7 +528,7 @@ fn map_ids(name: &str, mut value: Vec<u8>, map_owner: &dyn Fn(u32, u32) -> (u32,
 /// in recent kernels, for an fd the caller opened itself; where an
 /// unprivileged caller (the unit tests) gets `ENOENT`, the fd's magic link
 /// names the same inode.
-fn link_fd(fd: BorrowedFd<'_>, dir: BorrowedFd<'_>, name: &OsStr) -> rustlet_sys::Result<()> {
+pub(crate) fn link_fd(fd: BorrowedFd<'_>, dir: BorrowedFd<'_>, name: &OsStr) -> rustlet_sys::Result<()> {
     match nix::unistd::linkat(fd, "", dir, name, AtFlags::AT_EMPTY_PATH) {
         Err(Errno::ENOENT) => {
             let magic = format!("/proc/self/fd/{}", fd.as_raw_fd());
@@ -538,12 +538,12 @@ fn link_fd(fd: BorrowedFd<'_>, dir: BorrowedFd<'_>, name: &OsStr) -> rustlet_sys
     }
 }
 
-fn times(st: &FileStat) -> (TimeSpec, TimeSpec) {
+pub(crate) fn times(st: &FileStat) -> (TimeSpec, TimeSpec) {
     (TimeSpec::new(st.st_atime, st.st_atime_nsec), TimeSpec::new(st.st_mtime, st.st_mtime_nsec))
 }
 
 /// The names in `dir` other than `.` and `..`, sorted.
-fn entries(dir: BorrowedFd<'_>) -> rustlet_sys::Result<Vec<OsString>> {
+pub(crate) fn entries(dir: BorrowedFd<'_>) -> rustlet_sys::Result<Vec<OsString>> {
     let mut listing = listing(dir)?;
     let mut names = Vec::new();
     for entry in listing.iter() {
