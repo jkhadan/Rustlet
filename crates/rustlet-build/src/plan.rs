@@ -193,9 +193,9 @@ fn stage_named(file: &Containerfile, name: &str, before: usize) -> Option<usize>
 }
 
 /// `--target`: a stage's name (case-insensitively) or index; the last
-/// stage without one.
+/// stage without one (or with an empty one).
 fn target_stage(file: &Containerfile, target: Option<&str>) -> Result<usize, String> {
-    let Some(target) = target else { return Ok(file.stages.len().saturating_sub(1)) };
+    let Some(target) = target.filter(|t| !t.is_empty()) else { return Ok(file.stages.len().saturating_sub(1)) };
     if let Some(index) = stage_named(file, target, file.stages.len()) {
         return Ok(index);
     }

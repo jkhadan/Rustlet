@@ -59,11 +59,12 @@ fn a_target_is_a_stage_name_in_any_case_or_an_index() {
     assert_eq!(planned(MULTI, Some("lint"), &[]).total_steps, 4);
     assert_eq!(planned(MULTI, Some("1"), &[]).target, 1);
     assert_eq!(planned(MULTI, Some("3"), &[]).stages, [0, 3]);
+    assert_eq!(planned(MULTI, Some(""), &[]).target, 3, "an empty target is none");
 }
 
 #[test]
 fn an_unknown_target_lists_the_stages() {
-    for target in ["nope", "4", "", "-1", "+1"] {
+    for target in ["nope", "4", "-1", "+1"] {
         let e = plan_error(MULTI, Some(target), &[]);
         assert!(e.contains(&format!("target stage {target:?} could not be found")), "{e}");
         assert!(e.contains("build, test, lint, 3"), "unnamed stages by their index: {e}");
