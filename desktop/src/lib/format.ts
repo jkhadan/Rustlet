@@ -36,6 +36,30 @@ export function duration(seconds: number): string {
   return `${Math.round(d / 365)} years`;
 }
 
+/** Nanoseconds as Go writes a duration (`30s`, `1m30s`, `1h0m0s`,
+ * `500ms`): the syntax `HEALTHCHECK --interval=` and compose files take,
+ * in which healthchecks' settings arrive. */
+export function goDuration(ns: number | null | undefined): string {
+  if (ns == null || !Number.isFinite(ns)) return "–";
+  let n = Math.abs(Math.round(ns));
+  // Up to nine decimals, as Go prints them, without trailing zeros.
+  const num = (v: number) => String(Number(v.toFixed(9)));
+  let out: string;
+  if (n === 0) out = "0s";
+  else if (n < 1e3) out = `${n}ns`;
+  else if (n < 1e6) out = `${num(n / 1e3)}µs`;
+  else if (n < 1e9) out = `${num(n / 1e6)}ms`;
+  else {
+    const h = Math.floor(n / 3.6e12);
+    n -= h * 3.6e12;
+    const m = Math.floor(n / 6e10);
+    n -= m * 6e10;
+    const s = `${num(n / 1e9)}s`;
+    out = h ? `${h}h${m}m${s}` : m ? `${m}m${s}` : s;
+  }
+  return ns < 0 ? `-${out}` : out;
+}
+
 /** An RFC 3339 time → "5 minutes ago". */
 export function ago(time: string | null | undefined, now = Date.now()): string {
   const t = parseTime(time);

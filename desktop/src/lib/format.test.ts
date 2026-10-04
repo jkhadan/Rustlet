@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { ContainerState } from "@/bindings";
 
-import { bytes, commandText, duration, imageName, portsText, splitCommand, statusText } from "./format";
+import { bytes, commandText, duration, goDuration, imageName, portsText, splitCommand, statusText } from "./format";
 
 describe("format", () => {
   it("bytes in binary units", () => {
@@ -62,5 +62,21 @@ describe("format", () => {
     expect(commandText(["sh", "-c", "echo hi"])).toBe("sh -c 'echo hi'");
     expect(imageName("docker.io/library/alpine:latest")).toBe("alpine:latest");
     expect(imageName("ghcr.io/o/n:1")).toBe("ghcr.io/o/n:1");
+  });
+});
+
+describe("Go durations", () => {
+  it("read as HEALTHCHECK and compose files write them", () => {
+    expect(goDuration(0)).toBe("0s");
+    expect(goDuration(30e9)).toBe("30s");
+    expect(goDuration(90e9)).toBe("1m30s");
+    expect(goDuration(3600e9)).toBe("1h0m0s");
+    expect(goDuration(1.5e9)).toBe("1.5s");
+    expect(goDuration(61.25e9)).toBe("1m1.25s");
+    expect(goDuration(500e6)).toBe("500ms");
+    expect(goDuration(1500)).toBe("1.5µs");
+    expect(goDuration(7)).toBe("7ns");
+    expect(goDuration(-2e9)).toBe("-2s");
+    expect(goDuration(null)).toBe("–");
   });
 });

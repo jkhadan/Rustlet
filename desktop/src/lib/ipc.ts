@@ -13,6 +13,10 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 
 import type {
+  BuildEvent,
+  BuildOptions,
+  CommitRequest,
+  CommitResponse,
   ContainerConfig,
   ContainerInspect,
   ContainerSummary,
@@ -24,6 +28,7 @@ import type {
   ImageSummary,
   Info,
   Isolation,
+  LoadEvent,
   LogEntry,
   LogsQuery,
   MountSpec,
@@ -107,6 +112,58 @@ export interface RunOptions {
  * its data arrives as `ArrayBuffer`s. */
 export type TerminalMessage = { type: "exit"; code: number } | { type: "error"; error: CommandError };
 
+/** A compose project the daemon has containers of (`Stack`,
+ * src-tauri/src/compose.rs): what its containers' labels say. */
+export interface Stack {
+  name: string;
+  /** Where it was brought up from, if its containers say. */
+  working_dir: string | null;
+  /** The compose files it was brought up from, absolute; empty when its
+   * containers don't say. */
+  config_files: string[];
+  /** By service, then number. */
+  containers: StackContainer[];
+}
+
+export interface StackContainer {
+  service: string;
+  /** From 1, within its service. */
+  number: number;
+  container: ContainerSummary;
+}
+
+export type ResourceKind = "network" | "volume" | "container" | "image";
+
+export type ResourceAction =
+  | "creating"
+  | "created"
+  | "running"
+  | "recreating"
+  | "recreated"
+  | "starting"
+  | "started"
+  | "healthy"
+  | "exited"
+  | "stopping"
+  | "stopped"
+  | "removing"
+  | "removed"
+  | "building"
+  | "built"
+  | "pulling"
+  | "pulled";
+
+/** What a dependency must reach before its dependent starts. */
+export type DependencyCondition = "started" | "healthy" | "completed_successfully";
+
+/** What `compose_up` reports as it goes (`ComposeProgress`). */
+export type ComposeProgress =
+  | { type: "resource"; kind: ResourceKind; name: string; action: ResourceAction }
+  | { type: "build"; service: string; event: BuildEvent }
+  | { type: "pull"; service: string; image: string; event: PullEvent }
+  | { type: "waiting"; service: string; on: string; condition: DependencyCondition }
+  | { type: "warning"; message: string };
+
 /** A running stream; `cancel` stops it (idempotent). */
 export interface StreamHandle {
   id: number;
@@ -169,6 +226,10 @@ export const api = {
       openStream<LogEntry>("container_logs", { id, query }, onMessage),
     stats: (id: string, onMessage: (m: StreamMessage<StatsSample>) => void) =>
       openStream<StatsSample>("container_stats", { id }, onMessage),
+    /** The API's defaults for what is left out: a running container is
+     * paused while its changes are read. */
+    commit: (request: Partial<CommitRequest> & { container: string }) =>
+      call<CommitResponse>("container_commit", { request }),
   },
   images: {
     list: () => call<ImageSummary[]>("image_list"),
@@ -176,6 +237,38 @@ export const api = {
     remove: (name: string, force = false) => call<ImageDeleteResponse>("image_remove", { name, force }),
     pull: (reference: string, policy: PullPolicy, onMessage: (m: StreamMessage<PullEvent>) => void) =>
       openStream<PullEvent>("image_pull", { reference, policy }, onMessage),
+    tag: (source: string, target: string) => call<void>("image_tag", { source, target }),
+    /** Into a new file at `path` (absolute or from `~/`); resolves with
+     * the archive's size. */
+    save: (names: string[], path: string) => call<number>("image_save", { names, path }),
+    /** The file is read as it is sent: cancelling stops the load. */
+    load: (path: string, onMessage: (m: StreamMessage<LoadEvent>) => void) =>
+      openStream<LoadEvent>("image_load", { path }, onMessage),
+    /** `containerfile`: relative to the context, absolute, or from `~/`;
+     * null for the context's Containerfile, else its Dockerfile. The app
+     * sets `options.dockerfile`. Cancelling stops the build. */
+    build: (
+      context: string,
+      containerfile: string | null,
+      options: Partial<BuildOptions>,
+      onMessage: (m: StreamMessage<BuildEvent>) => void,
+    ) => openStream<BuildEvent>("image_build", { context, containerfile, options }, onMessage),
+    pruneBuildCache: () => call<PruneResponse>("build_prune"),
+  },
+  compose: {
+    stacks: () => call<Stack[]>("stack_list"),
+    /** `compose up -d`. A file that doesn't load rejects; then the up runs
+     * to its end in the app, whether or not its progress is followed. */
+    up: (
+      args: { files: string[]; project_name?: string | null; project_dir?: string | null },
+      onMessage: (m: StreamMessage<ComposeProgress>) => void,
+    ) =>
+      openStream<ComposeProgress>(
+        "compose_up",
+        { files: args.files, project_name: args.project_name ?? null, project_dir: args.project_dir ?? null },
+        onMessage,
+      ),
+    down: (project: string, volumes: boolean) => call<void>("compose_down", { project, volumes }),
   },
   networks: {
     list: () => call<Network[]>("network_list"),

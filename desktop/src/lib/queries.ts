@@ -25,3 +25,5 @@ export const useNetworks = () => useQuery({ queryKey: keys.networks(), queryFn: 
 export const useVolumes = () => useQuery({ queryKey: keys.volumes(), queryFn: api.volumes.list });
 
 export const useInfo = () => useQuery({ queryKey: keys.info(), queryFn: api.daemon.info });
+
+export const useStacks = () => useQuery({ queryKey: keys.stacks(), queryFn: api.compose.stacks });

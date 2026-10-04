@@ -28,6 +28,8 @@ export const keys = {
   volumes: () => ["volumes"] as const,
   volume: (name: string) => ["volume", name] as const,
   info: () => ["info"] as const,
+  /** Compose projects, as their containers' labels say. */
+  stacks: () => ["stacks"] as const,
 };
 
 // Prefixes, for invalidation.
@@ -41,6 +43,7 @@ const NETWORK = ["network"];
 const VOLUMES = ["volumes"];
 const VOLUME = ["volume"];
 const INFO = ["info"];
+const STACKS = ["stacks"];
 
 /** Container actions that start or end a run: its addresses, ports and
  * namespaces come and go with it. */
@@ -54,7 +57,11 @@ export function invalidationsFor(event: Event): QueryKey[] {
         // No view lists execs.
         return [];
       }
-      const out: QueryKey[] = [CONTAINERS, CONTAINER, INFO];
+      // Every other action, `health_status` among them (a healthcheck's
+      // verdict changed: the lists, the page and the stacks show it),
+      // changes the container. A stack is its containers, so any of
+      // theirs changes it.
+      const out: QueryKey[] = [CONTAINERS, CONTAINER, INFO, STACKS];
       if (RUN_CHANGES.has(event.action)) {
         // Endpoints (addresses) of networks, and the namespaces the
         // isolation inspector reads.
@@ -64,9 +71,16 @@ export function invalidationsFor(event: Event): QueryKey[] {
         // What uses an image, a volume, a network.
         out.push(IMAGES, IMAGE, VOLUMES, VOLUME, NETWORKS, NETWORK, ISOLATION);
       }
+      if (event.action === "commit") {
+        // A new image: a named one gets an image `tag` event too, an
+        // unnamed one (listed as <none>) only this.
+        out.push(IMAGES, IMAGE);
+      }
       return out;
     }
     case "image":
+      // `pull`, `tag` (a build, tag, commit or load named it), `untag`,
+      // `load` (an unnamed image loaded), `delete`.
       return [IMAGES, IMAGE, INFO];
     case "network":
       if (event.action === "connect" || event.action === "disconnect") {
@@ -128,14 +142,28 @@ export function describeEvent(e: Event, nameOf: (id: string) => string | undefin
           return `${name}: exec ${e.action === "exec_start" ? "started" : "created"}`;
         case "exec_die":
           return `${name}: exec exited (${e.attributes.exit_code ?? "?"})`;
+        case "health_status":
+          return `${name} is ${e.attributes.health_status ?? "checked"}`;
+        case "commit":
+          return e.attributes.new_image
+            ? `${name} committed as image ${shortId(e.attributes.new_image)}`
+            : `${name} committed`;
         default:
           return `${name} ${pastTense(e.action)}`;
       }
     case "image": {
       // By name, as the image list shows it (`alpine:latest`); a `delete`
-      // names the image as `rmi` was given it, which may be its digest.
+      // names the image as `rmi` was given it, which may be its digest,
+      // and a `load` of an unnamed image names it by its digest.
       const image = /^(sha256:)?[0-9a-f]{64}$/.test(e.id) ? shortId(e.id) : imageName(e.id);
-      return `image ${image} ${e.action === "pull" ? "pulled" : e.action === "untag" ? "untagged" : "deleted"}`;
+      const done: Record<string, string> = {
+        pull: "pulled",
+        tag: "tagged",
+        untag: "untagged",
+        load: "loaded",
+        delete: "deleted",
+      };
+      return `image ${image} ${done[e.action] ?? e.action}`;
     }
     case "network": {
       const net = e.attributes.name ?? e.id.slice(0, 12);

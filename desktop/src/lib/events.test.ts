@@ -72,6 +72,50 @@ describe("event → stale queries", () => {
     }
   });
 
+  it("a healthcheck's new verdict refreshes the container, its lists and the stacks, and nothing of the network", () => {
+    const client = clientWith(
+      keys.containers(true),
+      keys.container("web"),
+      keys.stacks(),
+      keys.images(),
+      keys.networks(),
+      keys.isolation("web"),
+    );
+    applyEvents(client, [event("container", "health_status", "abc123", { name: "web", health_status: "unhealthy" })]);
+    expect(stale(client)).toEqual(
+      [keys.container("web"), keys.containers(true), keys.stacks()].map((k) => JSON.stringify(k)).sort(),
+    );
+  });
+
+  it("a stack is its containers: every container event but an exec's changes it", () => {
+    for (const action of ["create", "start", "die", "stop", "destroy", "health_status", "commit"]) {
+      expect(invalidationsFor(event("container", action))).toContainEqual(keys.stacks());
+    }
+    expect(invalidationsFor(event("container", "exec_die"))).not.toContainEqual(keys.stacks());
+    for (const kind of ["image", "network", "volume"] as const) {
+      expect(invalidationsFor(event(kind, "create"))).not.toContainEqual(keys.stacks());
+    }
+  });
+
+  it("a commit makes an image, named or not", () => {
+    const digest = `sha256:${"ab".repeat(32)}`;
+    const client = clientWith(keys.images(), keys.image(digest), keys.volumes(), keys.networks());
+    // An unnamed commit's only event: no image event names it.
+    applyEvents(client, [event("container", "commit", "abc123", { name: "web", new_image: digest })]);
+    expect(stale(client)).toEqual([keys.image(digest), keys.images()].map((k) => JSON.stringify(k)).sort());
+  });
+
+  it("a tag (of a build, tag, commit or load) and an unnamed load refresh the images", () => {
+    for (const [action, id] of [
+      ["tag", "docker.io/library/hits:latest"],
+      ["load", `sha256:${"cd".repeat(32)}`],
+    ]) {
+      const client = clientWith(keys.images(), keys.image("hits"), keys.containers(true), keys.stacks());
+      applyEvents(client, [event("image", action, id, { id: `sha256:${"cd".repeat(32)}` })]);
+      expect(stale(client)).toEqual([keys.image("hits"), keys.images()].map((k) => JSON.stringify(k)).sort());
+    }
+  });
+
   it("images, volumes and networks refresh their own views", () => {
     const client = clientWith(keys.images(), keys.volumes(), keys.networks(), keys.containers(true));
     applyEvents(client, [event("image", "pull", "docker.io/library/alpine:latest")]);
@@ -133,6 +177,21 @@ describe("activity feed lines", () => {
     // One `delete` per image, named as `rmi` was given it: a name or an id.
     expect(describeEvent(event("image", "delete", "alpine", { id: digest }))).toBe("image alpine deleted");
     expect(describeEvent(event("image", "delete", digest, { id: digest }))).toBe("image 4f4f4f4f4f4f deleted");
+  });
+
+  it("say a healthcheck's verdict and a commit", () => {
+    const e = (action: string, attributes: Record<string, string>) => event("container", action, "abc", { name: "web", ...attributes });
+    expect(describeEvent(e("health_status", { health_status: "unhealthy" }))).toBe("web is unhealthy");
+    expect(describeEvent(e("health_status", { health_status: "healthy" }))).toBe("web is healthy");
+    expect(describeEvent(e("commit", { new_image: `sha256:${"ab".repeat(32)}` }))).toBe("web committed as image abababababab");
+  });
+
+  it("say what named an image, and an unnamed load by its id", () => {
+    const digest = `sha256:${"4f".repeat(32)}`;
+    expect(describeEvent(event("image", "tag", "docker.io/library/hits:latest", { id: digest }))).toBe("image hits:latest tagged");
+    expect(describeEvent(event("image", "load", digest, { id: digest }))).toBe("image 4f4f4f4f4f4f loaded");
+    // An action this app doesn't know yet says itself, rather than "deleted".
+    expect(describeEvent(event("image", "prune", "x"))).toBe("image x prune");
   });
 
   it("say a restart that couldn't start, not an exit", () => {
