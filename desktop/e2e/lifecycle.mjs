@@ -1,6 +1,8 @@
 // Phase 6's milestone, as a script: a container's whole life driven from
 // the GUI, with the `rustlet` CLI acting on the same daemon at the same
-// time, each side seeing what the other did without a reload.
+// time, each side seeing what the other did without a reload; and Phase
+// 7's: a compose stack the CLI brings up, on the Stacks page with its
+// health, taken down from there; an image built from the Build view.
 //
 //   node e2e/lifecycle.mjs <app binary> <rustlet CLI> [screenshot dir]
 //
@@ -12,6 +14,9 @@
 // the start of the next.
 
 import { execFileSync } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { WebDriver } from "./webdriver.mjs";
 
@@ -61,9 +66,55 @@ const rowStatus = (name) =>
     name,
   );
 
+// Phase 7: a compose project and a build context, in a directory of
+// their own. (A container's first process ignores a signal it has no
+// handler for, as sleep has none for SIGTERM: stopped with it, each would
+// wait out its 10 s, one after the other.)
+const work = mkdtempSync(join(tmpdir(), "rustlet-e2e-"));
+const stackFile = join(work, "compose.yaml");
+writeFileSync(
+  stackFile,
+  `services:
+  db:
+    image: alpine
+    command: ["sh", "-c", "touch /tmp/ready; exec sleep 1000"]
+    stop_signal: SIGKILL
+    healthcheck:
+      test: ["CMD", "test", "-e", "/tmp/ready"]
+      interval: 500ms
+      retries: 3
+  web:
+    image: alpine
+    command: ["sleep", "1000"]
+    stop_signal: SIGKILL
+    depends_on:
+      db:
+        condition: service_healthy
+`,
+);
+writeFileSync(join(work, "Containerfile"), "FROM alpine\nRUN echo built > /built\n");
+const compose = (...args) => rustlet("compose", "-f", stackFile, "-p", "e2e-stack", ...args);
+
+/** The Stacks page's card for `name`: its state, or null if it has none. */
+const stackState = (name) =>
+  d.exec(
+    `const s = document.querySelector('[data-testid="stack"][data-name="' + arguments[0] + '"]');
+     return s ? s.dataset.state : null;`,
+    name,
+  );
+/** The health the Stacks page shows for the container `name`. */
+const stackHealth = (name) =>
+  d.exec(
+    `const r = document.querySelector('[data-testid="stack-container"][data-name="' + arguments[0] + '"]');
+     return r ? (r.dataset.health ?? "none") : null;`,
+    name,
+  );
+
 for (const n of ["e2e-cli", "e2e-gui", "e2e-quit"]) rustlet("rm", "-f", n);
 rustlet("network", "rm", "e2e-net");
 rustlet("volume", "rm", "e2e-vol");
+compose("down");
+rustlet("rmi", "e2e-built");
 
 console.log("lifecycle:");
 await d.start(app);
@@ -187,6 +238,37 @@ try {
     await d.find('[data-testid="volume-row"][data-name="e2e-vol"]', 5_000);
   });
 
+  await check("a stack the CLI brings up shows on the Stacks page, with its health", async () => {
+    await d.go("/stacks");
+    await d.find('[data-testid="open-compose-up"]');
+    if (compose("up", "-d") == null) throw new Error("rustlet compose up failed");
+    // `up -d` returned once web, started after db was healthy, ran: the
+    // page follows from the events.
+    await d.waitFor(async () => (await stackState("e2e-stack")) === "running", 10_000, "the e2e-stack card, all running");
+    await d.waitFor(async () => (await stackHealth("e2e-stack-db-1")) === "healthy", 5_000, "db healthy on the page");
+    // web has no healthcheck.
+    await d.waitFor(async () => (await stackHealth("e2e-stack-web-1")) === "none", 5_000, "web on the page");
+  });
+
+  await check("Down on the Stacks page takes the stack down, as the CLI sees", async () => {
+    await d.click(await d.find('[data-testid="stack"][data-name="e2e-stack"] [data-testid="stack-down"]'));
+    await d.click(await d.findXPath(`//*[@role="dialog"]//button[normalize-space(.)="Down"]`));
+    await d.waitFor(async () => (await stackState("e2e-stack")) === null, 20_000, "the card gone");
+    if ((rustlet("ps", "-a") ?? "e2e-stack-").includes("e2e-stack-")) throw new Error("its containers are left");
+    if ((rustlet("network", "ls") ?? "e2e-stack_default").includes("e2e-stack_default")) {
+      throw new Error("its network is left");
+    }
+  });
+
+  await check("the Build view builds an image the CLI then lists", async () => {
+    await d.go("/build");
+    await d.type(await d.find('[name="context"]'), work);
+    await d.type(await d.find('[name="tags"]'), "e2e-built");
+    await d.click(await d.find('[data-testid="build-submit"]'));
+    await d.find('[data-testid="build-result"]', 60_000);
+    if (!(rustlet("images") ?? "").includes("e2e-built")) throw new Error("rustlet images has no e2e-built");
+  });
+
   if (process.env.E2E_RESTART) {
     await check("after a daemon restart the app reconnects and follows the CLI again", async () => {
       await d.go("/containers");
@@ -236,4 +318,6 @@ try {
   for (const n of ["e2e-cli", "e2e-gui", "e2e-quit"]) rustlet("rm", "-f", n);
   rustlet("network", "rm", "e2e-net");
   rustlet("volume", "rm", "e2e-vol");
+  compose("down");
+  rustlet("rmi", "e2e-built");
 }
