@@ -54,7 +54,7 @@ pub struct ComposeArgs {
     /// Compose file; given again, one that overrides and extends those before [default: compose.yaml, compose.yml, docker-compose.yaml or docker-compose.yml]
     #[arg(short, long = "file", value_name = "FILE")]
     pub files: Vec<PathBuf>,
-    /// The project's name [default: the file's name:, else $COMPOSE_PROJECT_NAME, else its directory's]
+    /// The project's name [default: $COMPOSE_PROJECT_NAME, else the file's name:, else its directory's]
     #[arg(short, long, value_name = "NAME")]
     pub project_name: Option<String>,
     /// Where the file's relative paths start [default: the first file's directory]
@@ -214,6 +214,11 @@ pub async fn compose(ctx: &mut Ctx, args: ComposeArgs) -> anyhow::Result<i32> {
         }
         command => {
             let project = rustlet_compose::load(&options).map_err(compose_error)?;
+            // What the file asked for that isn't done (an unset variable,
+            // `expose`), as Compose's WARN lines.
+            for warning in &project.warnings {
+                writeln!(ctx.console.stderr, "WARN: {warning}")?;
+            }
             let compose = Compose::new(ctx.client.clone(), project);
             run(ctx, &compose, command).await
         }
