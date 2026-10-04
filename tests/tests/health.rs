@@ -65,8 +65,14 @@ fn hc_healthy_then_unhealthy_with_events() {
     block_on(async {
         let c = d.client();
         let mut events = c.events(&EventsQuery::default()).await.unwrap();
+        // A start period, so that a slow start (a loaded host) can't make
+        // it unhealthy before it is healthy: then the order is certain.
         let cfg = ContainerConfig {
-            healthcheck: Some(check("echo checked; test -e /tmp/ok", 100, 3)),
+            healthcheck: Some(HealthConfig {
+                start_period: Some(30_000 * MS),
+                start_interval: Some(100 * MS),
+                ..check("echo checked; test -e /tmp/ok", 100, 3)
+            }),
             ..sh("sleep 0.5; touch /tmp/ok; sleep 600")
         };
         let id = run(&c, &cfg).await;
