@@ -183,7 +183,9 @@ function StackCard({ stack, onUp }: { stack: Stack; onUp: (files: string[]) => v
                       <Link to={`/containers/${c.id}`} className="hover:underline">
                         {c.name}
                       </Link>
-                      {g.containers.length > 1 && <span className="text-muted-foreground ml-1.5 text-xs">#{sc.number}</span>}
+                      <span className="text-muted-foreground ml-1.5 text-xs" title="Its number within the service">
+                        #{sc.number}
+                      </span>
                     </Td>
                     <Td>
                       <span className="flex items-center gap-2">
