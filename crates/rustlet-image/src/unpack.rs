@@ -48,7 +48,11 @@
 //! the mode must come after), then extended attributes (a chown also clears
 //! `security.capability`, the file capabilities of `ping` and friends), then
 //! times. Directory times are set last of all, since creating entries in a
-//! directory changes its mtime. Attributes come from PAX `SCHILY.xattr.*`
+//! directory changes its mtime. Names, link targets, ids, times and
+//! attributes the header can't hold come from the extension headers before
+//! an entry (PAX records, GNU long names), which this module reads itself
+//! (`extensions`: the tar crate loses PAX records whose values hold a
+//! newline). Attributes come from PAX `SCHILY.xattr.*`
 //! records, except overlay's own (`trusted.overlay.*`, `user.overlay.*`):
 //! from an image they could forge an opaque directory or a redirect.
 //!
@@ -80,6 +84,7 @@ use rustlet_sys::fs::{ResolveFlags, Statx, fstatx, openat2, statx};
 use rustlet_sys::{tree, xattr};
 use tar::EntryType;
 
+use self::extensions::Extensions;
 use crate::digest::{Digest, HashingReader};
 use crate::error::{Context, Error, Result};
 use crate::media::Compression;
@@ -168,9 +173,18 @@ pub fn unpack_with(
         let mut unpacker = Unpacker::new(dest)?;
         unpacker.whiteouts = options.whiteouts;
         {
+            // Raw: the extension headers come as entries, read here.
             let mut archive = tar::Archive::new(&mut tar_stream);
-            for entry in archive.entries().context("read the layer archive")? {
-                unpacker.entry(entry.context("read the layer archive")?)?;
+            let mut extensions = Extensions::default();
+            for entry in archive.entries().context("read the layer archive")?.raw(true) {
+                let mut entry = entry.context("read the layer archive")?;
+                if extensions.absorb(&mut entry).context("read the layer archive")? {
+                    continue;
+                }
+                unpacker.entry(entry, std::mem::take(&mut extensions))?;
+            }
+            if !extensions.is_empty() {
+                return Err(Error::invalid("the layer archive ends with headers for an entry that never comes"));
             }
         }
         io::copy(&mut tar_stream, &mut io::sink()).context("read to the end of the layer archive")?;
@@ -220,8 +234,7 @@ struct Meta {
 impl Meta {
     /// From the header, overridden by PAX records (which carry ids too large
     /// for the header's octal fields, sub-second times, and attributes).
-    fn read<R: Read>(entry: &mut tar::Entry<'_, R>, shown: &str) -> Result<Meta> {
-        let header = entry.header();
+    fn read(header: &tar::Header, extensions: &Extensions, shown: &str) -> Result<Meta> {
         let bad = |field: &str, e: io::Error| Error::invalid(format!("layer entry {shown:?}: {field}: {e}"));
         // An empty numeric field (all NULs or spaces) reads as 0, as Go's
         // archive/tar (Docker's, containerd's) reads it; the tar crate
@@ -239,24 +252,23 @@ impl Meta {
         let mut mtime = TimeSpec::new(i64::try_from(secs).unwrap_or(i64::MAX), 0);
         let mut atime = None;
         let mut xattrs = Vec::new();
-        if let Some(extensions) = entry.pax_extensions().map_err(|e| bad("PAX header", e))? {
-            for ext in extensions {
-                let ext = ext.map_err(|e| bad("PAX record", e))?;
-                let Ok(key) = ext.key() else { continue };
-                let value = || std::str::from_utf8(ext.value_bytes()).unwrap_or("");
-                match key {
-                    "uid" => {
-                        uid = value().parse().map_err(|_| Error::invalid(format!("layer entry {shown:?}: PAX uid")))?
-                    }
-                    "gid" => {
-                        gid = value().parse().map_err(|_| Error::invalid(format!("layer entry {shown:?}: PAX gid")))?
-                    }
-                    "mtime" => mtime = pax_time(value()).unwrap_or(mtime),
-                    "atime" => atime = pax_time(value()),
-                    k => {
-                        if let Some(name) = k.strip_prefix("SCHILY.xattr.") {
-                            xattrs.push((name.to_owned(), ext.value_bytes().to_vec()));
-                        }
+        for (key, raw) in extensions.records() {
+            let Ok(key) = std::str::from_utf8(key) else { continue };
+            let value = || std::str::from_utf8(raw).unwrap_or("");
+            match key {
+                "uid" => {
+                    uid = value().parse().map_err(|_| Error::invalid(format!("layer entry {shown:?}: PAX uid")))?
+                }
+                "gid" => {
+                    gid = value().parse().map_err(|_| Error::invalid(format!("layer entry {shown:?}: PAX gid")))?
+                }
+                "mtime" => mtime = pax_time(value()).unwrap_or(mtime),
+                "atime" => atime = pax_time(value()),
+                k => {
+                    if let Some(name) = k.strip_prefix("SCHILY.xattr.") {
+                        // A later record for the same attribute wins.
+                        xattrs.retain(|(n, _): &(String, Vec<u8>)| n != name);
+                        xattrs.push((name.to_owned(), raw.clone()));
                     }
                 }
             }
@@ -325,11 +337,31 @@ impl<'a> Unpacker<'a> {
         if self.privileged { OPAQUE_XATTR } else { USER_OPAQUE_XATTR }
     }
 
-    fn entry<R: Read>(&mut self, mut entry: tar::Entry<'_, R>) -> Result<()> {
+    fn entry<R: Read>(&mut self, mut entry: tar::Entry<'_, R>, extensions: Extensions) -> Result<()> {
         self.report.entries += 1;
-        let raw = entry.path_bytes().into_owned();
+        let raw = match extensions.path() {
+            Some(p) => p.to_vec(),
+            None => entry.path_bytes().into_owned(),
+        };
+        let link: Option<Vec<u8>> = match extensions.linkpath() {
+            Some(l) => Some(l.to_vec()),
+            None => entry.link_name_bytes().map(|l| l.into_owned()),
+        };
         let shown = String::from_utf8_lossy(&raw).into_owned();
         let mut kind = entry.header().entry_type();
+        // What only the tar crate's own reading of extension headers did:
+        // refused rather than written wrong (see `extensions`).
+        if kind == EntryType::GNUSparse || extensions.records().iter().any(|(k, _)| k.starts_with(b"GNU.sparse.")) {
+            return Err(Error::unsupported(format!("layer entry {shown:?}: sparse files are not supported")));
+        }
+        if let Some(size) = extensions.get("size") {
+            let header = entry.header().entry_size().ok();
+            if std::str::from_utf8(size).ok().and_then(|s| s.parse::<u64>().ok()) != header {
+                return Err(Error::unsupported(format!(
+                    "layer entry {shown:?}: a file over 8 GiB (its size only in a PAX record) is not supported"
+                )));
+            }
+        }
         // An old-style (V7) archive's directory: typeflag NUL, which the tar
         // crate reads as a regular file, and a name ending in `/`. Go's
         // archive/tar (Docker's) reads it as a directory, as GNU tar does.
@@ -341,7 +373,7 @@ impl<'a> Unpacker<'a> {
             return Ok(());
         }
         let path = clean(&raw).map_err(|why| Error::invalid(format!("layer entry {shown:?}: {why}")))?;
-        let meta = Meta::read(&mut entry, &shown)?;
+        let meta = Meta::read(entry.header(), &extensions, &shown)?;
         let Some(path) = path else {
             // `./`: the layer's own root directory.
             if kind != EntryType::Directory {
@@ -357,7 +389,7 @@ impl<'a> Unpacker<'a> {
         let name_bytes = name.as_bytes();
 
         if !self.whiteouts {
-            return self.plain(kind, &parent, &name, &meta, &mut entry, &shown);
+            return self.plain(kind, &path, &meta, &mut entry, link.as_deref(), &shown);
         }
         if name_bytes == OPAQUE_MARKER {
             self.dir(&parent, &shown)?;
@@ -376,35 +408,34 @@ impl<'a> Unpacker<'a> {
             let dir = self.dir(&parent, &shown)?;
             return self.whiteout(dir.as_fd(), target, &shown);
         }
-        self.plain(kind, &parent, &name, &meta, &mut entry, &shown)
+        self.plain(kind, &path, &meta, &mut entry, link.as_deref(), &shown)
     }
 
     /// An entry that is what it says: a directory, file, link or FIFO.
     fn plain<R: Read>(
         &mut self,
         kind: EntryType,
-        parent: &Path,
-        name: &OsStr,
+        path: &Path,
         meta: &Meta,
         entry: &mut tar::Entry<'_, R>,
+        link: Option<&[u8]>,
         shown: &str,
     ) -> Result<()> {
+        let parent = path.parent().unwrap_or(Path::new(""));
+        let name = path.file_name().expect("a cleaned path ends in a name");
         match kind {
             EntryType::Directory => self.directory(parent, name, meta, shown),
             EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse => {
                 self.file(parent, name, meta, entry, shown)
             }
             EntryType::Symlink => {
-                let target = entry.link_name_bytes().map(|t| t.into_owned()).unwrap_or_default();
+                let target = link.unwrap_or_default();
                 if target.is_empty() || target.contains(&0) {
                     return Err(Error::invalid(format!("layer entry {shown:?}: a symlink needs a target")));
                 }
-                self.symlink(parent, name, OsStr::from_bytes(&target), meta, shown)
+                self.symlink(parent, name, OsStr::from_bytes(target), meta, shown)
             }
-            EntryType::Link => {
-                let target = entry.link_name_bytes().map(|t| t.into_owned()).unwrap_or_default();
-                self.hardlink(parent, name, &target, shown)
-            }
+            EntryType::Link => self.hardlink(parent, name, link.unwrap_or_default(), shown),
             EntryType::Fifo => self.fifo(parent, name, meta, shown),
             EntryType::Char | EntryType::Block => {
                 self.report.skipped_devices.push(shown.to_owned());
@@ -745,6 +776,8 @@ impl<'a> Unpacker<'a> {
         Ok(())
     }
 }
+
+mod extensions;
 
 #[cfg(test)]
 mod tests;

@@ -506,3 +506,73 @@ fn old_style_directories_are_directories() {
     assert!(u.path("d").is_dir());
     assert_eq!(u.read("d/f"), "x");
 }
+
+#[test]
+fn pax_values_may_hold_newlines_and_records_after_them_still_apply() {
+    // An attribute whose binary value holds 0x0a (an ACL entry for id 10),
+    // then a record the tar crate's own parsing would lose after it.
+    let acl = [2, 0, 0, 0, 1, 0, 7, 0, 0xff, 0xff, 0xff, 0xff, 8, 0, 5, 0, 10, 0, 0, 0];
+    let tar = Archive::new().pax_file("f", b"x", &[("SCHILY.xattr.user.acl", &acl), ("mtime", b"1234567890.5")]).tar();
+    let u = unpack_tar(&tar);
+    u.report();
+    assert_eq!(xattr::lget(&u.path("f"), "user.acl").unwrap(), acl);
+    let m = std::fs::symlink_metadata(u.path("f")).unwrap();
+    assert_eq!((m.mtime(), m.mtime_nsec()), (1_234_567_890, 500_000_000));
+}
+
+#[test]
+fn long_names_and_link_targets_come_from_extension_headers() {
+    let long = format!("{}/file", "d".repeat(150));
+    let target = format!("{}/target", "t".repeat(120));
+    let mut b = tar::Builder::new(Vec::new());
+    let mut h = tar::Header::new_gnu();
+    h.set_size(2);
+    h.set_mode(0o644);
+    b.append_data(&mut h, &long, &b"hi"[..]).unwrap();
+    let mut h = tar::Header::new_gnu();
+    h.set_entry_type(EntryType::Symlink);
+    h.set_size(0);
+    b.append_link(&mut h, "link", &target).unwrap();
+    // And a PAX path, as Go writes for long names.
+    let mut p = Archive { out: b };
+    p = p.pax_file("short", b"pax", &[("path", format!("{}/pax", "p".repeat(110)).as_bytes())]);
+    let u = unpack_tar(&p.tar());
+    u.report();
+    assert_eq!(u.read(&long), "hi");
+    assert_eq!(std::fs::read_link(u.path("link")).unwrap(), Path::new(&target));
+    assert_eq!(u.read(&format!("{}/pax", "p".repeat(110))), "pax");
+    assert!(!u.path("short").exists());
+}
+
+#[test]
+fn oversized_or_dangling_extension_headers_are_refused() {
+    let huge = vec![b'v'; (extensions::MAX_HEADER + 1) as usize];
+    let tar = Archive::new().pax_file("f", b"x", &[("SCHILY.xattr.user.big", &huge)]).tar();
+    assert!(unpack_tar(&tar).error().contains("extension header"), "{}", unpack_tar(&tar).error());
+    // Headers for an entry that never comes.
+    let mut a = Archive::new();
+    a.out.append_pax_extensions([("path", &b"never"[..])]).unwrap();
+    assert!(unpack_tar(&a.tar()).error().contains("never comes"));
+    // A malformed record.
+    let mut h = tar::Header::new_ustar();
+    h.set_entry_type(EntryType::XHeader);
+    h.set_size(7);
+    h.set_cksum();
+    let mut a = Archive::new();
+    a.out.append(&h, &b"9 a=b\nX"[..]).unwrap();
+    let a = a.file("f", b"x", 0o644);
+    assert!(unpack_tar(&a.tar()).error().contains("PAX record"));
+}
+
+#[test]
+fn sparse_files_and_sizes_only_in_pax_are_refused() {
+    let mut a = Archive::new();
+    let h = Archive::header(b"sparse", EntryType::GNUSparse, 0, 0o644);
+    a.out.append(&h, io::empty()).unwrap();
+    assert!(unpack_tar(&a.tar()).error().contains("sparse"));
+    let tar = Archive::new().pax_file("f", b"x", &[("size", b"9000000000")]).tar();
+    assert!(unpack_tar(&tar).error().contains("8 GiB"));
+    // A size record that agrees with the header is fine.
+    let tar = Archive::new().pax_file("f", b"x", &[("size", b"1")]).tar();
+    assert_eq!(unpack_tar(&tar).read("f"), "x");
+}
