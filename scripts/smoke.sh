@@ -220,12 +220,13 @@ say "12. compose"
 C="$R compose -f examples/hits/compose.yaml -p smoke-hits"
 $C up -d >/tmp/smoke-compose.$$ 2>&1 || fail "compose up: $(tail -3 /tmp/smoke-compose.$$)"
 rm -f /tmp/smoke-compose.$$
+# up -d returns once web has started; its healthcheck says when it serves.
+for _ in $(seq 1 150); do $C ps | grep smoke-hits-web-1 | grep -q '(healthy)' && break; sleep 0.2; done
+check "compose ps shows web healthy" sh -c "$C ps | grep smoke-hits-web-1 | grep -q '(healthy)'"
 first=$(curl -fsS http://127.0.0.1:8000/ 2>&1)
 second=$(curl -fsS http://127.0.0.1:8000/ 2>&1)
 echo "$first" | grep -q 'seen 1 times' && echo "$second" | grep -q 'seen 2 times' \
   && ok "the page counts through redis" || fail "the page said '$first' then '$second'"
-for _ in $(seq 1 100); do $C ps | grep -q 'healthy' && break; sleep 0.2; done
-check "compose ps shows web healthy" sh -c "$C ps | grep smoke-hits-web-1 | grep -q '(healthy)'"
 $C down -v >/dev/null 2>&1 || fail "compose down"
 check "down removed the containers" sh -c "! $R ps -a | grep -q smoke-hits-"
 check "and the network" sh -c "! $R network ls | grep -q smoke-hits_default"
