@@ -36,7 +36,10 @@ pub mod run;
 
 pub use load::{LoadOptions, load, load_str};
 pub use project::{Condition, Dependency, Project, Service};
-pub use run::{Compose, ComposeEvent, DownOptions, ServiceContainer, Stack, UpOptions};
+pub use run::{
+    Action, BuildPolicy, Compose, ComposeEvent, DownOptions, Events, LogLine, RemoveImages, ResourceKind,
+    ServiceContainer, Stack, UpOptions, down_project, stacks,
+};
 
 /// Every container, network and volume of a project: its name.
 pub const LABEL_PROJECT: &str = "io.rustlet.compose.project";
@@ -50,6 +53,11 @@ pub const LABEL_CONFIG_HASH: &str = "io.rustlet.compose.config-hash";
 pub const LABEL_WORKING_DIR: &str = "io.rustlet.compose.project.working-dir";
 /// The project's files, comma-separated, on containers.
 pub const LABEL_CONFIG_FILES: &str = "io.rustlet.compose.project.config-files";
+/// A container's service's dependencies, comma-separated
+/// `service:condition:required` (`db:service_healthy:true`), as Compose
+/// records them: so that `down` without the file still takes dependents
+/// down first.
+pub const LABEL_DEPENDS_ON: &str = "io.rustlet.compose.depends-on";
 /// A network's key in the file (`default`, `backend`).
 pub const LABEL_NETWORK: &str = "io.rustlet.compose.network";
 /// A volume's key in the file.

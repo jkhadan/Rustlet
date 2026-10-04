@@ -633,7 +633,7 @@ impl Context<'_> {
         let build = def.build.as_ref().map(|b| self.build(b, &at, always_build)).transpose()?;
         let image = match (&def.image, &build) {
             (Some(image), _) => image.clone(),
-            (None, Some(_)) => format!("{}-{}", self.project, def.name.to_ascii_lowercase()),
+            (None, Some(_)) => crate::project::default_image(self.project, &def.name),
             (None, None) => return Err(Error::Invalid(format!("{at}: a service needs an image or a build section"))),
         };
         let pull_policy = match def.pull_policy {

@@ -139,6 +139,12 @@ pub struct Volume {
     pub labels: BTreeMap<String, String>,
 }
 
+/// The image a service with `build:` and no `image:` gets:
+/// `<project>-<service>`, lowercased (an image's name has no capitals).
+pub fn default_image(project: &str, service: &str) -> String {
+    format!("{project}-{}", service.to_ascii_lowercase())
+}
+
 impl Project {
     pub fn service(&self, name: &str) -> Option<&Service> {
         self.services.iter().find(|s| s.name == name)
