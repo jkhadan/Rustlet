@@ -279,7 +279,10 @@ impl Compose {
                     which == RemoveImages::All
                         || (s.build.is_some() && s.image == default_image(&self.project.name, &s.name))
                 })
-                .map(|s| s.image.clone());
+                .map(|s| s.image.clone())
+                // Collected: an iterator of closures held across the awaits
+                // would make this future not `Send` (`futures_are_send`).
+                .collect::<Vec<_>>();
             remove_images(&self.client, images, events).await?;
         }
         Ok(())
@@ -937,7 +940,8 @@ pub async fn down_project(client: &Client, project: &str, options: &DownOptions,
         let images = containers
             .iter()
             .filter(|c| which == RemoveImages::All || c.summary.image == default_image(project, &c.service))
-            .map(|c| c.summary.image.clone());
+            .map(|c| c.summary.image.clone())
+            .collect::<Vec<_>>();
         remove_images(client, images, events).await?;
     }
     Ok(())
@@ -1206,5 +1210,23 @@ mod tests {
             .map(condition_name)
             .collect();
         assert_eq!(names, ["service_started", "service_healthy", "service_completed_successfully"]);
+    }
+
+    /// The desktop app runs these on Tauri's multithreaded runtime, from
+    /// commands whose futures must be `Send` for any lifetime of their
+    /// arguments: a compile-time check, so that this crate notices first.
+    #[allow(dead_code)]
+    fn futures_are_send(compose: &Compose, client: &Client) {
+        fn send<T: Send>(_: T) {}
+        let events: Events<'_> = &|_| {};
+        send(compose.up(&UpOptions::default(), events));
+        send(compose.down(&DownOptions::default(), events));
+        send(compose.ps(true));
+        send(compose.build(&[], false, events));
+        send(compose.stop(&[], None, events));
+        send(compose.start(&[], events));
+        send(compose.logs(&[], &LogsQuery::default()));
+        send(stacks(client));
+        send(down_project(client, "p", &DownOptions::default(), events));
     }
 }
