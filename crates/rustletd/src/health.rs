@@ -30,8 +30,9 @@
 //! ([`rustlet_spec::container::ContainerState::health`]), saved with every
 //! check, so `inspect` and `ps` show it and a restarted daemon picks it up
 //! where the last one left it (the monitor of a container that is taken
-//! over starts again from its saved state). A paused container isn't
-//! checked: its processes are frozen, and a check would only time out.
+//! over starts again from its saved state, its start period counted from
+//! the container's start). A paused container isn't checked: its
+//! processes are frozen, and a check would only time out.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -164,7 +165,16 @@ impl Daemon {
     /// The monitor of one run: checks until it is aborted (the run ended).
     async fn check_health(self: Arc<Self>, c: Arc<Container>, plan: HealthPlan, mut health: Health) {
         let socket = self.paths.shim(c.id()).socket();
-        let started = Instant::now();
+        // The start period runs from the container's start, as Docker's:
+        // a new daemon taking a container over doesn't give it another.
+        let since_start = c
+            .persisted()
+            .state
+            .started_at
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+            .and_then(|t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).to_std().ok())
+            .unwrap_or_default();
+        let started = Instant::now().checked_sub(since_start).unwrap_or_else(Instant::now);
         loop {
             let in_start_period = health.status == HealthStatus::Starting && started.elapsed() < plan.start_period;
             tokio::time::sleep(if in_start_period { plan.start_interval } else { plan.interval }).await;
