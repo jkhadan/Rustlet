@@ -17,6 +17,10 @@ workspace = true
 [dependencies]
 rustlet-spec.workspace = true
 rustlet-client.workspace = true
+# Packing build contexts, and Go durations for --health-*.
+rustlet-build.workspace = true
+# `rustlet compose`.
+rustlet-compose.workspace = true
 tokio.workspace = true
 futures.workspace = true
 bytes.workspace = true

@@ -18,7 +18,7 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use rustlet_spec::container::{ContainerState, ContainerStatus};
+use rustlet_spec::container::{ContainerState, ContainerStatus, HealthStatus};
 use rustlet_spec::network::PublishedPort;
 
 /// A table laid out as `docker` lays them out (Go's `tabwriter` with a
@@ -108,14 +108,19 @@ pub fn ago(ts: &str, now: DateTime<Utc>) -> String {
     elapsed(ts, now).map_or_else(|| "N/A".to_owned(), |d| format!("{} ago", human_duration(d)))
 }
 
-/// The STATUS column of `ps`.
+/// The STATUS column of `ps`. A running container with a healthcheck says
+/// what it says, as Docker's does: `Up 5 minutes (healthy)`. (A paused
+/// one doesn't: its checks don't run.)
 pub fn status_text(state: &ContainerState, now: DateTime<Utc>) -> String {
     let since = |ts: &Option<String>| ts.as_deref().and_then(|t| elapsed(t, now)).map(human_duration);
     let code = state.exit_code.unwrap_or(0);
     let up = || since(&state.started_at).unwrap_or_else(|| human_duration(Duration::ZERO));
     match state.status {
         ContainerStatus::Created => "Created".to_owned(),
-        ContainerStatus::Running => format!("Up {}", up()),
+        ContainerStatus::Running => match &state.health {
+            Some(health) => format!("Up {} ({})", up(), health_text(health.status)),
+            None => format!("Up {}", up()),
+        },
         ContainerStatus::Paused => format!("Up {} (Paused)", up()),
         ContainerStatus::Restarting => match since(&state.finished_at) {
             Some(d) => format!("Restarting ({code}) {d} ago"),
@@ -127,6 +132,15 @@ pub fn status_text(state: &ContainerState, now: DateTime<Utc>) -> String {
         },
         ContainerStatus::Removing => "Removing".to_owned(),
         ContainerStatus::Dead => "Dead".to_owned(),
+    }
+}
+
+/// A healthcheck's status as `ps` words it: `healthy`, `unhealthy`, and
+/// `health: starting` (`starting` alone would read as the container's).
+pub fn health_text(status: HealthStatus) -> String {
+    match status {
+        HealthStatus::Starting => "health: starting".to_owned(),
+        other => other.to_string(),
     }
 }
 
@@ -373,6 +387,7 @@ fn parse_go_duration(s: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    use rustlet_spec::container::Health;
     use rustlet_spec::network::Protocol;
 
     use super::*;
@@ -455,6 +470,41 @@ mod tests {
         for (state, text) in cases {
             assert_eq!(status_text(&state, now), text, "{state:?}");
         }
+    }
+
+    #[test]
+    fn running_containers_with_a_healthcheck_say_how_they_are() {
+        let now = at("2026-10-01T12:00:00Z");
+        let state = |status, started: &str, health| ContainerState {
+            status,
+            started_at: Some(started.to_owned()),
+            finished_at: Some("2026-10-01T11:59:59Z".to_owned()),
+            exit_code: Some(0),
+            health: Some(Health { status: health, ..Health::default() }),
+            ..ContainerState::default()
+        };
+        let cases = [
+            (state(ContainerStatus::Running, "2026-10-01T11:55:00Z", HealthStatus::Healthy), "Up 5 minutes (healthy)"),
+            (
+                state(ContainerStatus::Running, "2026-10-01T11:59:57Z", HealthStatus::Starting),
+                "Up 3 seconds (health: starting)",
+            ),
+            (
+                state(ContainerStatus::Running, "2026-10-01T11:58:00Z", HealthStatus::Unhealthy),
+                "Up 2 minutes (unhealthy)",
+            ),
+            // Paused, its checks don't run; exited, what they last said is
+            // kept, but the container isn't up for it to be about.
+            (state(ContainerStatus::Paused, "2026-10-01T11:55:00Z", HealthStatus::Healthy), "Up 5 minutes (Paused)"),
+            (
+                state(ContainerStatus::Exited, "2026-10-01T11:55:00Z", HealthStatus::Unhealthy),
+                "Exited (0) 1 second ago",
+            ),
+        ];
+        for (state, text) in cases {
+            assert_eq!(status_text(&state, now), text, "{state:?}");
+        }
+        assert_eq!(health_text(HealthStatus::Starting), "health: starting");
     }
 
     #[test]

@@ -18,7 +18,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
 use clap::ValueEnum;
-use rustlet_spec::container::{ContainerConfig, RestartPolicy, RestartPolicyName, UsernsMode};
+use rustlet_spec::container::{ContainerConfig, HealthConfig, RestartPolicy, RestartPolicyName, UsernsMode};
 use rustlet_spec::network::{NetworkMode, PortMapping, parse_extra_host, valid_hostname};
 use rustlet_spec::volume::MountSpec;
 
@@ -81,6 +81,27 @@ pub struct CreateFlags {
     /// Seconds to wait for the stop signal before killing
     #[arg(long, value_name = "SECONDS")]
     pub stop_timeout: Option<u32>,
+    /// Command that checks the container's health, run by its shell (/bin/sh -c): exit 0 is healthy
+    #[arg(long, value_name = "COMMAND")]
+    pub health_cmd: Option<String>,
+    /// Time between health checks: 30s, 1m30s (default 30s)
+    #[arg(long, value_name = "DURATION", value_parser = parse_nanos)]
+    pub health_interval: Option<u64>,
+    /// Longest a health check may run before it counts as failed (default 30s)
+    #[arg(long, value_name = "DURATION", value_parser = parse_nanos)]
+    pub health_timeout: Option<u64>,
+    /// Time the container gets to start before failed checks count (default 0s)
+    #[arg(long, value_name = "DURATION", value_parser = parse_nanos)]
+    pub health_start_period: Option<u64>,
+    /// Time between health checks during the start period (default 5s)
+    #[arg(long, value_name = "DURATION", value_parser = parse_nanos)]
+    pub health_start_interval: Option<u64>,
+    /// Failed checks in a row that make the container unhealthy (default 3)
+    #[arg(long, value_name = "N")]
+    pub health_retries: Option<u32>,
+    /// No healthcheck, not even the image's HEALTHCHECK
+    #[arg(long)]
+    pub no_healthcheck: bool,
     /// Add a capability (repeatable; ALL for all)
     #[arg(long, value_name = "CAP")]
     pub cap_add: Vec<String>,
@@ -224,7 +245,7 @@ impl CreateFlags {
             auto_remove: self.rm,
             stop_signal: self.stop_signal.clone(),
             stop_timeout: self.stop_timeout,
-            healthcheck: None,
+            healthcheck: self.healthcheck()?,
             cap_add: self.cap_add.clone(),
             cap_drop: self.cap_drop.clone(),
             privileged: self.privileged,
@@ -243,6 +264,45 @@ impl CreateFlags {
             extra_hosts: parse_extra_hosts(&self.add_host)?,
             mounts: self.mounts(cwd)?,
         })
+    }
+
+    /// `--health-*` and `--no-healthcheck`, as Docker's CLI reads them:
+    /// none of them leaves the image's `HEALTHCHECK` as it is (`None`);
+    /// `--no-healthcheck` turns it off (`["NONE"]`), and can't go with
+    /// options for it; options without `--health-cmd` keep the image's
+    /// command and replace its options (an empty `test`).
+    fn healthcheck(&self) -> anyhow::Result<Option<HealthConfig>> {
+        let given = [
+            ("--health-cmd", self.health_cmd.is_some()),
+            ("--health-interval", self.health_interval.is_some()),
+            ("--health-timeout", self.health_timeout.is_some()),
+            ("--health-start-period", self.health_start_period.is_some()),
+            ("--health-start-interval", self.health_start_interval.is_some()),
+            ("--health-retries", self.health_retries.is_some()),
+        ];
+        let first = given.iter().find(|(_, given)| *given).map(|(flag, _)| *flag);
+        if self.no_healthcheck {
+            if let Some(flag) = first {
+                bail!("conflicting options: --no-healthcheck and {flag} (no healthcheck runs to take options)");
+            }
+            return Ok(Some(HealthConfig { test: vec!["NONE".to_owned()], ..HealthConfig::default() }));
+        }
+        if first.is_none() {
+            return Ok(None);
+        }
+        let test = match self.health_cmd.as_deref() {
+            // Docker's CLI takes an empty command for none too.
+            None | Some("") => Vec::new(),
+            Some(command) => vec!["CMD-SHELL".to_owned(), command.to_owned()],
+        };
+        Ok(Some(HealthConfig {
+            test,
+            interval: self.health_interval,
+            timeout: self.health_timeout,
+            start_period: self.health_start_period,
+            start_interval: self.health_start_interval,
+            retries: self.health_retries,
+        }))
     }
 
     /// `-v`, `--mount` and `--tmpfs`, in that order.
@@ -439,8 +499,15 @@ pub fn resolve_env(values: &[String], lookup: &dyn Fn(&str) -> Option<String>) -
     Ok(env)
 }
 
+/// A Go duration (`30s`, `1m30s`, `500ms`) as `--health-*` take one, in
+/// the nanoseconds the API carries.
+fn parse_nanos(s: &str) -> Result<u64, String> {
+    let duration = rustlet_build::config::parse_duration(s)?;
+    u64::try_from(duration.as_nanos()).map_err(|_| format!("duration {s:?} is too long"))
+}
+
 /// `-l KEY=VALUE` (or a bare `KEY`, with an empty value); `--label` of
-/// `network create` and `volume create` too.
+/// `network create`, `volume create` and `build` too.
 pub fn parse_labels(values: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
     let mut labels = BTreeMap::new();
     for v in values {
@@ -790,6 +857,89 @@ mod tests {
             assert!(e.starts_with("duplicate mount point: "), "{args:?}: {e}");
         }
         assert_eq!(config(&["-v", "data:/data", "--tmpfs", "/data/tmp"]).unwrap().mounts.len(), 2);
+    }
+
+    #[test]
+    fn health_flags_make_a_healthcheck_with_durations_in_nanoseconds() {
+        let health = |args: &[&str]| config(args).unwrap().healthcheck;
+        let all = [
+            "--health-cmd",
+            "curl -f http://localhost/ || exit 1",
+            "--health-interval",
+            "1m30s",
+            "--health-timeout=500ms",
+            "--health-start-period",
+            "1.5s",
+            "--health-start-interval",
+            "2s",
+            "--health-retries",
+            "5",
+        ];
+        assert_eq!(
+            health(&all),
+            Some(HealthConfig {
+                test: vec!["CMD-SHELL".into(), "curl -f http://localhost/ || exit 1".into()],
+                interval: Some(90_000_000_000),
+                timeout: Some(500_000_000),
+                start_period: Some(1_500_000_000),
+                start_interval: Some(2_000_000_000),
+                retries: Some(5),
+            })
+        );
+        // None of them: the image's HEALTHCHECK stands, untouched.
+        assert_eq!(health(&[]), None);
+        // A command alone; options alone (the image's command, with them).
+        assert_eq!(
+            health(&["--health-cmd", "pg_isready"]),
+            Some(HealthConfig { test: vec!["CMD-SHELL".into(), "pg_isready".into()], ..HealthConfig::default() })
+        );
+        assert_eq!(
+            health(&["--health-interval", "5s", "--health-retries", "1"]),
+            Some(HealthConfig { interval: Some(5_000_000_000), retries: Some(1), ..HealthConfig::default() })
+        );
+        assert_eq!(
+            health(&["--health-timeout", "0"]),
+            Some(HealthConfig { timeout: Some(0), ..HealthConfig::default() })
+        );
+        // An empty command is none, as Docker's CLI reads it.
+        assert_eq!(health(&["--health-cmd", ""]), Some(HealthConfig::default()));
+        // Off, the image's too.
+        let off = health(&["--no-healthcheck"]).unwrap();
+        assert_eq!(off.test, ["NONE"]);
+        assert!(off.is_none());
+    }
+
+    #[test]
+    fn no_healthcheck_conflicts_with_every_health_option() {
+        for args in [
+            &["--health-cmd", "true"][..],
+            &["--health-interval", "1s"],
+            &["--health-timeout", "1s"],
+            &["--health-start-period", "1s"],
+            &["--health-start-interval", "1s"],
+            &["--health-retries", "2"],
+        ] {
+            let e = config(&[&["--no-healthcheck"][..], args].concat()).unwrap_err().to_string();
+            assert_eq!(
+                e,
+                format!("conflicting options: --no-healthcheck and {} (no healthcheck runs to take options)", args[0])
+            );
+        }
+    }
+
+    #[test]
+    fn health_durations_are_gos_and_never_negative() {
+        let parses = |args: &[&str]| Probe::try_parse_from(std::iter::once("probe").chain(args.iter().copied()));
+        for bad in ["10", "5 s", "1x", "fast", ""] {
+            let e = parses(&["--health-interval", bad]).err().unwrap_or_else(|| panic!("{bad:?} parsed"));
+            assert_eq!(e.kind(), clap::error::ErrorKind::ValueValidation, "{bad:?}");
+        }
+        // A negative one isn't a value at all, as for Docker's CLI.
+        assert!(parses(&["--health-timeout", "-1s"]).is_err());
+        assert!(parses(&["--health-retries", "-1"]).is_err());
+        assert!(parses(&["--health-retries", "x"]).is_err());
+        assert_eq!(parse_nanos("2h45m").unwrap(), (2 * 3600 + 45 * 60) * 1_000_000_000);
+        assert_eq!(parse_nanos("1us").unwrap(), 1_000);
     }
 
     #[test]

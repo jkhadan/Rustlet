@@ -20,6 +20,10 @@
 //! downloads show their byte counts. Anywhere else each layer prints a
 //! line per state change (progress counts would be noise in a log), as
 //! Docker does. The config blob is part of the pull but has no line.
+//!
+//! A pull that is only a step of something else (a build's base image, a
+//! compose service's image) is condensed to one line ([`PullLine`]): the
+//! layers summed while it goes, the `Status:` line once it is done.
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -168,10 +172,83 @@ pub async fn pull(
 /// asked for, as Docker words it (`alpine:latest`).
 pub fn summary(out: &mut dyn Write, pulled: &Pulled, name: &str) -> io::Result<()> {
     writeln!(out, "Digest: {}", pulled.repo_digest.as_deref().unwrap_or(&pulled.manifest))?;
+    writeln!(out, "{}", status(pulled, name))
+}
+
+/// The `Status:` line of a pull.
+pub fn status(pulled: &Pulled, name: &str) -> String {
     if pulled.downloaded {
-        writeln!(out, "Status: Downloaded newer image for {name}")
+        format!("Status: Downloaded newer image for {name}")
     } else {
-        writeln!(out, "Status: Image is up to date for {name}")
+        format!("Status: Image is up to date for {name}")
+    }
+}
+
+/// A pull shown as one line, for the pulls a build or `compose up` does
+/// on the way: `python:3-slim: Downloading 12.3MB/41.2MB` while it goes,
+/// redrawn by whoever shows it, and its [`status`] line once it is done.
+#[derive(Debug)]
+pub struct PullLine {
+    /// The image as Docker words it: `python:3-slim`.
+    pub name: String,
+    /// Keeps the account of what the pull did.
+    progress: Progress,
+    /// Each layer blob: bytes there so far, of how many.
+    layers: Vec<(String, u64, u64)>,
+    unpacking: bool,
+}
+
+impl PullLine {
+    /// A pull of `reference`.
+    pub fn new(reference: &str) -> PullLine {
+        PullLine {
+            name: Reference::parse(reference).familiar(),
+            progress: Progress::new(false),
+            layers: Vec::new(),
+            unpacking: false,
+        }
+    }
+
+    /// Takes `event` into account; returns what was pulled once it is
+    /// `ready`.
+    pub fn update(&mut self, event: &PullEvent) -> Option<Pulled> {
+        match event {
+            PullEvent::Downloading { kind: BlobKind::Layer, digest, current, total } => {
+                self.layer(digest, *current, *total);
+            }
+            PullEvent::Downloaded { kind: BlobKind::Layer, digest, size }
+            | PullEvent::Exists { kind: BlobKind::Layer, digest, size } => self.layer(digest, *size, *size),
+            PullEvent::Unpacking { .. } => self.unpacking = true,
+            _ => {}
+        }
+        // Nothing is written to a sink; only the account is wanted.
+        self.progress.show(&mut io::sink(), event).ok().flatten()
+    }
+
+    /// The `Status:` line for a pull that is done, if it asked a registry
+    /// anything: an image that was already there (and pulled only if
+    /// missing) gets none, as Docker shows nothing for it.
+    pub fn status(&self, pulled: &Pulled) -> Option<String> {
+        (pulled.downloaded || pulled.repo_digest.is_some()).then(|| status(pulled, &self.name))
+    }
+
+    /// What the line says now.
+    pub fn text(&self) -> String {
+        let (current, total) = self.layers.iter().fold((0, 0), |(c, t), (_, current, total)| (c + current, t + total));
+        if self.unpacking {
+            format!("{}: Extracting", self.name)
+        } else if total > 0 {
+            format!("{}: Downloading {}/{}", self.name, bytes_si(current), bytes_si(total))
+        } else {
+            format!("{}: Pulling", self.name)
+        }
+    }
+
+    fn layer(&mut self, digest: &str, current: u64, total: u64) {
+        match self.layers.iter_mut().find(|(d, _, _)| d == digest) {
+            Some(layer) => (layer.1, layer.2) = (current, total.max(current)),
+            None => self.layers.push((digest.to_owned(), current, total.max(current))),
+        }
     }
 }
 
@@ -338,6 +415,53 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "Digest: sha256:m\nStatus: Image is up to date for alpine:latest\n"
         );
+    }
+
+    #[test]
+    fn a_pull_shown_in_one_line_sums_its_layers() {
+        let mut line = PullLine::new("docker.io/library/alpine:latest");
+        assert_eq!(line.text(), "alpine:latest: Pulling");
+        let mut texts = Vec::new();
+        let mut pulled = None;
+        for e in events() {
+            match line.update(&e) {
+                Some(p) => pulled = Some(p),
+                None => texts.push(line.text().replace("alpine:latest: ", "")),
+            }
+        }
+        // The config blob isn't a layer; an existing layer counts as there.
+        assert_eq!(
+            texts,
+            [
+                "Pulling",
+                "Pulling",
+                "Pulling",
+                "Pulling",
+                "Downloading 10B/10B",
+                "Downloading 10B/3.4MB",
+                "Downloading 1.2MB/3.4MB",
+                "Downloading 3.4MB/3.4MB",
+                "Downloading 3.4MB/3.4MB",
+                "Downloading 3.4MB/3.4MB",
+                "Extracting",
+                "Extracting",
+            ]
+        );
+        let pulled = pulled.unwrap();
+        assert_eq!(line.status(&pulled).unwrap(), "Status: Downloaded newer image for alpine:latest");
+
+        // Already there, and only pulled if missing: no registry was asked,
+        // and there is nothing to say.
+        let all = events();
+        let (resolving, resolved, exists, ready) = (&all[0], &all[1], &all[4], &all[all.len() - 1]);
+        let mut line = PullLine::new("alpine");
+        assert!(line.update(resolving).is_none());
+        let pulled = line.update(ready).unwrap();
+        assert_eq!(line.status(&pulled), None);
+        // Asked (--pull), but nothing new.
+        let mut line = PullLine::new("alpine");
+        let pulled = [resolving, resolved, exists, ready].into_iter().find_map(|e| line.update(e)).unwrap();
+        assert_eq!(line.status(&pulled).unwrap(), "Status: Image is up to date for alpine:latest");
     }
 
     #[test]

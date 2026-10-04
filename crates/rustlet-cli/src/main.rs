@@ -11,12 +11,19 @@
 //! rustlet run -d --name site --network backend -p 8080:80 -v site:/usr/share/nginx/html nginx
 //! rustlet network create --ipv6 edge      # dual stack: an IPv6 subnet too
 //! rustlet network connect edge site       # site joins it too, at once if it runs
+//! rustlet build -t app .                  # an image from ./Containerfile (or ./Dockerfile)
+//! rustlet run -d --health-cmd 'curl -f localhost' app
+//! rustlet save -o app.tar app && rustlet load -i app.tar
+//! rustlet compose up -d                   # the services of ./compose.yaml, in dependency order
+//! rustlet compose logs -f web             # one service's output
+//! rustlet compose down                    # its containers and networks gone
 //! ```
 //!
 //! Every command is a few calls to the daemon's API through
-//! [`rustlet_client`]; the work (images, containers, logs) is the daemon's.
-//! What the CLI owns is the user's side: flags, tables and progress, the
-//! terminal (raw mode, size, detach keys, signals: [`relay`]), and exit
+//! [`rustlet_client`]; the work (images, builds, containers, logs) is the
+//! daemon's, and `compose`'s is `rustlet_compose`'s. What the CLI owns is
+//! the user's side: flags, tables and progress, packing a build's context,
+//! the terminal (raw mode, size, detach keys, signals: [`relay`]), and exit
 //! codes. Those follow Docker's:
 //!
 //! - **125** when Rustlets fails: a bad flag, a daemon that can't be
@@ -25,15 +32,19 @@
 //!   wasn't found (as a shell would);
 //! - otherwise the container's (or exec'd process's) own status, for the
 //!   commands that wait for one: `run`, `start -a`, `attach`, `exec`;
-//! - **1** when a command acting on several containers, images, networks
+//! - **1** when a build fails (a step did: the daemon's message says
+//!   which), when a command acting on several containers, images, networks
 //!   or volumes failed for some of them (`stop a b`, `rm`, `rmi`, `wait`,
 //!   `inspect`, `network rm`, `volume rm`), and when `port` finds no
-//!   mapping for the port asked about.
+//!   mapping for the port asked about;
+//! - **130** when Ctrl-C stopped an attached `compose up`.
 //!
 //! The daemon's socket is `/run/rustlet/rustlet.sock`, or what `--host` /
 //! `RUSTLET_HOST` says (`unix:///path` or a path).
 #![forbid(unsafe_code)]
 
+mod build;
+mod compose;
 mod config;
 mod console;
 mod containers;
@@ -52,11 +63,13 @@ mod tests;
 
 use std::fmt;
 use std::io::{self, Write};
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use rustlet_client::Client;
 use rustlet_spec::container::RemoveQuery;
 
+use crate::build::Packer;
 use crate::console::Console;
 use crate::containers::{ObjectType, Op};
 
@@ -190,12 +203,47 @@ enum Command {
         #[arg(value_name = "IMAGE", required = true)]
         images: Vec<String>,
     },
+    /// Build an image from a Containerfile and a context directory
+    Build(build::BuildArgs),
+    /// Manage the build cache
+    #[command(subcommand)]
+    Builder(build::BuilderCommand),
+    /// Create a new image from a container's changes (and print its ID)
+    Commit(build::CommitArgs),
+    /// Give an image another name
+    Tag {
+        /// The image: a name, an ID, or a unique prefix of an ID
+        #[arg(value_name = "SOURCE_IMAGE[:TAG]")]
+        source: String,
+        /// The new name, taken from whatever image had it
+        #[arg(value_name = "TARGET_IMAGE[:TAG]")]
+        target: String,
+    },
+    /// Save one or more images to a tar archive (on stdout unless -o)
+    Save {
+        /// Write to this file instead of stdout
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        #[arg(value_name = "IMAGE", required = true)]
+        images: Vec<String>,
+    },
+    /// Load images from a tar archive (from stdin unless -i)
+    Load {
+        /// Read this file instead of stdin
+        #[arg(short, long, value_name = "FILE")]
+        input: Option<PathBuf>,
+        /// Only say what was loaded, not each blob (as off a terminal)
+        #[arg(short, long)]
+        quiet: bool,
+    },
     /// Manage networks
     #[command(subcommand)]
     Network(networks::NetworkCommand),
     /// Manage volumes
     #[command(subcommand)]
     Volume(volumes::VolumeCommand),
+    /// Run applications of several containers, from a compose file
+    Compose(compose::ComposeArgs),
     /// Show what happens in the daemon, as it happens
     Events(system::EventsArgs),
     /// Show the client's and the daemon's versions
@@ -204,11 +252,13 @@ enum Command {
     Info,
 }
 
-/// What every command gets: the daemon, the terminal, and `--debug`.
+/// What every command gets: the daemon, the terminal, `--debug`, and
+/// what packs a build's context.
 pub struct Ctx {
     pub client: Client,
     pub console: Console,
     pub debug: bool,
+    pub packer: Packer,
 }
 
 impl Ctx {
@@ -251,8 +301,14 @@ fn main() {
 
 /// Runs the command line on `console`; returns the exit code.
 async fn run_cli(cli: Cli, console: Console) -> i32 {
+    run_cli_with(cli, console, Packer::real()).await
+}
+
+/// [`run_cli`], with `packer` packing build contexts (the tests' fake
+/// one).
+async fn run_cli_with(cli: Cli, console: Console, packer: Packer) -> i32 {
     let mut ctx = match Client::from_host(cli.host.as_deref().unwrap_or("")) {
-        Ok(client) => Ctx { client, console, debug: cli.debug },
+        Ok(client) => Ctx { client, console, debug: cli.debug, packer },
         Err(e) => {
             let mut console = console;
             let _ = writeln!(console.stderr, "rustlet: error: {e}");
@@ -293,8 +349,15 @@ async fn dispatch(ctx: &mut Ctx, command: Command) -> anyhow::Result<i32> {
         Command::Pull { quiet, image } => images::pull(ctx, quiet, &image).await,
         Command::Images { quiet, no_trunc } => images::images(ctx, quiet, no_trunc).await,
         Command::Rmi { force, images } => images::rmi(ctx, force, &images).await,
+        Command::Build(args) => build::build(ctx, args).await,
+        Command::Builder(command) => build::builder(ctx, command).await,
+        Command::Commit(args) => build::commit(ctx, args).await,
+        Command::Tag { source, target } => images::tag(ctx, &source, &target).await,
+        Command::Save { output, images } => images::save(ctx, output.as_deref(), &images).await,
+        Command::Load { input, quiet } => images::load(ctx, input.as_deref(), quiet).await,
         Command::Network(command) => networks::network(ctx, command).await,
         Command::Volume(command) => volumes::volume(ctx, command).await,
+        Command::Compose(args) => compose::compose(ctx, args).await,
         Command::Events(args) => system::events(ctx, args).await,
         Command::Version => system::version(ctx).await,
         Command::Info => system::info(ctx).await,

@@ -1,11 +1,21 @@
-//! `images`, `rmi` and `pull`.
+//! `images`, `rmi`, `pull`, `tag`, `save` and `load`.
+//!
+//! `save` and `load` move archives that can be gigabytes, so neither holds
+//! one whole: `save` writes the daemon's answer out as it arrives, and
+//! `load` sends a file (or stdin) as it is read
+//! ([`RequestBody::from_reader`]). An archive is never written to a
+//! terminal, nor read from one, as with Docker.
 
 use std::collections::HashSet;
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
+use anyhow::{Context, anyhow, bail};
 use chrono::Utc;
-use rustlet_client::Error;
-use rustlet_spec::image::PullPolicy;
+use futures::StreamExt;
+use rustlet_client::{ByteStream, Error, RequestBody};
+use rustlet_spec::image::{LoadEvent, PullPolicy};
 
 use crate::Ctx;
 use crate::format::{Table, ago, bytes_si, short_digest, split_image_name};
@@ -83,5 +93,118 @@ pub async fn pull(ctx: &mut Ctx, quiet: bool, image: &str) -> anyhow::Result<i32
         pull::summary(&mut *console.stdout, &pulled, &reference.familiar())?;
     }
     writeln!(console.stdout, "{}", pulled.reference)?;
+    Ok(0)
+}
+
+/// `rustlet tag`: `target` names `source`'s image too (and no longer
+/// whatever it named before). Nothing is printed, as with Docker.
+pub async fn tag(ctx: &mut Ctx, source: &str, target: &str) -> anyhow::Result<i32> {
+    ctx.client.tag_image(source, target).await?;
+    Ok(0)
+}
+
+/// `rustlet save`: the images as one tar archive, into `output` or onto
+/// stdout, which mustn't be a terminal.
+pub async fn save(ctx: &mut Ctx, output: Option<&Path>, images: &[String]) -> anyhow::Result<i32> {
+    let Some(path) = output else {
+        if ctx.console.stdout_tty {
+            bail!("refusing to write an archive to a terminal; use -o or redirect");
+        }
+        let mut archive = ctx.client.save_images(images).await?;
+        while let Some(chunk) = archive.next().await {
+            ctx.console.stdout.write_all(&chunk?)?;
+        }
+        ctx.console.stdout.flush()?;
+        return Ok(0);
+    };
+    // The daemon is asked first: a save it refuses (no such image) leaves
+    // no file behind, nor touches one that is there.
+    let archive = ctx.client.save_images(images).await?;
+    match fs::metadata(path) {
+        // `-o /dev/stdout`, a FIFO: written as they are. Replacing one with
+        // a file would be wrong, and for root, possible.
+        Ok(m) if !m.is_file() => {
+            let file = OpenOptions::new().write(true).open(path).with_context(|| format!("-o {}", path.display()))?;
+            write_archive(archive, file).await.with_context(|| format!("-o {}", path.display()))
+        }
+        _ => save_to_file(archive, path).await,
+    }?;
+    Ok(0)
+}
+
+/// Writes the archive into a new file beside `path`, renamed to `path`
+/// once it is whole (as Docker's CLI does): a save that fails midway
+/// removes what it wrote, and leaves a file that was there as it was.
+async fn save_to_file(archive: ByteStream, path: &Path) -> anyhow::Result<()> {
+    let partial = partial_path(path)?;
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&partial)
+        .with_context(|| format!("-o {}: creating {}", path.display(), partial.display()))?;
+    let saved = write_archive(archive, file)
+        .await
+        .and_then(|()| fs::rename(&partial, path).with_context(|| format!("renaming {}", partial.display())));
+    if let Err(e) = saved {
+        let _ = fs::remove_file(&partial);
+        return Err(e.context(format!("-o {}", path.display())));
+    }
+    Ok(())
+}
+
+/// `dir/.name.rustlet-partial-<pid>`, for `dir/name`.
+fn partial_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let name = path.file_name().ok_or_else(|| anyhow!("-o {}: not a file name", path.display()))?;
+    Ok(path.with_file_name(format!(".{}.rustlet-partial-{}", name.to_string_lossy(), std::process::id())))
+}
+
+/// The archive, chunk by chunk as it arrives, into `file`.
+async fn write_archive(mut archive: ByteStream, mut file: File) -> anyhow::Result<()> {
+    while let Some(chunk) = archive.next().await {
+        // A blocking write: the local disk is the bottleneck we want.
+        file.write_all(&chunk?)?;
+    }
+    file.flush()?;
+    Ok(())
+}
+
+/// `rustlet load`: the images of an archive (`input`, else stdin, which
+/// mustn't be a terminal), and what they are called now. As with Docker,
+/// each blob's line is shown only on a terminal, and not with `-q`.
+pub async fn load(ctx: &mut Ctx, input: Option<&Path>, quiet: bool) -> anyhow::Result<i32> {
+    let archive = match input {
+        Some(path) => {
+            let file = File::open(path).with_context(|| format!("-i {}", path.display()))?;
+            RequestBody::from_reader(file)
+        }
+        None => {
+            if ctx.console.stdin_tty {
+                bail!("requested load from stdin, but stdin is a terminal; use -i or redirect an archive in");
+            }
+            let stdin = ctx.console.stdin.take().ok_or_else(|| anyhow!("stdin is already in use"))?;
+            RequestBody::from_reader(stdin)
+        }
+    };
+    let blobs = !quiet && ctx.console.stdout_tty;
+    let mut events = ctx.client.load_images(archive).await?;
+    let out = &mut ctx.console.stdout;
+    while let Some(event) = events.next().await {
+        match event? {
+            LoadEvent::Blob { digest, existed: true, .. } if blobs => {
+                writeln!(out, "{}: Already exists", short_digest(&digest))?;
+            }
+            LoadEvent::Blob { digest, size, .. } if blobs => {
+                writeln!(out, "{}: Loaded {}", short_digest(&digest), bytes_si(size))?;
+            }
+            LoadEvent::Blob { .. } => {}
+            LoadEvent::Loaded { name: Some(name), .. } => {
+                writeln!(out, "Loaded image: {}", Reference::parse(&name).familiar())?;
+            }
+            LoadEvent::Loaded { id, name: None } => writeln!(out, "Loaded image ID: {id}")?,
+            // The client turns it into the stream's error.
+            LoadEvent::Error { message } => bail!(message),
+        }
+        out.flush()?;
+    }
     Ok(0)
 }

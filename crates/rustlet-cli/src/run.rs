@@ -131,7 +131,7 @@ pub struct ExecArgs {
 }
 
 /// The CLI's environment, for `-e KEY`.
-fn from_environment(key: &str) -> Option<String> {
+pub(crate) fn from_environment(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
 

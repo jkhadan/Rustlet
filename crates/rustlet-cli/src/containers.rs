@@ -175,7 +175,7 @@ pub async fn logs(ctx: &mut Ctx, args: LogsArgs) -> anyhow::Result<i32> {
 
 /// `--tail`: `all`, or a number of lines (a negative one means all, as
 /// with Docker).
-fn parse_tail(s: &str) -> anyhow::Result<Option<u64>> {
+pub(crate) fn parse_tail(s: &str) -> anyhow::Result<Option<u64>> {
     if s.eq_ignore_ascii_case("all") {
         return Ok(None);
     }

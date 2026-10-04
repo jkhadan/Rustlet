@@ -3,7 +3,9 @@
 //! a temporary Unix socket that records the calls it gets and answers like
 //! rustletd would.
 
+use std::io;
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,14 +17,19 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use bytes::Bytes;
 use clap::Parser;
 use futures::StreamExt;
+use rustlet_build::context::{ContextError, Packed};
+use rustlet_spec::build::{BuildEvent, BuildOptions, BuildQuery, CommitRequest, CommitResponse};
 use rustlet_spec::container::{
     AttachQuery, ContainerConfig, ContainerInspect, ContainerState, ContainerStatus, ContainerSummary, CreateResponse,
-    KillQuery, RemoveQuery, StopQuery, WaitQuery, WaitResponse,
+    HealthConfig, KillQuery, RemoveQuery, StopQuery, WaitQuery, WaitResponse,
 };
 use rustlet_spec::exec::{ExecConfig, ExecCreated};
-use rustlet_spec::image::{BlobKind, ImageQuery, ImageSummary, PullEvent, PullQuery};
+use rustlet_spec::image::{
+    BlobKind, ImageQuery, ImageSaveRequest, ImageSummary, ImageTagQuery, LoadEvent, PullEvent, PullPolicy, PullQuery,
+};
 use rustlet_spec::logs::{LogEntry, LogStream, LogsQuery};
 use rustlet_spec::network::{
     Network, NetworkConnect, NetworkCreate, NetworkCreateResponse, NetworkDisconnect, NetworkMode, NetworkSettings,
@@ -37,11 +44,18 @@ use rustlet_spec::{ErrorBody, ErrorKind};
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
 
+use crate::build::Packer;
+use crate::compose::{ComposeCommand, Rmi};
+use crate::console::Console;
 use crate::console::testing::{Buffer, console};
-use crate::{Cli, Command, run_cli};
+use crate::{Cli, Command, run_cli, run_cli_with};
 
 const ID: &str = "4f1d2c3b4a5968778695a4b3c2d1e0f0011223344556677889900aabbccddee";
 const LAYER: &str = "sha256:9824c27679d3b27c0e1cb00b2b5cdbc2d1ae6e8f00aabbccddeeff0011223344";
+/// What the mock builds, commits and loads.
+const IMAGE_ID: &str = "sha256:3c4d5e6f7a8b00112233445566778899aabbccddeeff00112233445566778899";
+/// The image a load finds without a name.
+const UNNAMED_ID: &str = "sha256:5a5b5c5d5e5f00112233445566778899aabbccddeeff00112233445566778899";
 
 fn parse(args: &[&str]) -> Cli {
     Cli::try_parse_from(std::iter::once("rustlet").chain(args.iter().copied())).unwrap()
@@ -105,6 +119,12 @@ struct Daemon {
     /// A prune has removed what there was.
     networks_pruned: AtomicBool,
     volumes_pruned: AtomicBool,
+    /// Each build's options, and the context it was sent.
+    builds: Mutex<Vec<BuildOptions>>,
+    contexts: Mutex<Vec<Vec<u8>>>,
+    commits: Mutex<Vec<CommitRequest>>,
+    /// Each archive loaded.
+    loads: Mutex<Vec<Vec<u8>>>,
 }
 
 type Shared = State<Arc<Daemon>>;
@@ -536,6 +556,123 @@ async fn images() -> Json<Vec<ImageSummary>> {
     ])
 }
 
+/// A name as the daemon gives it back: `app` → `docker.io/library/app:latest`.
+fn full_name(name: &str) -> String {
+    let full = if name.contains('/') { name.to_owned() } else { format!("docker.io/library/{name}") };
+    if full.rsplit('/').next().unwrap_or_default().contains(':') { full } else { full + ":latest" }
+}
+
+/// Reads the whole context, then builds in three steps: `FROM alpine`
+/// (pulled), a `RUN` that prints on both streams, a `CMD`. The target
+/// `broken` fails at the `RUN`.
+async fn build(State(d): Shared, Query(q): Query<BuildQuery>, body: Body) -> Response {
+    let context = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(context) => context,
+        Err(e) => {
+            d.call("build: the context broke off");
+            return error(ErrorKind::Invalid, &format!("reading the build context: {e}"));
+        }
+    };
+    let options = q.options().unwrap();
+    d.contexts.lock().unwrap().push(context.to_vec());
+    d.builds.lock().unwrap().push(options.clone());
+    let alpine = "docker.io/library/alpine:latest".to_owned();
+    let layer = BlobKind::Layer;
+    let mut events = vec![
+        BuildEvent::Context { files: 2, bytes: 2048 },
+        BuildEvent::Stage { index: 0, name: None, base: "alpine".into() },
+        BuildEvent::Step { step: 1, total: 3, instruction: "FROM alpine".into() },
+        BuildEvent::Pull { event: PullEvent::Resolving { reference: alpine.clone() } },
+        BuildEvent::Pull {
+            event: PullEvent::Downloading { kind: layer, digest: LAYER.into(), current: 0, total: 3_000_000 },
+        },
+        BuildEvent::Pull { event: PullEvent::Downloaded { kind: layer, digest: LAYER.into(), size: 3_000_000 } },
+        BuildEvent::Pull { event: PullEvent::Ready { reference: alpine, manifest: "sha256:m".into() } },
+        BuildEvent::StepDone { step: 1, layer: None },
+        BuildEvent::Step { step: 2, total: 3, instruction: "RUN apk add curl".into() },
+        BuildEvent::Container { step: 2, id: ID.into() },
+        BuildEvent::Output {
+            step: 2,
+            stream: LogStream::Stdout,
+            text: "fetch https://dl-cdn.alpinelinux.org/\n".into(),
+        },
+        BuildEvent::Output { step: 2, stream: LogStream::Stderr, text: "warning: no cache\n".into() },
+    ];
+    if options.target.as_deref() == Some("broken") {
+        let message = "The command '/bin/sh -c apk add curl' returned a non-zero code: 1".into();
+        events.push(BuildEvent::Error { message });
+        return ndjson(&events);
+    }
+    events.extend([
+        BuildEvent::StepDone { step: 2, layer: Some(LAYER.into()) },
+        BuildEvent::Warning { message: "One or more build-args [UNUSED] were not consumed".into() },
+        BuildEvent::Step { step: 3, total: 3, instruction: "CMD [\"sh\"]".into() },
+        BuildEvent::StepDone { step: 3, layer: None },
+        BuildEvent::Done { id: IMAGE_ID.into(), names: options.tags.iter().map(|t| full_name(t)).collect() },
+    ]);
+    ndjson(&events)
+}
+
+/// The cache had two entries, 7.8 MB.
+async fn build_prune(State(d): Shared) -> Json<PruneResponse> {
+    d.call("build prune");
+    Json(PruneResponse { deleted: vec!["sha256:aaaa".into(), "sha256:bbbb".into()], space_reclaimed: 7_812_345 })
+}
+
+/// Any container but `gone` commits.
+async fn commit(State(d): Shared, Json(request): Json<CommitRequest>) -> Response {
+    d.call(format!("commit {}", request.container));
+    if request.container == "gone" {
+        return error(ErrorKind::NoSuchContainer, "no such container: gone");
+    }
+    d.commits.lock().unwrap().push(request.clone());
+    let name = request.reference.as_deref().map(full_name);
+    (StatusCode::CREATED, Json(CommitResponse { id: IMAGE_ID.into(), name, layer: LAYER.into() })).into_response()
+}
+
+/// Any image but `missing` takes another name.
+async fn tag(State(d): Shared, Query(q): Query<ImageTagQuery>) -> Response {
+    d.call(format!("tag {} {}", q.source, q.target));
+    if q.source == "missing" {
+        return error(ErrorKind::NoSuchImage, "no such image: missing");
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// An "archive" naming the images asked for; `missing` is refused, and
+/// the archive of `broken` breaks off after its first chunk (sent before
+/// it breaks: an error that came at once would end the response before
+/// its head).
+async fn save(State(d): Shared, Json(request): Json<ImageSaveRequest>) -> Response {
+    d.call(format!("save {}", request.names.join(" ")));
+    if request.names.iter().any(|n| n == "missing") {
+        return error(ErrorKind::NoSuchImage, "no such image: missing");
+    }
+    let archive = Bytes::from(format!("archive of {}", request.names.join(", ")));
+    let tar = [(header::CONTENT_TYPE, "application/x-tar")];
+    if request.names.iter().any(|n| n == "broken") {
+        let breaks = futures::stream::once(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Err(io::Error::other("the disk is on fire"))
+        });
+        let chunks = futures::stream::iter([Ok(archive)]).chain(breaks);
+        return (tar, Body::from_stream(chunks)).into_response();
+    }
+    (tar, Body::from(archive)).into_response()
+}
+
+/// Takes the archive in: it held `app:1.0` and an image without a name.
+async fn load(State(d): Shared, body: Body) -> Response {
+    let archive = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    d.loads.lock().unwrap().push(archive.to_vec());
+    ndjson(&[
+        LoadEvent::Blob { digest: LAYER.into(), size: 3_000_000, existed: false },
+        LoadEvent::Blob { digest: IMAGE_ID.into(), size: 1500, existed: true },
+        LoadEvent::Loaded { id: IMAGE_ID.into(), name: Some("docker.io/library/app:1.0".into()) },
+        LoadEvent::Loaded { id: UNNAMED_ID.into(), name: None },
+    ])
+}
+
 /// Serves `app`; returns the `-H` value that reaches it, and the directory
 /// guard.
 fn serve(app: Router) -> (String, tempfile::TempDir) {
@@ -571,6 +708,12 @@ fn daemon() -> (Arc<Daemon>, String, tempfile::TempDir) {
         .route(pattern::IMAGE_PULL, post(pull))
         .route(pattern::IMAGES, get(images))
         .route(pattern::IMAGE_INSPECT, get(inspect_image))
+        .route(pattern::IMAGE_TAG, post(tag))
+        .route(pattern::IMAGE_SAVE, post(save))
+        .route(pattern::IMAGE_LOAD, post(load))
+        .route(pattern::BUILD, post(build))
+        .route(pattern::BUILD_PRUNE, post(build_prune))
+        .route(pattern::COMMIT, post(commit))
         .route(pattern::NETWORKS, get(network_list).post(network_create))
         .route(pattern::NETWORK, get(network_inspect).delete(network_remove))
         .route(pattern::NETWORK_PRUNE, post(network_prune))
@@ -589,11 +732,40 @@ fn daemon() -> (Arc<Daemon>, String, tempfile::TempDir) {
 /// Runs `rustlet -H host args…` with `stdin`; returns the exit code and
 /// what it printed.
 async fn rustlet(host: &str, args: &[&str], stdin: &[u8]) -> (i32, Buffer, Buffer) {
+    let (console, stdout, stderr) = console(stdin);
+    (rustlet_on(host, args, console).await, stdout, stderr)
+}
+
+/// Runs `rustlet -H host args…` on `console` (one that says it is a
+/// terminal); returns the exit code.
+async fn rustlet_on(host: &str, args: &[&str], console: Console) -> i32 {
     let mut argv = vec!["-H", host];
     argv.extend_from_slice(args);
-    let (console, stdout, stderr) = console(stdin);
-    let code = tokio::time::timeout(Duration::from_secs(20), run_cli(parse(&argv), console)).await.expect("hung");
-    (code, stdout, stderr)
+    tokio::time::timeout(Duration::from_secs(20), run_cli(parse(&argv), console)).await.expect("hung")
+}
+
+/// [`rustlet`], with `packer` packing build contexts.
+async fn rustlet_packing(host: &str, args: &[&str], packer: Packer) -> (i32, Buffer, Buffer) {
+    let mut argv = vec!["-H", host];
+    argv.extend_from_slice(args);
+    let (console, stdout, stderr) = console(b"");
+    let code = tokio::time::timeout(Duration::from_secs(20), run_cli_with(parse(&argv), console, packer));
+    (code.await.expect("hung"), stdout, stderr)
+}
+
+/// Packs no files: the "archive" says which context and Containerfile it
+/// was given. A context's Containerfile is `Containerfile`, by that name.
+fn fake_packer() -> Packer {
+    Packer {
+        default_containerfile: |dir| Some(dir.join("Containerfile")),
+        dockerfile_name: |_, file| Ok(file.file_name().unwrap_or_default().to_string_lossy().into_owned()),
+        pack: |context, file, out| {
+            let archive = format!("context {} with {}", context.display(), file.display());
+            let io = |source| ContextError::Io { path: context.to_owned(), source };
+            out.write_all(archive.as_bytes()).map_err(io)?;
+            Ok(Packed { dockerfile: "Containerfile".into(), entries: 2, bytes: 2048, excluded: 0 })
+        },
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1448,6 +1620,406 @@ alpine          3.20      111111111111   2 weeks ago   3.62MB
     assert_eq!(stdout.text(), expected);
     let (_, stdout, _) = rustlet(&host, &["images", "-q"], b"").await;
     assert_eq!(stdout.text(), "333333333333\n111111111111\n");
+}
+
+/// What a build of the mock prints until its `RUN` fails, or goes on.
+const BUILD_STEPS: &str = "Sending build context to rustletd  2.048kB\n\
+                           Step 1/3 : FROM alpine\n\
+                           Status: Downloaded newer image for alpine:latest\n\
+                           Step 2/3 : RUN apk add curl\n \
+                           ---> Running in 4f1d2c3b4a59\n\
+                           fetch https://dl-cdn.alpinelinux.org/\n\
+                           warning: no cache\n";
+
+#[tokio::test]
+async fn build_packs_its_context_into_the_request_and_shows_the_steps() {
+    let (d, host, _dir) = daemon();
+    let context = tempfile::tempdir().unwrap();
+    let path = context.path().to_str().unwrap();
+    let args = [
+        "build",
+        "-t",
+        "app",
+        "--tag",
+        "app:1.0",
+        "--build-arg",
+        "V=1",
+        "--label",
+        "tier=web",
+        "--network",
+        "none",
+        "--pull",
+        path,
+    ];
+    let (code, stdout, stderr) = rustlet_packing(&host, &args, fake_packer()).await;
+    assert_eq!(code, 0, "{}", stderr.text());
+    let rest = " ---> Removed intermediate container 4f1d2c3b4a59\n \
+                ---> 9824c27679d3\n\
+                Step 3/3 : CMD [\"sh\"]\n\
+                Successfully built 3c4d5e6f7a8b\n\
+                Successfully tagged app:latest\n\
+                Successfully tagged app:1.0\n";
+    assert_eq!(stdout.text(), format!("{BUILD_STEPS}{rest}"));
+    assert_eq!(stderr.text(), "[Warning] One or more build-args [UNUSED] were not consumed\n");
+    // The options in the query, the packed context as the body.
+    let expected = BuildOptions {
+        tags: vec!["app".into(), "app:1.0".into()],
+        dockerfile: Some("Containerfile".into()),
+        build_args: [("V".to_owned(), "1".to_owned())].into(),
+        pull: PullPolicy::Always,
+        network: NetworkMode::None,
+        labels: [("tier".to_owned(), "web".to_owned())].into(),
+        ..BuildOptions::default()
+    };
+    assert_eq!(*d.builds.lock().unwrap(), [expected]);
+    let sent = format!("context {path} with {path}/Containerfile");
+    assert_eq!(*d.contexts.lock().unwrap(), [sent.into_bytes()]);
+
+    // -f names the Containerfile, from the current directory.
+    let (code, _, stderr) = rustlet_packing(&host, &["build", "-f", "../Dockerfile.dev", path], fake_packer()).await;
+    assert_eq!(code, 0, "{}", stderr.text());
+    assert_eq!(d.builds.lock().unwrap()[1].dockerfile.as_deref(), Some("Dockerfile.dev"));
+    assert_eq!(d.contexts.lock().unwrap()[1], format!("context {path} with ../Dockerfile.dev").into_bytes());
+}
+
+#[tokio::test]
+async fn build_quiet_prints_the_id_alone_and_the_rest_only_if_it_fails() {
+    let (_d, host, _dir) = daemon();
+    let context = tempfile::tempdir().unwrap();
+    let path = context.path().to_str().unwrap();
+    let (code, stdout, stderr) = rustlet_packing(&host, &["build", "-q", path], fake_packer()).await;
+    assert_eq!((code, stdout.text(), stderr.text()), (0, format!("{IMAGE_ID}\n"), String::new()));
+    // A failure: what was held back, then the daemon's message.
+    let (code, stdout, stderr) =
+        rustlet_packing(&host, &["build", "-q", "--target", "broken", path], fake_packer()).await;
+    assert_eq!((code, stdout.text().as_str()), (1, ""));
+    let error = "rustlet: error: The command '/bin/sh -c apk add curl' returned a non-zero code: 1\n";
+    assert_eq!(stderr.text(), format!("{BUILD_STEPS}{error}"));
+}
+
+#[tokio::test]
+async fn a_failed_step_ends_the_build_with_the_daemons_message_and_1() {
+    let (_d, host, _dir) = daemon();
+    let context = tempfile::tempdir().unwrap();
+    let args = ["build", "--target", "broken", context.path().to_str().unwrap()];
+    let (code, stdout, stderr) = rustlet_packing(&host, &args, fake_packer()).await;
+    assert_eq!(code, 1);
+    assert_eq!(stdout.text(), BUILD_STEPS);
+    assert_eq!(stderr.text(), "rustlet: error: The command '/bin/sh -c apk add curl' returned a non-zero code: 1\n");
+}
+
+#[tokio::test]
+async fn a_context_that_cant_be_packed_is_reported_by_the_file_that_failed() {
+    let (d, host, _dir) = daemon();
+    let context = tempfile::tempdir().unwrap();
+    // A first chunk goes out, then a file can't be read.
+    let unreadable = Packer {
+        pack: |context, _, out| {
+            let io = |source| ContextError::Io { path: context.to_owned(), source };
+            out.write_all(&[0; 100_000]).map_err(io)?;
+            Err(ContextError::Io { path: context.join("secret.key"), source: io::ErrorKind::PermissionDenied.into() })
+        },
+        ..fake_packer()
+    };
+    let (code, stdout, stderr) = rustlet_packing(&host, &["build", context.path().to_str().unwrap()], unreadable).await;
+    assert_eq!((code, stdout.text().as_str()), (125, ""));
+    let key = context.path().join("secret.key");
+    assert_eq!(
+        stderr.text(),
+        format!("rustlet: error: packing the build context: {}: permission denied\n", key.display())
+    );
+    // The daemon never took the cut-off body for a context.
+    assert!(d.builds.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn build_needs_a_directory_and_a_containerfile_before_any_request() {
+    let (d, host, _dir) = daemon();
+    let context = tempfile::tempdir().unwrap();
+    let path = context.path().to_str().unwrap();
+    let none = Packer { default_containerfile: |_| None, ..fake_packer() };
+    let (code, _, stderr) = rustlet_packing(&host, &["build", path], none).await;
+    assert_eq!(
+        (code, stderr.text()),
+        (125, format!("rustlet: error: no Containerfile or Dockerfile in {path} (-f names one)\n"))
+    );
+    let file = context.path().join("Containerfile");
+    std::fs::write(&file, "FROM alpine\n").unwrap();
+    let (code, _, stderr) = rustlet_packing(&host, &["build", file.to_str().unwrap()], fake_packer()).await;
+    assert_eq!(
+        (code, stderr.text()),
+        (125, format!("rustlet: error: build context {}: not a directory\n", file.display()))
+    );
+    for (args, says) in [
+        (&["build", "-"][..], "a build context on stdin (-) isn't supported"),
+        (&["build", "https://github.com/o/app.git"], "a remote build context"),
+        (&["build", "-f", "-", path], "a Containerfile on stdin (-f -) isn't supported"),
+        (&["build", "--network", "container:web", path], "--network container:web: a build's RUN steps"),
+    ] {
+        let (code, _, stderr) = rustlet_packing(&host, args, fake_packer()).await;
+        assert_eq!(code, 125, "{args:?}");
+        assert!(stderr.text().starts_with(&format!("rustlet: error: {says}")), "{args:?}: {}", stderr.text());
+    }
+    assert!(d.builds.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn builder_prune_asks_on_a_terminal_and_never_without_one() {
+    let (d, host, _dir) = daemon();
+    let pruned = "Deleted build cache objects:\nsha256:aaaa\nsha256:bbbb\n\nTotal reclaimed space: 7.812MB\n";
+    let (code, stdout, _) = rustlet(&host, &["builder", "prune", "-f"], b"").await;
+    assert_eq!((code, stdout.text().as_str()), (0, pruned));
+    // No terminal to ask on: refused without -f, even with a yes piped in.
+    let (code, stdout, stderr) = rustlet(&host, &["builder", "prune"], b"y\n").await;
+    assert_eq!((code, stdout.text().as_str()), (125, ""));
+    assert_eq!(
+        stderr.text(),
+        "rustlet: error: not removing the build cache without -f: stdin isn't a terminal to ask on\n"
+    );
+    // On a terminal, asked; anything but y is a no.
+    let question = "WARNING! This will remove all build cache. Are you sure you want to continue? [y/N] ";
+    for (answer, expected) in [(&b"n\n"[..], question.to_owned()), (b"y\n", format!("{question}{pruned}"))] {
+        let (mut terminal, stdout, _) = console(answer);
+        terminal.stdin_tty = true;
+        assert_eq!(rustlet_on(&host, &["builder", "prune"], terminal).await, 0);
+        assert_eq!(stdout.text(), expected);
+    }
+    assert_eq!(d.calls().iter().filter(|c| *c == "build prune").count(), 2);
+}
+
+#[tokio::test]
+async fn commit_sends_the_containers_changes_and_prints_the_new_images_id() {
+    let (d, host, _dir) = daemon();
+    let args = [
+        "commit",
+        "-a",
+        "Jane Doe <jane@example.com>",
+        "-m",
+        "with curl",
+        "-c",
+        "CMD [\"sh\"]",
+        "--change",
+        "ENV A=1",
+        "--pause=false",
+        "web",
+        "app:2",
+    ];
+    let (code, stdout, stderr) = rustlet(&host, &args, b"").await;
+    assert_eq!((code, stdout.text()), (0, format!("{IMAGE_ID}\n")), "{}", stderr.text());
+    // Paused by default; -p alone is true, -p=false isn't.
+    for args in [&["commit", "web"][..], &["commit", "-p", "web"], &["commit", "-p=false", "web"]] {
+        let (code, _, stderr) = rustlet(&host, args, b"").await;
+        assert_eq!(code, 0, "{args:?}: {}", stderr.text());
+    }
+    let web = |pause| CommitRequest { container: "web".into(), pause, ..CommitRequest::default() };
+    let first = CommitRequest {
+        container: "web".into(),
+        reference: Some("app:2".into()),
+        comment: Some("with curl".into()),
+        author: Some("Jane Doe <jane@example.com>".into()),
+        pause: false,
+        changes: vec!["CMD [\"sh\"]".into(), "ENV A=1".into()],
+    };
+    assert_eq!(*d.commits.lock().unwrap(), [first, web(true), web(true), web(false)]);
+    let (code, _, stderr) = rustlet(&host, &["commit", "gone"], b"").await;
+    assert_eq!((code, stderr.text().as_str()), (125, "rustlet: error: no such container: gone\n"));
+}
+
+#[tokio::test]
+async fn tag_names_an_image_quietly() {
+    let (d, host, _dir) = daemon();
+    let (code, stdout, stderr) = rustlet(&host, &["tag", "alpine", "registry.example/alpine:3"], b"").await;
+    assert_eq!((code, stdout.text().as_str(), stderr.text().as_str()), (0, "", ""));
+    let (code, _, stderr) = rustlet(&host, &["tag", "missing", "x"], b"").await;
+    assert_eq!((code, stderr.text().as_str()), (125, "rustlet: error: no such image: missing\n"));
+    assert_eq!(d.calls(), ["tag alpine registry.example/alpine:3", "tag missing x"]);
+}
+
+#[tokio::test]
+async fn save_writes_the_archive_to_a_file_or_a_pipe_never_to_a_terminal() {
+    let (d, host, dir) = daemon();
+    let out = dir.path().join("images.tar");
+    let (code, stdout, stderr) = rustlet(&host, &["save", "-o", out.to_str().unwrap(), "alpine", "app:1.0"], b"").await;
+    assert_eq!((code, stdout.text().as_str(), stderr.text().as_str()), (0, "", ""));
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "archive of alpine, app:1.0");
+    // Onto stdout, which is a pipe here.
+    let (code, stdout, _) = rustlet(&host, &["save", "alpine"], b"").await;
+    assert_eq!((code, stdout.text().as_str()), (0, "archive of alpine"));
+    // Onto a terminal: refused before the daemon is asked.
+    let (mut terminal, stdout, stderr) = console(b"");
+    terminal.stdout_tty = true;
+    assert_eq!(rustlet_on(&host, &["save", "alpine"], terminal).await, 125);
+    assert_eq!(stdout.text(), "");
+    assert_eq!(stderr.text(), "rustlet: error: refusing to write an archive to a terminal; use -o or redirect\n");
+    assert_eq!(d.calls().iter().filter(|c| c.starts_with("save")).count(), 2);
+}
+
+#[tokio::test]
+async fn a_failed_save_leaves_no_partial_archive_and_an_old_one_as_it_was() {
+    let (_d, host, dir) = daemon();
+    let out = dir.path().join("images.tar");
+    std::fs::write(&out, "the old archive").unwrap();
+    let (code, _, stderr) = rustlet(&host, &["save", "-o", out.to_str().unwrap(), "alpine", "broken"], b"").await;
+    assert_eq!(code, 125);
+    let stderr = stderr.text();
+    assert!(stderr.starts_with(&format!("rustlet: error: -o {}: ", out.display())), "{stderr}");
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "the old archive");
+    // Refused by the daemon: no file at all.
+    let new = dir.path().join("new.tar");
+    let (code, _, stderr) = rustlet(&host, &["save", "-o", new.to_str().unwrap(), "missing"], b"").await;
+    assert_eq!((code, stderr.text().as_str()), (125, "rustlet: error: no such image: missing\n"));
+    let mut left: Vec<String> =
+        std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    left.sort();
+    assert_eq!(left, ["images.tar", "rustlet.sock"]);
+}
+
+#[tokio::test]
+async fn load_sends_the_archive_and_says_what_it_loaded() {
+    let (d, host, dir) = daemon();
+    let archive = dir.path().join("images.tar");
+    std::fs::write(&archive, "an archive").unwrap();
+    let loaded = format!("Loaded image: app:1.0\nLoaded image ID: {UNNAMED_ID}\n");
+    let (code, stdout, stderr) = rustlet(&host, &["load", "-i", archive.to_str().unwrap()], b"").await;
+    assert_eq!((code, stdout.text()), (0, loaded.clone()), "{}", stderr.text());
+    let (code, stdout, _) = rustlet(&host, &["load"], b"piped in").await;
+    assert_eq!((code, stdout.text()), (0, loaded.clone()));
+    // On a terminal, a line per blob first, unless -q.
+    let (mut terminal, stdout, _) = console(b"from a pipe");
+    terminal.stdout_tty = true;
+    assert_eq!(rustlet_on(&host, &["load"], terminal).await, 0);
+    assert_eq!(stdout.text(), format!("9824c27679d3: Loaded 3MB\n3c4d5e6f7a8b: Already exists\n{loaded}"));
+    let (mut terminal, stdout, _) = console(b"from a pipe");
+    terminal.stdout_tty = true;
+    assert_eq!(rustlet_on(&host, &["load", "--quiet"], terminal).await, 0);
+    assert_eq!(stdout.text(), loaded);
+    let bodies = ["an archive", "piped in", "from a pipe", "from a pipe"].map(|s| s.as_bytes().to_vec());
+    assert_eq!(*d.loads.lock().unwrap(), bodies);
+
+    // Not from a terminal, nor from a file that isn't there.
+    let (mut terminal, _, stderr) = console(b"");
+    terminal.stdin_tty = true;
+    assert_eq!(rustlet_on(&host, &["load"], terminal).await, 125);
+    let stderr = stderr.text();
+    assert!(stderr.starts_with("rustlet: error: requested load from stdin, but stdin is a terminal"), "{stderr}");
+    let (code, _, stderr) = rustlet(&host, &["load", "-i", "/nonexistent/images.tar"], b"").await;
+    assert_eq!(code, 125);
+    assert!(stderr.text().starts_with("rustlet: error: -i /nonexistent/images.tar: "), "{}", stderr.text());
+    assert_eq!(d.loads.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn health_flags_reach_the_daemon_and_conflicting_ones_dont() {
+    let (d, host, _dir) = daemon();
+    let args =
+        ["create", "--health-cmd", "wget -qO- localhost", "--health-interval=10s", "--health-retries", "2", "nginx"];
+    let (code, _, stderr) = rustlet(&host, &args, b"").await;
+    assert_eq!(code, 0, "{}", stderr.text());
+    let (code, _, stderr) = rustlet(&host, &["run", "-d", "--no-healthcheck", "nginx"], b"").await;
+    assert_eq!(code, 0, "{}", stderr.text());
+    let (code, _, stderr) =
+        rustlet(&host, &["run", "-d", "--no-healthcheck", "--health-timeout", "1s", "nginx"], b"").await;
+    assert_eq!(
+        (code, stderr.text().as_str()),
+        (
+            125,
+            "rustlet: error: conflicting options: --no-healthcheck and --health-timeout (no healthcheck runs to \
+             take options)\n"
+        )
+    );
+    let checks: Vec<Option<HealthConfig>> = d.configs.lock().unwrap().iter().map(|c| c.healthcheck.clone()).collect();
+    let probe = HealthConfig {
+        test: vec!["CMD-SHELL".into(), "wget -qO- localhost".into()],
+        interval: Some(10_000_000_000),
+        retries: Some(2),
+        ..HealthConfig::default()
+    };
+    let off = HealthConfig { test: vec!["NONE".into()], ..HealthConfig::default() };
+    assert_eq!(checks, [Some(probe), Some(off)]);
+}
+
+#[test]
+fn compose_takes_files_project_and_profiles_before_its_command() {
+    let argv = [
+        "compose",
+        "-f",
+        "compose.yaml",
+        "--file",
+        "compose.dev.yaml",
+        "-p",
+        "hits",
+        "--project-directory",
+        "/srv/hits",
+        "--profile",
+        "debug",
+        "--profile",
+        "tools",
+        "up",
+        "-d",
+        "--build",
+        "--force-recreate",
+        "--remove-orphans",
+        "-t",
+        "3",
+        "web",
+        "worker",
+    ];
+    let Command::Compose(c) = parse(&argv).command else { panic!() };
+    assert_eq!(c.files, [PathBuf::from("compose.yaml"), PathBuf::from("compose.dev.yaml")]);
+    assert_eq!(c.project_name.as_deref(), Some("hits"));
+    assert_eq!(c.project_directory, Some(PathBuf::from("/srv/hits")));
+    assert_eq!(c.profile, ["debug", "tools"]);
+    let ComposeCommand::Up(up) = c.command else { panic!() };
+    assert!(up.detach && up.build && up.force_recreate && up.remove_orphans);
+    assert!(!up.no_build && !up.no_recreate && !up.no_color);
+    assert_eq!((up.timeout, up.services.as_slice()), (Some(3), &["web".to_owned(), "worker".to_owned()][..]));
+
+    // A command's own -f is its own: `logs -f` follows.
+    let Command::Compose(c) =
+        parse(&["compose", "-f", "x.yaml", "logs", "-f", "-n", "5", "-t", "--no-color", "web"]).command
+    else {
+        panic!()
+    };
+    assert_eq!(c.files, [PathBuf::from("x.yaml")]);
+    let ComposeCommand::Logs(logs) = c.command else { panic!() };
+    assert!(logs.follow && logs.timestamps && logs.no_color);
+    assert_eq!((logs.tail.as_str(), logs.services.as_slice()), ("5", &["web".to_owned()][..]));
+
+    let Command::Compose(c) =
+        parse(&["compose", "-p", "hits", "down", "-v", "--rmi", "local", "--remove-orphans", "-t", "1"]).command
+    else {
+        panic!()
+    };
+    let ComposeCommand::Down(down) = c.command else { panic!() };
+    assert!(down.volumes && down.remove_orphans);
+    assert_eq!((down.rmi, down.timeout), (Some(Rmi::Local), Some(1)));
+
+    let compose = |args: &[&str]| match parse(&[&["compose"][..], args].concat()).command {
+        Command::Compose(c) => c.command,
+        _ => panic!(),
+    };
+    assert!(
+        matches!(compose(&["ps", "-a", "-q", "web"]), ComposeCommand::Ps { all: true, quiet: true, services } if services == ["web"])
+    );
+    assert!(
+        matches!(compose(&["build", "--no-cache"]), ComposeCommand::Build { no_cache: true, services } if services.is_empty())
+    );
+    assert!(matches!(compose(&["stop", "-t", "0", "db"]), ComposeCommand::Stop { timeout: Some(0), .. }));
+    assert!(matches!(compose(&["start", "db"]), ComposeCommand::Start { services } if services == ["db"]));
+    assert!(matches!(compose(&["ls", "--all"]), ComposeCommand::Ls { all: true }));
+    assert!(matches!(compose(&["config", "--services"]), ComposeCommand::Config { services: true }));
+    assert!(matches!(compose(&["down"]), ComposeCommand::Down(d) if d.rmi.is_none() && !d.volumes));
+
+    // What can't go together, or isn't a value, is a bad command line.
+    for bad in [
+        &["compose", "up", "--build", "--no-build"][..],
+        &["compose", "up", "--force-recreate", "--no-recreate"],
+        &["compose", "down", "--rmi", "some"],
+        &["compose", "logs", "-n"],
+        &["compose"],
+    ] {
+        assert!(Cli::try_parse_from(std::iter::once("rustlet").chain(bad.iter().copied())).is_err(), "{bad:?}");
+    }
 }
 
 /// The terminal path, which needs a real terminal: raw mode, the size sent
