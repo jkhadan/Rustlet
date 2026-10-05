@@ -31,22 +31,68 @@ pub fn recv_fds(sock: BorrowedFd<'_>, buf: &mut [u8], max_fds: usize) -> Result<
         return Err(Errno::EINVAL);
     }
     let mut iov = [IoSliceMut::new(buf)];
-    let msg = recvmsg::<()>(sock.as_raw_fd(), &mut iov, Some(&mut space), MsgFlags::MSG_CMSG_CLOEXEC)?;
-    let mut fds = Vec::new();
-    for c in msg.cmsgs()? {
-        if let ControlMessageOwned::ScmRights(list) = c {
-            for fd in list {
-                // SAFETY: the kernel installed these descriptors in our
-                // table for this message; nothing else owns them yet.
-                fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
+    let (n, received) = {
+        let msg = recvmsg::<()>(sock.as_raw_fd(), &mut iov, Some(&mut space), MsgFlags::MSG_CMSG_CLOEXEC)?;
+        let received = msg.cmsgs().map(|messages| {
+            let mut fds = Vec::new();
+            for c in messages {
+                if let ControlMessageOwned::ScmRights(list) = c {
+                    for fd in list {
+                        // SAFETY: the kernel installed these descriptors in our
+                        // table for this message; nothing else owns them yet.
+                        fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
+                    }
+                }
             }
+            fds
+        });
+        (msg.bytes, received)
+    };
+    let mut fds = match received {
+        Ok(fds) => fds,
+        Err(e) => {
+            // nix refuses to iterate a truncated control buffer, but Linux
+            // already installed the SCM_RIGHTS descriptors that fit in it.
+            // Close those before propagating the truncation error.
+            close_truncated_rights(&space);
+            return Err(e);
         }
-    }
-    let n = msg.bytes;
+    };
     if fds.len() > max_fds {
         fds.truncate(max_fds);
     }
     Ok((n, fds))
+}
+
+/// Discards descriptors from the complete portions of a Linux control
+/// buffer. The kernel shortens a truncated SCM_RIGHTS record's `cmsg_len`
+/// to include only the installed whole descriptor values. Unused bytes in
+/// our zero-initialized buffer have a zero length and end the walk.
+fn close_truncated_rights(mut control: &[u8]) {
+    let header_len = std::mem::size_of::<libc::cmsghdr>();
+    let alignment = std::mem::size_of::<usize>();
+    while control.len() >= header_len {
+        let length = usize::from_ne_bytes(control[..alignment].try_into().expect("a complete control header"));
+        if length < header_len || length > control.len() {
+            break;
+        }
+        let field = |offset| i32::from_ne_bytes(control[offset..offset + 4].try_into().expect("a complete field"));
+        let level = field(std::mem::offset_of!(libc::cmsghdr, cmsg_level));
+        let kind = field(std::mem::offset_of!(libc::cmsghdr, cmsg_type));
+        if level == libc::SOL_SOCKET && kind == libc::SCM_RIGHTS {
+            for bytes in control[header_len..length].chunks_exact(std::mem::size_of::<RawFd>()) {
+                let fd = RawFd::from_ne_bytes(bytes.try_into().expect("a whole received descriptor"));
+                // SAFETY: these complete SCM_RIGHTS values were written by
+                // recvmsg and refer to descriptors the kernel installed.
+                // nix returned before decoding any of them, so none has an
+                // owner yet; dropping the new owner closes each one once.
+                drop(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+        }
+        let Some(next) = length.checked_add(alignment - 1).map(|n| n & !(alignment - 1)) else { break };
+        let Some(rest) = control.get(next..) else { break };
+        control = rest;
+    }
 }
 
 /// Peer credentials of a connected Unix socket (`SO_PEERCRED`).
@@ -61,6 +107,27 @@ mod tests {
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
     use std::io::{Read, Seek, Write};
     use std::os::fd::AsFd;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn truncated_rights_do_not_leak_received_descriptors() {
+        let (a, b) = socketpair(AddressFamily::Unix, SockType::Stream, None, SockFlag::SOCK_CLOEXEC).unwrap();
+        let file = tempfile::tempfile().unwrap();
+        let identity = file.metadata().unwrap();
+        let copies = || {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|entry| std::fs::metadata(entry.ok()?.path()).ok())
+                .filter(|meta| meta.dev() == identity.dev() && meta.ino() == identity.ino())
+                .count()
+        };
+        let before = copies();
+        let descriptors = vec![file.as_fd(); 9];
+        send_fds(a.as_fd(), b"x", &descriptors).unwrap();
+        let mut buf = [0u8; 1];
+        assert_eq!(recv_fds(b.as_fd(), &mut buf, 1).unwrap_err(), Errno::ENOBUFS);
+        assert_eq!(copies(), before, "truncated SCM_RIGHTS leaked descriptors for the sent file");
+    }
 
     #[test]
     fn fd_round_trip() {
