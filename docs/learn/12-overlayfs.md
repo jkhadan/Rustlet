@@ -228,9 +228,10 @@ reads `index=N`, `metacopy=N`, `redirect_dir=N` and
 `redirect_always_follow=Y`. The last makes `redirect_dir=off` mean
 "create none, but follow one if found". Rustlets asks for `nofollow`:
 create none and follow none. No layer should hold a redirect, since
-unpacking drops every `trusted.overlay.*` and `user.overlay.*` attribute
-(§5); with `nofollow` the mount itself would ignore one anyway, a second
-barrier rather than a single one.
+unpacking drops the rootful overlay's `trusted.overlay.*` attributes
+(§5). Attributes in the inactive `user.overlay.*` namespace stay ordinary
+image data. With `nofollow` the mount itself would ignore a redirect
+anyway, a second barrier rather than a single one.
 
 ## 4. Copy-up
 
@@ -787,8 +788,9 @@ options, all in one container.
 - **Overlay's bookkeeping.** Besides `work/` (§5), upper collects
   attributes: `trusted.overlay.uuid` on its root (`uuid=on`), `origin` on
   copied-up entries, `impure` on directories holding them. They hold no
-  content, and a diff must skip them. An unprivileged overlay shows them
-  as `user.overlay.*`.
+  content, and a diff must skip the namespace the overlay actually uses.
+  With `userxattr` that is `user.overlay.*`; the rootful daemon uses
+  `trusted.overlay.*`.
 - **Cleaning up.** image-run deletes `containers/<id>` when the container
   exits; `--keep` only unmounts. `cargo xtask images prune-containers`
   deletes what `--keep` left, skipping any directory with a mount below

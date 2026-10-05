@@ -195,24 +195,26 @@ fn invalid(text: &str, why: &str) -> String {
     format!("invalid interpolation format in {text:?}: {why} (a literal $ is written $$)")
 }
 
-/// The index of the `}` that closes a `${`, `s` starting after it; `${`
-/// inside opens another level, `$$` is an escaped `$`.
+/// The index of the `}` that closes a `${`, `s` starting after it. Every `{`
+/// opens a level, `${` or not, as compose-go counts them (its
+/// `getFirstBraceClosingIndex`): a default may hold braces of its own
+/// (`${JSON:-{"a":1}}`), and when the variable is set, all of it is skipped.
+/// `$$` is an escaped `$`. Without a `}` that balances them (`${V:-{}`), the
+/// first `}` closes, as it always did.
 fn closing_brace(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut depth = 1;
+    let mut first = None;
     let mut i = 0;
     while i < bytes.len() {
-        match (bytes[i], bytes.get(i + 1)) {
-            (b'$', Some(b'{')) => {
-                depth += 1;
+        match bytes[i] {
+            b'$' if bytes.get(i + 1) == Some(&b'$') => {
                 i += 2;
                 continue;
             }
-            (b'$', Some(b'$')) => {
-                i += 2;
-                continue;
-            }
-            (b'}', _) => {
+            b'{' => depth += 1,
+            b'}' => {
+                first.get_or_insert(i);
                 depth -= 1;
                 if depth == 0 {
                     return Some(i);
@@ -222,7 +224,7 @@ fn closing_brace(s: &str) -> Option<usize> {
         }
         i += 1;
     }
-    None
+    first
 }
 
 /// The length of the variable name `s` starts with: `[A-Za-z_][A-Za-z0-9_]*`.
@@ -239,15 +241,20 @@ fn note(unset: &mut Vec<String>, name: &str) {
     }
 }
 
-/// Parses a `.env` file (and `env_file:`'s files), as Compose does:
+/// Parses a `.env` file (and `env_file:`'s files), as Compose does (its
+/// `dotenv` package, whose own test cases this follows):
 ///
+/// - a UTF-8 byte-order mark at the start is skipped (Windows editors add
+///   one);
 /// - `KEY=VALUE` lines (`KEY: VALUE` too), optionally `export KEY=VALUE`;
 ///   blank lines and lines starting with `#` are skipped;
 /// - an unquoted value ends at its line's end or at a ` #` comment, its
 ///   surrounding blanks dropped, its variables substituted;
-/// - `'single quotes'`: literal, and may span lines;
-/// - `"double quotes"`: the escapes `\n`, `\r`, `\t`, `\"`, `\\` and `\$`
-///   (a literal `$`), variables substituted, and may span lines;
+/// - `'single quotes'`: literal (a backslash before the quote makes it part
+///   of the value: `'it\'s'`), and may span lines;
+/// - `"double quotes"`: the escapes `\a`, `\b`, `\f`, `\n`, `\r`, `\t`, `\v`,
+///   the octal `\0NNN`, `\"`, `\\` and `\$` (a literal `$`), variables
+///   substituted, and may span lines; any other backslash stays as written;
 /// - a line with only `KEY`: `None`, for the caller to look up (an
 ///   `env_file` entry takes the environment's value, or is left out).
 ///
@@ -258,10 +265,20 @@ pub fn parse_dotenv(
     text: &str,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Vec<(String, Option<String>)>, String> {
+    parse_dotenv_with_base(text, lookup, &BTreeMap::new())
+}
+
+/// Parses another env file with earlier files available for interpolation.
+pub(crate) fn parse_dotenv_with_base(
+    text: &str,
+    lookup: &dyn Fn(&str) -> Option<String>,
+    base: &BTreeMap<String, String>,
+) -> Result<Vec<(String, Option<String>)>, String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let chars: Vec<char> = text.chars().collect();
     let mut p = Parser { chars: &chars, i: 0, line: 1 };
     let mut entries: Vec<(String, Option<String>)> = Vec::new();
-    let mut defined: BTreeMap<String, String> = BTreeMap::new();
+    let mut defined = base.clone();
     loop {
         // Blank lines and comments.
         match p.peek() {
@@ -293,6 +310,14 @@ pub fn parse_dotenv(
         p.skip_blanks();
         match p.peek() {
             None | Some('\n' | '#') => {
+                match lookup(&key) {
+                    Some(value) => {
+                        defined.insert(key.clone(), value);
+                    }
+                    None => {
+                        defined.remove(&key);
+                    }
+                }
                 entries.push((key, None));
                 p.skip_line();
                 continue;
@@ -396,9 +421,13 @@ impl Parser<'_> {
         s
     }
 
-    /// A quoted value's text, up to its closing `quote` (consumed). In
-    /// double quotes, escapes are translated; `\$` becomes `$$`, which
-    /// substitution then turns into a literal `$`.
+    /// A quoted value's text, up to its closing `quote` (consumed). A
+    /// backslash before the quote makes the quote part of the value, in both
+    /// kinds of quotes (compose-go's rule). In double quotes, escapes are
+    /// translated ([`Parser::escape`]); `\$` becomes `$$`, which substitution
+    /// then turns into a literal `$`. In single quotes, everything else is
+    /// literal, a pair of backslashes staying a pair (so `'a\\'` ends after
+    /// them).
     fn until_quote(&mut self, quote: char, line: usize) -> Result<String, String> {
         let mut s = String::new();
         loop {
@@ -406,28 +435,63 @@ impl Parser<'_> {
                 return Err(format!("line {line}: the value's {quote} quote is never closed"));
             };
             self.bump();
-            match c {
-                c if c == quote => return Ok(s),
-                '\\' if quote == '"' => {
-                    let Some(next) = self.peek() else { continue };
-                    let escaped = match next {
-                        'n' => "\n",
-                        'r' => "\r",
-                        't' => "\t",
-                        '"' => "\"",
-                        '\\' => "\\",
-                        '$' => "$$",
-                        _ => {
-                            s.push('\\');
-                            continue;
-                        }
-                    };
-                    s.push_str(escaped);
+            if c == quote {
+                return Ok(s);
+            }
+            if c != '\\' {
+                s.push(c);
+                continue;
+            }
+            // A backslash at the very end: the next round says the quote is never closed.
+            let Some(next) = self.peek() else { continue };
+            if next == quote {
+                s.push(quote);
+                self.bump();
+            } else if quote == '\'' {
+                s.push('\\');
+                if next == '\\' {
+                    s.push('\\');
                     self.bump();
                 }
-                c => s.push(c),
+            } else if let Some((escaped, taken)) = self.escape() {
+                s.push_str(&escaped);
+                self.i += taken;
+            } else {
+                s.push('\\');
             }
         }
+    }
+
+    /// What the backslash just read means in double quotes, from the
+    /// character after it: the text it stands for, and how many characters
+    /// that took. The shell's escapes, as compose-go's `escapeSeqRegex` has
+    /// them: `\a \b \f \n \r \t \v`, `\0` and three octal digits (`\0123` is
+    /// `S`), `\"`, `\\`, and `\$`, which is written `$$` for the
+    /// substitution that follows. Anything else (`\x07`, `ዤ`, `\ `) is
+    /// not an escape here.
+    fn escape(&self) -> Option<(String, usize)> {
+        let simple = match self.peek()? {
+            'a' => '\u{7}',
+            'b' => '\u{8}',
+            'f' => '\u{c}',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'v' => '\u{b}',
+            '"' => '"',
+            '\\' => '\\',
+            '$' => return Some(("$$".to_owned(), 1)),
+            '0' => {
+                let digits: String = self.chars[self.i + 1..].iter().take(3).collect();
+                if digits.len() != 3 || !digits.chars().all(|d| ('0'..='7').contains(&d)) {
+                    return None;
+                }
+                let value = u32::from_str_radix(&digits, 8).ok().filter(|v| *v <= 0o377)?;
+                return Some((char::from_u32(value)?.to_string(), 4));
+            }
+            _ => return None,
+        };
+        Some((simple.to_string(), 1))
     }
 
     /// After a quoted value: only blanks or a comment to the line's end.
@@ -517,8 +581,113 @@ mod tests {
     fn defaults_nest() {
         assert_eq!(sub("${NOPE:-${HOST}:${TAG}}"), "db:1.27");
         assert_eq!(sub("${NOPE:-${ALSO_NOT:-deep}}"), "deep");
-        assert_eq!(sub("${NOPE:-{literal}}"), "{literal}", "a plain {{ opens no level: the first }} closes");
+        assert_eq!(sub("${NOPE:-{literal}}"), "{literal}", "a plain {{ opens a level too: the last }} closes");
         assert_eq!(sub("x${NOPE:-a}y${TAG}z"), "xay1.27z");
+    }
+
+    /// compose-go's template tests (`TestValueWithCurlyBracesDefault`,
+    /// `TestNoValueWithCurlyBracesDefault`): a default may hold braces, and
+    /// when the variable is set, all of the default is skipped, whatever it
+    /// holds.
+    #[test]
+    fn a_default_holding_braces_is_one_default() {
+        let json = |name: &str| match name {
+            "JSON" => Some(r#"{"json":2}"#.to_owned()),
+            "Y" => Some("why".to_owned()),
+            _ => None,
+        };
+        let sub = |text: &str| substitute(text, &json).unwrap().value;
+        assert_eq!(sub(r#"ok ${JSON:-{"json":1}}"#), r#"ok {"json":2}"#);
+        assert_eq!(sub(r#"ok ${JSON-{"json":1}}"#), r#"ok {"json":2}"#);
+        assert_eq!(sub(r#"ok ${MISSING:-{"json":1}}"#), r#"ok {"json":1}"#);
+        assert_eq!(sub(r#"ok ${MISSING-{"json":1}}"#), r#"ok {"json":1}"#);
+        assert_eq!(sub("ok ${JSON:+x{y}z}"), "ok x{y}z");
+        assert_eq!(sub(r#"${MISSING:-{"a":{"b":"${Y}"}}} and ${Y}"#), r#"{"a":{"b":"why"}} and why"#);
+        assert_eq!(sub(r#"${JSON:-{"a":{"b":"${Y}"}}} and ${Y}"#), r#"{"json":2} and why"#);
+        // An escaped `$` before a brace is text, and the brace still counts.
+        assert_eq!(sub("${MISSING:-$${x}}"), "${x}");
+        // No `}` balances the `{`: the first one closes, as it always did.
+        assert_eq!(sub("${MISSING:-{}"), "{");
+        assert_eq!(sub("${JSON:-{}"), r#"{"json":2}"#);
+        // A `${` whose own `}` is missing is still an error.
+        assert!(substitute("a ${MISSING:-${Y}", &json).is_err());
+    }
+
+    /// compose-go's own cases (template/template_test.go): nesting, which of
+    /// `-`, `:-`, `+`, `:+`, `?` an expression is by the one that comes
+    /// first (`${V?bar-baz}` is a `?`), and what a stray `$` is.
+    #[test]
+    fn template_cases_from_compose_go() {
+        let go = |name: &str| match name {
+            "FOO" => Some("first".to_owned()),
+            "BAR" => Some(String::new()),
+            "JSON" => Some(r#"{"json":2}"#.to_owned()),
+            _ => None,
+        };
+        let cases: &[(&str, &str)] = &[
+            ("ok ${missing:-{\"json\":1}}", "ok {\"json\":1}"),
+            ("ok ${missing-{\"json\":1}}", "ok {\"json\":1}"),
+            ("${A:+${A},}B", "B"),
+            ("+ok ${UNSET:-${BAR-defaultValue}}", "+ok "),
+            (":?ok ${BAR:-defaultValue}", ":?ok defaultValue"),
+            ("ok ${BAR+$FOO ${FOO:+second}}", "ok first second"),
+            ("ok ${UNSET_VAR-${FOO} ${FOO}}", "ok first first"),
+            ("${UNSET_VAR-myerror?msg}", "myerror?msg"),
+            ("${FOO?bar-baz}", "first"),
+            ("ok ${BAR:-/non:-alphanumeric}", "ok /non:-alphanumeric"),
+            ("$}", "$}"),
+            ("^REGEX$", "^REGEX$"),
+            ("a $ string", "a $ string"),
+            ("$FOO-bar", "first-bar"),
+            ("ok ${SUBDOMAIN:-redis}.${FOO:?}", "ok redis.first"),
+        ];
+        for (template, expected) in cases {
+            assert_eq!(substitute(template, &go).unwrap().value, *expected, "{template}");
+        }
+        let e = substitute("${UNSET_VAR?bar-baz}", &go).unwrap_err();
+        assert_eq!(e, "required variable UNSET_VAR is missing a value: bar-baz");
+        // A default is substituted only when it is used: no warning for what isn't.
+        assert!(substitute("${A:+${A},}B", &go).unwrap().unset.is_empty());
+        assert_eq!(substitute("${A:-${B}}", &go).unwrap().unset, ["B"]);
+        for invalid in ["${", "${}", "${ }", "${ foo}", "${foo }", "${foo!}"] {
+            assert!(substitute(invalid, &go).is_err(), "{invalid}");
+        }
+    }
+
+    /// compose-go's own cases (dotenv/godotenv_test.go `TestParsing` and
+    /// `TestExpanding`), the ones the other tests here don't spell out.
+    #[test]
+    fn dotenv_cases_from_compose_go() {
+        let one = |text: &str| dotenv(text).remove(0).1.unwrap();
+        let cases: &[(&str, &str)] = &[
+            ("FOO =bar", "bar"),
+            ("FOO= bar", "bar"),
+            ("FOO=bar #", "bar"),
+            ("FOO=bar #this is foo", "bar"),
+            ("FOO=123#not-an-inline-comment", "123#not-an-inline-comment"),
+            ("FOO=\"bar#baz\"#", "bar#baz"),
+            ("FOO='bar#baz' # comment", "bar#baz"),
+            ("FOO=\"bar#baz#bang\" # comment", "bar#baz#bang"),
+            ("export\tOPTION_A=2", "2"),
+            ("  export OPTION_A=2", "2"),
+            ("export OPTION_A=\"export A\"", "export A"),
+            ("export OPTION_B='\\n'", "\\n"),
+            ("OPTION_A: Foo=bar", "Foo=bar"),
+            ("OPTION_A=1:B", "1:B"),
+            ("FOO=foobar=", "foobar="),
+            ("FOO=a\\tb", "a\\tb"),
+            ("FOO=\"a\\tb\"", "a\tb"),
+            ("FOO=\"bar\\nbaz\\\\\"", "bar\nbaz\\"),
+            ("FOO=\"foo\\${BAR}\"", "foo${BAR}"),
+            ("FOO=\"quote $TAG\"", "quote 1.27"),
+            ("FOO='quote $TAG'", "quote $TAG"),
+            ("FOO=\"foo\\$BAR\"", "foo$BAR"),
+            ("TEST_URLS=\"stratum+tcp://a:3333\nstratum+tcp://a:443\"", "stratum+tcp://a:3333\nstratum+tcp://a:443"),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(one(text), *expected, "{text:?}");
+        }
+        assert!(parse_dotenv("lol$wut", &vars).is_err(), "a line that isn't KEY=VALUE");
     }
 
     #[test]
@@ -598,6 +767,50 @@ mod tests {
                 ("U", "\\n"),
             ])
         );
+    }
+
+    /// compose-go dotenv/godotenv.go: "seek past the UTF-8 BOM if it exists
+    /// (particularly on Windows, some editors tend to add it, and it'll cause
+    /// parsing to fail)"; its `TestUTF8BOM`.
+    #[test]
+    fn dotenv_skips_a_utf8_byte_order_mark() {
+        assert_eq!(dotenv("\u{feff}TAG=1.27\nPORT=8080\n"), pairs(&[("TAG", "1.27"), ("PORT", "8080")]));
+        assert_eq!(dotenv("\u{feff}# comment\nA=1\n"), pairs(&[("A", "1")]));
+        assert!(dotenv("\u{feff}").is_empty());
+    }
+
+    /// compose-go dotenv/parser.go: "skip escaped quote symbol (\" or \',
+    /// depends on quote)"; `TestUnterminatedQuotes`.
+    #[test]
+    fn dotenv_single_quotes_take_an_escaped_quote() {
+        assert_eq!(dotenv("A='it\\'s here'\n"), pairs(&[("A", "it's here")]));
+        // Any other backslash is literal, and a pair stays a pair.
+        assert_eq!(dotenv("B='C:\\path\\n'\n"), pairs(&[("B", "C:\\path\\n")]));
+        assert_eq!(dotenv("C='a\\\\' # comment\n"), pairs(&[("C", "a\\\\")]));
+        // In double quotes the escaped quote was always there.
+        assert_eq!(dotenv("D=\"say \\\"hi\\\"\"\n"), pairs(&[("D", "say \"hi\"")]));
+        for open in ["KEY='value\\'", "KEY='", "KEY=\"value\\\"", "KEY='value\""] {
+            let e = parse_dotenv(open, &vars).unwrap_err();
+            assert!(e.contains("never closed"), "{open}: {e}");
+        }
+    }
+
+    /// compose-go dotenv/parser.go `escapeSeqRegex` and `TestParsing`: the
+    /// shell's escapes in double quotes, `\0` and three octal digits among
+    /// them; the rest (`\x07`, `\u12e4`) is not an escape.
+    #[test]
+    fn dotenv_double_quotes_take_the_shell_escapes() {
+        let one = |text: &str| dotenv(text).remove(0).1.unwrap();
+        assert_eq!(one("K=\"Z\\aZ\\bZ\\fZ\\nZ\\rZ\\tZ\\vZ\\\\Z\\0123Z\""), "Z\u{7}Z\u{8}Z\u{c}Z\nZ\rZ\tZ\u{b}Z\\ZSZ");
+        assert_eq!(one("K=\"\\0123\""), "S");
+        assert_eq!(one("K=\"\\0377\""), "\u{ff}");
+        assert_eq!(one("K=\"\\0000\""), "\0");
+        // Not three octal digits, or too big for a byte: as written.
+        for same in ["\\0", "\\01", "\\012", "\\0128", "\\0400", "\\x07", "\\u12e4", "\\U00101234", "\\ b", "\\c"] {
+            assert_eq!(one(&format!("K=\"{same}\"")), same, "{same}");
+        }
+        // Variables are substituted after the escapes: `\$` stays a dollar.
+        assert_eq!(one("K=\"\\$TAG ${TAG}\\0101\""), "$TAG 1.27A");
     }
 
     #[test]

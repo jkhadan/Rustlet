@@ -28,6 +28,15 @@ const h = vi.hoisted(() => {
   return { handlers, calls, Channel, invoke };
 });
 vi.mock("@tauri-apps/api/core", () => ({ Channel: h.Channel, invoke: h.invoke }));
+const toasts = vi.hoisted(() => ({ warnings: [] as { message: string; description?: string }[] }));
+vi.mock("sonner", () => ({
+  toast: Object.assign(() => {}, {
+    success: () => {},
+    error: () => {},
+    warning: (message: string, options?: { description?: string }) =>
+      void toasts.warnings.push({ message, description: options?.description }),
+  }),
+}));
 
 import { StacksPage } from "./StacksPage";
 
@@ -85,6 +94,7 @@ function mount() {
 }
 
 beforeEach(() => {
+  toasts.warnings.length = 0;
   h.calls.length = 0;
   for (const k of Object.keys(h.handlers)) delete h.handlers[k];
   h.handlers.stack_list = () => [hits];
@@ -111,12 +121,25 @@ describe("stacks", () => {
   });
 
   it("take a project down, with its volumes when asked", async () => {
-    h.handlers.compose_down = () => undefined;
+    h.handlers.compose_down = () => [];
     mount();
     fireEvent.click(await screen.findByTestId("stack-down"));
     fireEvent.click(screen.getByLabelText(/Also remove its volumes/));
     fireEvent.click(screen.getByRole("button", { name: "Down" }));
     await waitFor(() => expect(args("compose_down")).toEqual([{ project: "hits", volumes: true }]));
+    expect(toasts.warnings).toEqual([]);
+  });
+
+  it("say what a down left because something else uses it", async () => {
+    // compose down's warnings: not a failure, but a volume still in use
+    // stays, and "Down and its volumes" mustn't read as having removed it.
+    h.handlers.compose_down = () => ["volume hits_data is still in use, so it stays: in use by container x"];
+    mount();
+    fireEvent.click(await screen.findByTestId("stack-down"));
+    fireEvent.click(screen.getByRole("button", { name: "Down" }));
+    await waitFor(() => expect(toasts.warnings).toHaveLength(1));
+    expect(toasts.warnings[0].message).toBe("hits is down, but not all of it");
+    expect(toasts.warnings[0].description).toContain("volume hits_data is still in use");
   });
 
   it("come up again from the files their labels name, under their name and in their directory", async () => {

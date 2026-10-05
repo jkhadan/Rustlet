@@ -3,7 +3,7 @@
 // container's `commit`, and an image `tag` if it was named).
 
 import { GitCommitHorizontal } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useNavigate } from "react-router";
 import { toast } from "sonner";
 
@@ -43,7 +43,13 @@ export function CommitDialog({
     onOpenChange(false);
   };
 
+  // One commit at a time: Enter in a field submits the form while the
+  // button is already disabled, and a second commit makes a second image,
+  // moving the name to it and leaving the first unnamed.
+  const committing = useRef(false);
   const submit = async () => {
+    if (committing.current) return;
+    committing.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -61,6 +67,7 @@ export function CommitDialog({
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
+      committing.current = false;
       setBusy(false);
     }
   };

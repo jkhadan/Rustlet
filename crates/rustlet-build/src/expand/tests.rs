@@ -202,3 +202,32 @@ fn empty_expansions_and_empty_quotes_make_no_word() {
     assert_eq!(ws("''"), Vec::<String>::new());
     assert_eq!(ws("x$UNSET"), ["x"]);
 }
+
+// Run in a child: a regression must not abort the whole test runner.
+#[test]
+fn deeply_nested_expansion_returns_an_error_without_aborting() {
+    const CHILD: &str = "REVIEW_DEEP_EXPANSION_CHILD";
+    const NAME: &str = "expand::tests::deeply_nested_expansion_returns_an_error_without_aborting";
+    if std::env::var_os(CHILD).is_some() {
+        let input = format!("{}x{}", "${A:-".repeat(20_000), "}".repeat(20_000));
+        let worker = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || crate::expand::word(&input, '\\', &|_| None).map(|s| s.len()).map_err(|e| e.0.len()))
+            .unwrap();
+        let result = worker.join().unwrap();
+        assert!(result.is_err(), "deep expansion must be refused");
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([NAME, "--exact", "--test-threads=1", "--nocapture"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "expanding 20 000 nested ${{A:-…}} ended the process: {} ({})",
+        output.status,
+        stderr.lines().find(|l| l.contains("overflow")).unwrap_or("")
+    );
+}

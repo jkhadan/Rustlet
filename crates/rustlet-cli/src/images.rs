@@ -9,6 +9,7 @@
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
@@ -134,12 +135,15 @@ pub async fn save(ctx: &mut Ctx, output: Option<&Path>, images: &[String]) -> an
 
 /// Writes the archive into a new file beside `path`, renamed to `path`
 /// once it is whole (as Docker's CLI does): a save that fails midway
-/// removes what it wrote, and leaves a file that was there as it was.
+/// removes what it wrote, and leaves a file that was there as it was. The
+/// file is the owner's alone (0600, as Docker's): an image holds what its
+/// layers and config hold, build arguments and keys among it.
 async fn save_to_file(archive: ByteStream, path: &Path) -> anyhow::Result<()> {
     let partial = partial_path(path)?;
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(&partial)
         .with_context(|| format!("-o {}: creating {}", path.display(), partial.display()))?;
     let saved = write_archive(archive, file)
@@ -170,26 +174,34 @@ async fn write_archive(mut archive: ByteStream, mut file: File) -> anyhow::Resul
 
 /// `rustlet load`: the images of an archive (`input`, else stdin, which
 /// mustn't be a terminal), and what they are called now. As with Docker,
-/// each blob's line is shown only on a terminal, and not with `-q`.
+/// each blob's line is shown only on a terminal, and not with `-q`. An
+/// archive that can't be read to its end (a failing disk) is reported as
+/// that, whatever the connection made of the body cut short.
 pub async fn load(ctx: &mut Ctx, input: Option<&Path>, quiet: bool) -> anyhow::Result<i32> {
-    let archive = match input {
+    let (archive, source) = match input {
         Some(path) => {
             let file = File::open(path).with_context(|| format!("-i {}", path.display()))?;
-            RequestBody::from_reader(file)
+            (RequestBody::from_reader(file), path.display().to_string())
         }
         None => {
             if ctx.console.stdin_tty {
                 bail!("requested load from stdin, but stdin is a terminal; use -i or redirect an archive in");
             }
             let stdin = ctx.console.stdin.take().ok_or_else(|| anyhow!("stdin is already in use"))?;
-            RequestBody::from_reader(stdin)
+            (RequestBody::from_reader(stdin), "stdin".to_owned())
         }
     };
+    let read_failure = archive.read_failure();
+    // What the load failed with, unless the archive's own reading did.
+    let failed = |e: Error| match read_failure.error() {
+        Some(read) => anyhow!("reading {source}: {read}"),
+        None => e.into(),
+    };
     let blobs = !quiet && ctx.console.stdout_tty;
-    let mut events = ctx.client.load_images(archive).await?;
+    let mut events = ctx.client.load_images(archive).await.map_err(failed)?;
     let out = &mut ctx.console.stdout;
     while let Some(event) = events.next().await {
-        match event? {
+        match event.map_err(failed)? {
             LoadEvent::Blob { digest, existed: true, .. } if blobs => {
                 writeln!(out, "{}: Already exists", short_digest(&digest))?;
             }

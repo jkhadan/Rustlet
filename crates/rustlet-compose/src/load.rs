@@ -10,27 +10,36 @@
 //!
 //! As Compose v2 does it:
 //!
-//! - **Files.** `-f` in order, else the first of `compose.yaml`,
+//! - **Files.** `-f` in order, else those `COMPOSE_FILE` lists (separated by
+//!   `COMPOSE_PATH_SEPARATOR`, `:` by default; from the environment or the
+//!   project directory's `.env`), else the first of `compose.yaml`,
 //!   `compose.yml`, `docker-compose.yaml`, `docker-compose.yml` in the
 //!   project directory (`--project-directory`, else the current one) and,
 //!   as Compose does, `compose.override.yaml` (or `.yml`, or the
-//!   `docker-compose.` ones) beside it. **Deviation:** parent directories
-//!   aren't searched.
+//!   `docker-compose.` ones) beside it. A relative entry of `COMPOSE_FILE` is
+//!   relative to the current directory, as compose-go's `WithConfigFileEnv`
+//!   makes it (`filepath.Abs`), not to the project directory. **Deviations:**
+//!   parent directories aren't searched; `-f -` (the file on standard input)
+//!   is refused.
 //! - **Variables** ([`crate::interpolate`]): the environment given, over the
-//!   project directory's `.env`. A bare `environment` key and a bare build
+//!   project directory's `.env` file. A bare `environment` key and a bare build
 //!   argument take their value from the same variables.
 //! - **Merging** a later file into an earlier one: mappings are merged key
 //!   by key; the lists `ports`, `expose`, `dns`, `dns_search`, `dns_opt`,
-//!   `tmpfs`, `cap_add`, `cap_drop`, `devices`, `security_opt`,
-//!   `extra_hosts` and `env_file` are concatenated (an item given twice
-//!   kept once); `volumes` are merged by target, the later mount replacing
-//!   the earlier in its place; `environment`, `labels` and `build.args`, as
-//!   lists or mappings, merge as mappings; a service's `networks` and
-//!   `depends_on`, as lists or mappings, merge as mappings too, and `build:
-//!   DIR` as `{context: DIR}`; anything else (`command`, `healthcheck.test`,
-//!   any scalar) is replaced. An empty value doesn't replace anything.
-//!   Compose's tags `!reset` (remove what earlier files set) and
-//!   `!override` (replace instead of merging) are understood.
+//!   `tmpfs`, `cap_add`, `cap_drop`, `security_opt`, `extra_hosts`,
+//!   `env_file`, `profiles` and a network's `aliases` are concatenated (an
+//!   item given twice kept once; ports also share a key after short and long
+//!   syntax are normalized); `volumes` and `devices` are merged by their
+//!   container path, the later entry replacing the earlier in its place;
+//!   `environment`, `labels` and `build.args`, as lists or mappings, merge as
+//!   mappings; a service's `networks` and `depends_on`, as lists or
+//!   mappings, merge as mappings too (a name in a `depends_on` list is
+//!   `{condition: service_started, required: true}`, which a later file's
+//!   list resets), and `build: DIR` as `{context: DIR}`; anything else
+//!   (`command`, `healthcheck.test`, any scalar) is replaced. An empty value
+//!   doesn't replace anything. Compose's tags `!reset` (remove what earlier
+//!   files set) and `!override` (replace instead of merging) are
+//!   understood.
 //! - **The project's name**: `-p`, else `COMPOSE_PROJECT_NAME`, else the
 //!   file's `name:`, else the project directory's name, as Compose decides
 //!   it. A name given (`-p`,
@@ -39,12 +48,20 @@
 //!   Compose does (lowercased, other characters dropped).
 //! - **Profiles**: `--profile`, else `COMPOSE_PROFILES` (comma-separated); a
 //!   service with `profiles:` is in the project only if one of them is active
-//!   (or `*` is).
+//!   (or `*` is). A service the command names (`up debug`, `logs debug`) is
+//!   enabled with its profiles ([`load_selected`]), as Compose's
+//!   `WithServicesEnabled` does.
 //! - **Normalization**: names (`<project>_<network>`, `<project>_<volume>`,
 //!   `<project>-<service>` for an image built without `image:`), relative
 //!   host paths made absolute against the project directory (`~` against
-//!   `HOME`), `env_file` read (its entries first, `environment` over them,
-//!   sorted by name), each service's `ContainerConfig`.
+//!   `HOME`; a build context too), each service's `ContainerConfig`.
+//! - **Container environment**: `env_file` entries are read in order, then
+//!   `environment` overrides them. Interpolation in an env file sees the
+//!   project's variables first, resolved service `environment` second,
+//!   and earlier entries/files last. An unresolved bare key removes the
+//!   earlier value and the image's ENV; `KEY=` keeps an empty value. Final
+//!   values and removal names are sorted. An explicit empty `command` clears
+//!   the image's CMD, while omitted or null `command` inherits it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -56,7 +73,7 @@ use rustlet_spec::network::{DEFAULT_NETWORK, NetworkMode};
 use rustlet_spec::volume::{MountSpec, MountType};
 use serde_yaml_ng::{Mapping, Value};
 
-use crate::interpolate::{interpolate, parse_dotenv, unset_warning};
+use crate::interpolate::{interpolate, parse_dotenv, parse_dotenv_with_base, unset_warning};
 use crate::model::{self, ComposeFile, PullPolicyDef, ServiceDef};
 use crate::project::{Build, Condition, Dependency, Network, Project, Service, ServiceNetwork, Volume};
 use crate::{Error, Result};
@@ -65,16 +82,18 @@ use crate::{Error, Result};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LoadOptions {
     /// `-f`: the files, in order; a later one overrides and extends an
-    /// earlier one (Compose's merge rules). Empty: the first of
-    /// `compose.yaml`, `compose.yml`, `docker-compose.yaml`,
-    /// `docker-compose.yml` in the current directory.
+    /// earlier one (Compose's merge rules). Empty: those `COMPOSE_FILE`
+    /// names, else the first of `compose.yaml`, `compose.yml`,
+    /// `docker-compose.yaml`, `docker-compose.yml` in the project directory
+    /// (the current one, without `project_dir`).
     pub files: Vec<PathBuf>,
     /// `--project-directory`.
     pub project_dir: Option<PathBuf>,
     /// `-p`.
     pub project_name: Option<String>,
     /// The environment interpolation reads (the process's), over the
-    /// project directory's `.env`.
+    /// project directory's `.env`; `COMPOSE_FILE`, `COMPOSE_PATH_SEPARATOR`,
+    /// `COMPOSE_PROJECT_NAME` and `COMPOSE_PROFILES` are read from it too.
     pub env: BTreeMap<String, String>,
     /// `--profile`: services with `profiles:` only when one of theirs is
     /// listed.
@@ -88,15 +107,54 @@ pub const DEFAULT_FILES: [&str; 4] = ["compose.yaml", "compose.yml", "docker-com
 pub const OVERRIDE_FILES: [&str; 4] =
     ["compose.override.yaml", "compose.override.yml", "docker-compose.override.yaml", "docker-compose.override.yml"];
 
+/// Whether a configuration source was supplied or a default file exists.
+///
+/// Uses the same `COMPOSE_FILE` and `.env` lookup as [`load`]. Errors are
+/// preserved so that a caller cannot turn an invalid file selection into
+/// a destructive operation based only on a project's name.
+pub fn has_config_file(options: &LoadOptions) -> Result<bool> {
+    if !options.files.is_empty() {
+        return Ok(true);
+    }
+    let dir = absolute(options.project_dir.as_deref().unwrap_or(Path::new(".")))?;
+    if files_from_variable(&dir, &options.env)?.is_some() {
+        return Ok(true);
+    }
+    for name in DEFAULT_FILES {
+        let path = dir.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(Error::Io { path, source }),
+        }
+    }
+    Ok(false)
+}
+
 /// Loads a project from files (see [`LoadOptions`]).
 pub fn load(options: &LoadOptions) -> Result<Project> {
+    load_selected(options, &[])
+}
+
+/// [`load`] for a command that names `services` (`up debug`, `logs debug`,
+/// `stop debug`…): each is in the project even if its `profiles:` aren't
+/// active, and so are its profiles' other services, as Compose's
+/// `WithServicesEnabled` does it. A name that is no service is left for the
+/// command to refuse.
+pub fn load_selected(options: &LoadOptions, services: &[String]) -> Result<Project> {
+    if options.files.iter().any(|f| f == Path::new("-")) {
+        return Err(stdin_unsupported());
+    }
     let project_dir = options.project_dir.as_deref().map(absolute).transpose()?;
     let files = if options.files.is_empty() {
         let dir = match &project_dir {
             Some(dir) => dir.clone(),
             None => std::env::current_dir().map_err(|source| Error::Io { path: ".".into(), source })?,
         };
-        default_files(&dir)?
+        match files_from_variable(&dir, &options.env)? {
+            Some(files) => files,
+            None => default_files(&dir)?,
+        }
     } else {
         options.files.iter().map(|f| absolute(f)).collect::<Result<_>>()?
     };
@@ -111,13 +169,48 @@ pub fn load(options: &LoadOptions) -> Result<Project> {
     }
     let sources: Vec<(Option<&Path>, &str)> =
         files.iter().map(|f| Some(f.as_path())).zip(texts.iter().map(String::as_str)).collect();
-    build_project(&sources, dir, files.clone(), options)
+    build_project(&sources, dir, files.clone(), options, services)
 }
 
 /// Loads a project from YAML text, as if it were a file in `dir`.
 pub fn load_str(yaml: &str, dir: &Path, options: &LoadOptions) -> Result<Project> {
     let dir = absolute(options.project_dir.as_deref().unwrap_or(dir))?;
-    build_project(&[(None, yaml)], dir, Vec::new(), options)
+    build_project(&[(None, yaml)], dir, Vec::new(), options, &[])
+}
+
+fn stdin_unsupported() -> Error {
+    Error::Invalid("reading the compose file from stdin isn't supported (-f -): give a file".into())
+}
+
+/// The files `COMPOSE_FILE` lists, when it is set (not empty), in the
+/// environment or in `dir`'s `.env`; `COMPOSE_PATH_SEPARATOR` (default `:`)
+/// separates them.
+///
+/// As compose-go's `WithConfigFileEnv` does it: each entry must be a file
+/// (an error says which entry, and that the variable named it), and a
+/// relative one is relative to the **current directory** (its `acceptComposeFile`
+/// calls `filepath.Abs`), not to the project directory. No override file is
+/// added to the list, as with `-f`. Empty entries (`a.yaml:`) are skipped.
+fn files_from_variable(dir: &Path, env: &BTreeMap<String, String>) -> Result<Option<Vec<PathBuf>>> {
+    let vars = variables(dir, env)?;
+    let Some(list) = vars.get("COMPOSE_FILE").filter(|list| !list.is_empty()) else { return Ok(None) };
+    let separator = vars.get("COMPOSE_PATH_SEPARATOR").filter(|s| !s.is_empty()).map_or(":", String::as_str);
+    let mut files = Vec::new();
+    for entry in list.split(separator).filter(|entry| !entry.is_empty()) {
+        if entry == "-" {
+            return Err(stdin_unsupported());
+        }
+        let path = absolute(Path::new(entry))?;
+        let invalid = |why: &dyn std::fmt::Display| {
+            Error::Invalid(format!("compose file {entry:?} set by COMPOSE_FILE is invalid: {why}"))
+        };
+        match std::fs::metadata(&path) {
+            Ok(m) if m.is_file() => files.push(path),
+            Ok(_) => return Err(invalid(&format_args!("{} is not a regular file", path.display()))),
+            Err(e) => return Err(invalid(&format_args!("{}: {e}", path.display()))),
+        }
+    }
+    Ok((!files.is_empty()).then_some(files))
 }
 
 /// The default file in `dir`, and its override file if there is one.
@@ -184,6 +277,7 @@ fn build_project(
     dir: PathBuf,
     files: Vec<PathBuf>,
     options: &LoadOptions,
+    named: &[String],
 ) -> Result<Project> {
     let vars = variables(&dir, &options.env)?;
     let mut unset = Vec::new();
@@ -198,11 +292,16 @@ fn build_project(
     let file = model::parse(&merged.unwrap_or(Value::Null))?;
 
     let mut warnings: Vec<String> = unset.iter().map(|name| unset_warning(name)).collect();
+    warnings.extend(file.warnings.iter().cloned());
     if file.version {
         warnings.push("the top-level version is obsolete and ignored: you can remove it".into());
     }
     let name = project_name(options, file.name.as_deref(), &vars, &dir)?;
-    let active = active_profiles(options, &vars);
+    let mut active = active_profiles(options, &vars);
+    // A service named on the command line brings its profiles along.
+    for def in file.services.iter().filter(|s| named.contains(&s.name)) {
+        active.extend(def.profiles.iter().cloned());
+    }
     let enabled = |s: &ServiceDef| s.profiles.is_empty() || active.iter().any(|a| a == "*" || s.profiles.contains(a));
 
     let cx = Context { project: &name, dir: &dir, vars: &vars, file: &file };
@@ -216,6 +315,10 @@ fn build_project(
         services.push(normalized.service);
     }
     check_container_names(&services)?;
+    // Retain every declaration for teardown, including external resources
+    // no enabled service currently uses. Creation still filters by usage.
+    used_networks.extend(file.networks.keys().cloned());
+    used_volumes.extend(file.volumes.keys().cloned());
     let networks = used_networks.into_iter().map(|key| Ok((key.clone(), cx.network(&key)?))).collect::<Result<_>>()?;
     let volumes = used_volumes.into_iter().map(|key| Ok((key.clone(), cx.volume(&key)?))).collect::<Result<_>>()?;
     let disabled_services = file.services.iter().filter(|s| !enabled(s)).map(|s| s.name.clone()).collect();
@@ -242,11 +345,72 @@ fn read_document(
         None => message,
     };
     let mut doc: Value = serde_yaml_ng::from_str(text).map_err(|e| Error::Parse(named(e.to_string())))?;
-    doc.apply_merge().map_err(|e| Error::Parse(named(e.to_string())))?;
+    resolve_merge_keys(&mut doc).map_err(|e| Error::Parse(named(e)))?;
     interpolate(&mut doc, &|name| vars.get(name).cloned(), unset).map_err(|e| Error::Invalid(named(e)))?;
     let alone = strip_tags(doc.clone(), &mut Vec::new()).map_err(|e| in_file(e, file))?;
     model::parse(&alone).map_err(|e| in_file(e, file))?;
     Ok(doc)
+}
+
+/// The YAML merge keys (`<<: *defaults`) of `value` resolved, as YAML 1.1
+/// has them and compose-go reads them: the mapping or the list of mappings
+/// under `<<` is merged into the mapping around it, the mapping's own keys
+/// winning, and in a list the earlier mappings winning over the later.
+///
+/// Mappings are resolved from the inside out, so that one that is merged in
+/// has had its own `<<` resolved first (`x-app: &app {<<: *base, …}`, then
+/// `<<: *app` in a service): `serde_yaml_ng`'s own `apply_merge` resolves one
+/// level, and leaves the inner `<<` behind as a key.
+fn resolve_merge_keys(value: &mut Value) -> std::result::Result<(), String> {
+    match value {
+        Value::Mapping(map) => {
+            for (_, child) in map.iter_mut() {
+                resolve_merge_keys(child)?;
+            }
+            let Some(merge) = map.shift_remove("<<") else { return Ok(()) };
+            let sources = match merge {
+                Value::Mapping(source) => vec![source],
+                Value::Sequence(items) => items
+                    .into_iter()
+                    .map(|item| match item {
+                        Value::Mapping(source) => Ok(source),
+                        other => Err(format!("a << merge key's list holds mappings, not {}", describe(&other))),
+                    })
+                    .collect::<std::result::Result<_, _>>()?,
+                other => {
+                    return Err(format!("a << merge key is a mapping or a list of mappings, not {}", describe(&other)));
+                }
+            };
+            for source in sources {
+                for (key, entry) in source {
+                    if !map.contains_key(&key) {
+                        map.insert(key, entry);
+                    }
+                }
+            }
+        }
+        Value::Sequence(items) => {
+            for item in items {
+                resolve_merge_keys(item)?;
+            }
+        }
+        Value::Tagged(tagged) => resolve_merge_keys(&mut tagged.value)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// What `value` is, for an error.
+fn describe(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "nothing",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Sequence(_) => "a list",
+        Value::Mapping(_) => "a mapping",
+        Value::Tagged(_) => "a tagged value",
+    }
 }
 
 /// `e`, saying which file it is about.
@@ -264,12 +428,17 @@ enum Rule {
     Deep,
     /// Lists concatenated, duplicates dropped.
     Append,
-    /// Mounts merged by target.
+    /// Mounts and devices merged by the path in the container (compose-go's
+    /// `volumeIndexer` and `deviceMappingIndexer`).
     ByTarget,
     /// `KEY=VALUE` lists or mappings, merged as mappings.
     AsMap,
     /// A list of names is a mapping of names to nothing, then [`Rule::Deep`].
     NamesAsMap,
+    /// A list of services is a mapping of each to `{condition:
+    /// service_started, required: true}`, then [`Rule::Deep`] (compose-go's
+    /// `mergeDependsOn`): naming a dependency again resets its condition.
+    DependsOn,
     /// `build: DIR` is `{context: DIR}`, then [`Rule::Deep`].
     Build,
 }
@@ -278,14 +447,16 @@ fn rule(path: &[String]) -> Rule {
     let path: Vec<&str> = path.iter().map(String::as_str).collect();
     match path.as_slice() {
         ["services", _, field] => match *field {
-            "ports" | "expose" | "dns" | "dns_search" | "dns_opt" | "tmpfs" | "cap_add" | "cap_drop" | "devices"
-            | "security_opt" | "extra_hosts" | "env_file" => Rule::Append,
-            "volumes" => Rule::ByTarget,
+            "ports" | "expose" | "dns" | "dns_search" | "dns_opt" | "tmpfs" | "cap_add" | "cap_drop"
+            | "security_opt" | "extra_hosts" | "env_file" | "profiles" => Rule::Append,
+            "volumes" | "devices" => Rule::ByTarget,
             "environment" | "labels" => Rule::AsMap,
-            "networks" | "depends_on" => Rule::NamesAsMap,
+            "networks" => Rule::NamesAsMap,
+            "depends_on" => Rule::DependsOn,
             "build" => Rule::Build,
             _ => Rule::Deep,
         },
+        ["services", _, "networks", _, "aliases"] => Rule::Append,
         ["services", _, "build", "args" | "labels"] | ["networks" | "volumes", _, "labels"] => Rule::AsMap,
         _ => Rule::Deep,
     }
@@ -319,15 +490,15 @@ fn merge(path: &mut Vec<String>, base: Value, over: Value) -> Result<Value> {
         }
         (Rule::ByTarget, base, over) => {
             let over = strip_tags(over, path)?;
-            let mut mounts: Vec<Value> = Vec::new();
-            for mount in as_list(base, None).into_iter().chain(as_list(over, None)) {
-                let target = mount_target(&mount);
-                match mounts.iter().position(|m| target.is_some() && mount_target(m) == target) {
-                    Some(i) => mounts[i] = mount,
-                    None => mounts.push(mount),
+            let mut entries: Vec<Value> = Vec::new();
+            for entry in as_list(base, None).into_iter().chain(as_list(over, None)) {
+                let target = container_path(&entry);
+                match entries.iter().position(|e| target.is_some() && container_path(e) == target) {
+                    Some(i) => entries[i] = entry,
+                    None => entries.push(entry),
                 }
             }
-            Value::Sequence(mounts)
+            Value::Sequence(entries)
         }
         (Rule::AsMap, base, over) => {
             let mut map = as_map(base);
@@ -346,6 +517,10 @@ fn merge(path: &mut Vec<String>, base: Value, over: Value) -> Result<Value> {
         (Rule::NamesAsMap, base, over) => {
             let over = untagged(over, path)?;
             Value::Mapping(merge_mappings(path, names_as_map(base), names_as_map(over))?)
+        }
+        (Rule::DependsOn, base, over) => {
+            let over = untagged(over, path)?;
+            Value::Mapping(merge_mappings(path, dependencies_as_map(base), dependencies_as_map(over))?)
         }
         (Rule::Build, base, over) => {
             let over = untagged(over, path)?;
@@ -481,8 +656,11 @@ fn as_list(v: Value, field: Option<&str>) -> Vec<Value> {
     }
 }
 
-/// The target of a mount in short (`SOURCE:TARGET[:MODE]`) or long syntax.
-fn mount_target(v: &Value) -> Option<String> {
+/// The path in the container of a mount in short (`SOURCE:TARGET[:MODE]`) or
+/// long syntax, or of a device (`HOST:CONTAINER[:MODE]`, or a mapping with
+/// a `target`): what two entries of a service's `volumes` or `devices`
+/// share when the later replaces the earlier.
+fn container_path(v: &Value) -> Option<String> {
     match v {
         Value::String(s) => {
             let parts: Vec<&str> = s.split(':').collect();
@@ -519,6 +697,28 @@ fn names_as_map(v: Value) -> Mapping {
     }
 }
 
+/// A list of dependencies as a mapping of each to what the short syntax
+/// means, `{condition: service_started, required: true}`; a mapping as it
+/// is.
+fn dependencies_as_map(v: Value) -> Mapping {
+    match v {
+        Value::Mapping(map) => map,
+        Value::Sequence(items) => items
+            .into_iter()
+            .map(|name| {
+                let default: Mapping = [
+                    (Value::String("condition".into()), Value::String("service_started".into())),
+                    (Value::String("required".into()), Value::Bool(true)),
+                ]
+                .into_iter()
+                .collect();
+                (name, Value::Mapping(default))
+            })
+            .collect(),
+        _ => Mapping::new(),
+    }
+}
+
 /// `build: DIR` as `{context: DIR}`.
 fn build_as_map(v: Value) -> Mapping {
     match v {
@@ -535,10 +735,10 @@ fn project_name(
     dir: &Path,
 ) -> Result<String> {
     if let Some(name) = &options.project_name {
-        return given_name(name, "-p");
+        return given_project_name(name, "-p");
     }
     if let Some(name) = vars.get("COMPOSE_PROJECT_NAME").filter(|n| !n.is_empty()) {
-        return given_name(name, "COMPOSE_PROJECT_NAME");
+        return given_project_name(name, "COMPOSE_PROJECT_NAME");
     }
     if let Some(name) = from_file.filter(|n| !n.is_empty()) {
         return made_name(name, "the file's name:");
@@ -547,8 +747,11 @@ fn project_name(
     made_name(&base, "the project directory's name")
 }
 
-/// A name given as such: it must be one (once lowercased).
-fn given_name(name: &str, source: &str) -> Result<String> {
+/// A project name given as such (`-p`, `COMPOSE_PROJECT_NAME`: `source` says
+/// which): it must be one once lowercased, `[a-z0-9][a-z0-9_-]*`, and is
+/// returned lowercased. The one rule, for loading a file and for acting on a
+/// project by name alone.
+pub fn given_project_name(name: &str, source: &str) -> Result<String> {
     let lower = name.to_ascii_lowercase();
     let valid = lower.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
         && lower.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
@@ -629,6 +832,8 @@ struct Attachment {
     keys: Vec<String>,
     /// What `network_mode: service:x` makes it depend on.
     implied: Option<Dependency>,
+    /// The service whose namespace it joins (`x`).
+    shares: Option<String>,
 }
 
 impl Context<'_> {
@@ -679,7 +884,7 @@ impl Context<'_> {
             warnings.push(format!("{at}.expose is ignored: Rustlets has no --expose (ports: publishes ports)"));
         }
 
-        let Attachment { mode: network, networks, keys: network_keys, implied } = self.networks(def, &at)?;
+        let Attachment { mode: network, networks, keys: network_keys, implied, shares } = self.networks(def, &at)?;
         let (mounts, volume_keys) = self.mounts(def, &at)?;
         let mut depends_on: Vec<Dependency> = def
             .depends_on
@@ -702,11 +907,14 @@ impl Context<'_> {
         // Aliases and addresses go with the first network, the others get
         // theirs from `network connect`.
         let first = networks.first();
+        let (env, unset_env) = self.environment(def, &at)?;
         let config = ContainerConfig {
             image: image.clone(),
             cmd: def.command.clone().unwrap_or_default(),
+            clear_cmd: def.command.as_ref().is_some_and(Vec::is_empty),
             entrypoint: def.entrypoint.clone(),
-            env: self.environment(def, &at)?,
+            env,
+            unset_env,
             user: def.user.clone(),
             workdir: def.working_dir.clone(),
             hostname: def.hostname.clone(),
@@ -748,6 +956,7 @@ impl Context<'_> {
             container_name: def.container_name.clone(),
             replicas,
             depends_on,
+            shares_network_with: shares,
             config,
             networks,
         };
@@ -755,11 +964,9 @@ impl Context<'_> {
     }
 
     fn build(&self, def: &model::BuildDef, at: &str, always: bool) -> Result<Build> {
-        let context = if Path::new(&def.context).is_absolute() {
-            PathBuf::from(&def.context)
-        } else {
-            clean(&self.dir.join(&def.context))
-        };
+        // A host path like a mount's source: `~` is the home directory too (compose-go resolves a
+        // build context with the same `absPath`).
+        let context = PathBuf::from(self.host_path(&def.context, &format!("{at}.build.context"))?);
         if let Some(network) = &def.network {
             match NetworkMode::parse(network) {
                 Ok(NetworkMode::Container(_)) => {
@@ -784,32 +991,40 @@ impl Context<'_> {
         })
     }
 
-    /// `env_file` entries, then `environment` over them; a bare key takes
-    /// the variables' value, or is left out.
-    fn environment(&self, def: &ServiceDef, at: &str) -> Result<Vec<String>> {
-        let mut env: BTreeMap<String, String> = BTreeMap::new();
+    /// `env_file` entries in order, then `environment` over them. An
+    /// unresolved bare key removes any earlier value and the image's ENV.
+    fn environment(&self, def: &ServiceDef, at: &str) -> Result<(Vec<String>, Vec<String>)> {
+        let resolved: BTreeMap<String, Option<String>> =
+            def.environment.iter().map(|(key, value)| (key.clone(), value.clone().or_else(|| self.var(key)))).collect();
+        let mut env: BTreeMap<String, Option<String>> = BTreeMap::new();
         for file in &def.env_file {
-            let path = self.host_path(&file.path, &format!("{at}.env_file"))?;
-            let path = PathBuf::from(path);
+            let path = PathBuf::from(self.host_path(&file.path, &format!("{at}.env_file"))?);
             let text = match std::fs::read_to_string(&path) {
                 Ok(text) => text,
                 Err(e) if e.kind() == io::ErrorKind::NotFound && !file.required => continue,
                 Err(source) => return Err(Error::Io { path, source }),
             };
-            let entries = parse_dotenv(&text, &|name| self.var(name))
+            // Earlier files seed the parser, so an entry in this file can
+            // replace them before a later line interpolates the same name.
+            let base = env.iter().filter_map(|(key, value)| Some((key.clone(), value.clone()?))).collect();
+            let lookup = |name: &str| self.var(name).or_else(|| resolved.get(name).cloned().flatten());
+            let entries = parse_dotenv_with_base(&text, &lookup, &base)
                 .map_err(|e| Error::Parse(format!("{}: {e}", path.display())))?;
             for (key, value) in entries {
-                if let Some(value) = value.or_else(|| self.var(&key)) {
-                    env.insert(key, value);
-                }
+                let value = value.or_else(|| lookup(&key));
+                env.insert(key, value);
             }
         }
-        for (key, value) in &def.environment {
-            if let Some(value) = value.clone().or_else(|| self.var(key)) {
-                env.insert(key.clone(), value);
+        env.extend(resolved);
+        let mut values = Vec::new();
+        let mut unset = Vec::new();
+        for (key, value) in env {
+            match value {
+                Some(value) => values.push(format!("{key}={value}")),
+                None => unset.push(key),
             }
         }
-        Ok(env.into_iter().map(|(k, v)| format!("{k}={v}")).collect())
+        Ok((values, unset))
     }
 
     /// Where the service's network namespace comes from, and its place on
@@ -836,6 +1051,7 @@ impl Context<'_> {
                         condition: Condition::Started,
                         required: true,
                     }),
+                    shares: Some(other.to_owned()),
                     ..Attachment::default()
                 });
             }
@@ -897,7 +1113,7 @@ impl Context<'_> {
             }
             None => NetworkMode::Bridge,
         };
-        Ok(Attachment { mode, networks, keys, implied: None })
+        Ok(Attachment { mode, networks, keys, implied: None, shares: None })
     }
 
     /// A network's daemon name: `name:`, an external network's key, or
@@ -1195,7 +1411,11 @@ services:
         let build = web.build.as_ref().unwrap();
         assert_eq!((build.context.clone(), build.target.as_deref()), (p.dir.join("app"), Some("prod")));
         assert_eq!(p.networks.keys().collect::<Vec<_>>(), ["back", "default", "front"], "db is on default");
-        assert_eq!(p.volumes.keys().collect::<Vec<_>>(), ["other"], "only what is mounted");
+        assert_eq!(
+            p.volumes.keys().collect::<Vec<_>>(),
+            ["data", "other"],
+            "all declarations remain available to teardown"
+        );
     }
 
     #[test]
@@ -1459,7 +1679,7 @@ volumes:
         let p = project(
             "services:\n  web:\n    image: a\n  db:\n    image: b\n    networks: [default, ext]\nnetworks:\n  ext:\n    external: true\n  unused:\n    name: given\n",
         );
-        assert_eq!(p.networks.keys().collect::<Vec<_>>(), ["default", "ext"]);
+        assert_eq!(p.networks.keys().collect::<Vec<_>>(), ["default", "ext", "unused"]);
         assert_eq!(p.networks["default"].name, "demo_default");
         assert!(p.networks["ext"].external && p.networks["ext"].name == "ext");
         let web = p.service("web").unwrap();

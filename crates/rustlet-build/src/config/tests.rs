@@ -6,6 +6,14 @@ use super::*;
 use crate::op::{CopyOp, HealthcheckOp};
 use crate::parser::parse_instruction;
 
+#[test]
+fn overflowing_duration_fractions_are_errors() {
+    for text in ["340282366920938463463374607431.999999999s", "18446744073.709551616s", "18446744073.709551615s1ns"] {
+        assert!(parse_duration(text).is_err(), "{text}");
+    }
+    assert_eq!(parse_duration("18446744073.709551615s").unwrap(), Duration::from_nanos(u64::MAX));
+}
+
 /// `text` as an op, expanded with no variables set.
 fn op(text: &str) -> Op {
     let instruction = parse_instruction(text).unwrap_or_else(|e| panic!("{text:?}: {e}"));

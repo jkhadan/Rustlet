@@ -390,8 +390,9 @@ fn logical_lines(lines: &[&str], escape: char, warnings: &mut Vec<String>) -> Ve
 /// it), and whether it had one: then the instruction goes on.
 fn continuation(line: &str, escape: char) -> (&str, bool) {
     match line.trim_end_matches([' ', '\t']).strip_suffix(escape) {
-        Some(part) => (part, true),
+        Some(part) if !part.ends_with(escape) => (part, true),
         None => (line, false),
+        Some(_) => (line, false),
     }
 }
 
@@ -412,7 +413,7 @@ fn parse_text(text: &str, escape: char) -> Result<Parsed, String> {
     let (keyword, rest) = split_keyword(text);
     let instruction = keyword.to_ascii_uppercase();
     let name = instruction.as_str();
-    let (flags, rest) = extract_flags(rest);
+    let (flags, rest) = extract_flags(rest, escape);
     let rest = rest.trim();
     let no_flags = || check_flags(name, &flags, &[], &[]).map(|_| ());
     let kind = match name {
@@ -513,9 +514,9 @@ fn split_blank_once(text: &str) -> (&str, &str) {
 }
 
 /// The flags at the start of `args` (its words that begin with `--`, quotes
-/// removed, `\` escaping the next character), and the rest: BuildKit's
+/// removed, the file's escape token escaping the next character), and the rest: BuildKit's
 /// `extractBuilderFlags`. A lone `--` ends them.
-fn extract_flags(args: &str) -> (Vec<String>, &str) {
+fn extract_flags(args: &str, escape: char) -> (Vec<String>, &str) {
     let mut flags = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
@@ -534,7 +535,7 @@ fn extract_flags(args: &str) -> (Vec<String>, &str) {
         if let Some(q) = quote {
             match c {
                 c if c == q => quote = None,
-                '\\' => match chars.next() {
+                c if c == escape => match chars.next() {
                     Some((_, next)) => word.push(next),
                     None => quote = None,
                 },
@@ -551,7 +552,7 @@ fn extract_flags(args: &str) -> (Vec<String>, &str) {
                 in_word = false;
             }
             '\'' | '"' => quote = Some(c),
-            '\\' => word.extend(chars.next().map(|(_, next)| next)),
+            c if c == escape => word.extend(chars.next().map(|(_, next)| next)),
             c => word.push(c),
         }
     }
@@ -680,7 +681,13 @@ fn copy_args(instruction: &str, flags: &[String], rest: &str, escape: char) -> R
     };
     // An empty value (`--from=`) is no value, as in Docker.
     let value = |name: &str| values.get(name).filter(|v| !v.is_empty()).cloned();
-    Ok(CopyArgs { from: value("from"), chown: value("chown"), chmod: value("chmod"), args })
+    let from = value("from");
+    if from.as_ref().is_some_and(|from| from.contains('$')) {
+        return Err(
+            "COPY: variable expansion is not supported for --from; use a stage declared with FROM instead".into()
+        );
+    }
+    Ok(CopyArgs { from, chown: value("chown"), chmod: value("chmod"), args })
 }
 
 /// `ENV`/`LABEL`: `name=value …`, each value as written (quotes included),
@@ -811,9 +818,9 @@ fn onbuild(rest: &str, escape: char) -> Result<String, String> {
     match trigger.as_str() {
         "ONBUILD" => return Err("ONBUILD ONBUILD isn't allowed".to_owned()),
         "FROM" | "MAINTAINER" => return Err(format!("{trigger} isn't allowed as an ONBUILD trigger")),
-        "RUN" | "COPY" | "ADD" => {
-            let args = extract_flags(args).1.trim();
-            if json_array(args)?.is_none() {
+        "RUN" | "COPY" | "ADD" | "CMD" | "ENTRYPOINT" | "VOLUME" | "SHELL" => {
+            let args = extract_flags(args, escape).1.trim();
+            if json_array(args)?.is_none() && matches!(trigger.as_str(), "RUN" | "COPY" | "ADD") {
                 refuse_heredoc(&format!("ONBUILD {trigger}"), args, escape)?;
             }
         }
@@ -823,13 +830,28 @@ fn onbuild(rest: &str, escape: char) -> Result<String, String> {
     Ok(rest.to_owned())
 }
 
-/// Refuses a heredoc in shell-form arguments: a word `[n]<<[-]DELIMITER`
-/// (BuildKit's rule; `<<<`, `<< EOF` and a quoted `"<<EOF"` aren't).
+/// Refuses a heredoc in shell-form arguments, including whitespace before
+/// its delimiter. Quoted angles, here strings and arithmetic shifts stay literal.
 fn refuse_heredoc(instruction: &str, args: &str, escape: char) -> Result<(), String> {
-    if args.contains("<<") && split_words(args, escape).iter().any(|word| is_heredoc(word)) {
-        return Err(format!(
-            "{instruction} with a heredoc (<<EOF) is a BuildKit feature Rustlets doesn't support: put the text in a file in the context"
-        ));
+    if args.contains("<<") {
+        let words = split_words(args, escape);
+        let mut arithmetic = false;
+        for (index, word) in words.iter().enumerate() {
+            if word.starts_with("$((") || word.starts_with("((") {
+                arithmetic = true;
+            }
+            let bare = word.trim_start_matches(|c: char| c.is_ascii_digit());
+            let spaced = matches!(bare, "<<" | "<<-")
+                && words.get(index + 1).is_some_and(|delimiter| !delimiter.starts_with('<'));
+            if !arithmetic && (is_heredoc(word) || spaced) {
+                return Err(format!(
+                    "{instruction} with a heredoc (<<EOF) is a BuildKit feature Rustlets doesn't support: put the text in a file in the context"
+                ));
+            }
+            if word.ends_with("))") {
+                arithmetic = false;
+            }
+        }
     }
     Ok(())
 }

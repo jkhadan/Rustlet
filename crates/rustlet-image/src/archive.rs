@@ -30,7 +30,9 @@
 //!
 //! ## What `load` reads
 //!
-//! Either format, entry by entry, in any order:
+//! Either format, entry by entry, in any order, from an archive that may be
+//! gzip- or zstd-compressed (as `docker load` takes one, told by its first
+//! bytes):
 //!
 //! - **OCI image layout** (`save`'s, `docker save` since Docker 25,
 //!   `skopeo copy … oci-archive:`): each `blobs/sha256/<hex>` entry is
@@ -53,6 +55,12 @@
 //!   as Docker's loader checks. When both `index.json` and `manifest.json`
 //!   are there, `index.json` wins.
 //!
+//! The archive is read by [`tarstream`], not the `tar` crate, whose reader
+//! holds every GNU long name and PAX header whole, however large it says it
+//! is: here an extension header over 1 MiB is an error (the unpacker's cap,
+//! `unpack::extensions`), and a PAX `size` record, which Go writes for a
+//! file over 8 GiB (a layer's blob, say), is honoured.
+//!
 //! Other entries (`repositories`, `<dir>/json`, `<dir>/VERSION`) are
 //! ignored. Once the archive ends, every image must load
 //! (`Image::from_manifest`: its config parses, one diff ID per layer) with
@@ -61,7 +69,7 @@
 //! kept ([`ContentStore::keep`]). A name listed for two images goes to the
 //! later one. Blobs already stored aren't written again (an entry's data is
 //! skipped). JSON files are capped as manifests and configs are (4 and
-//! 8 MiB); the archive itself isn't.
+//! 8 MiB), extension headers at 1 MiB; the archive itself isn't.
 //!
 //! [OCI image layout]: https://github.com/opencontainers/image-spec/blob/main/image-layout.md
 
@@ -72,6 +80,8 @@ use oci_spec::image::Descriptor;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tar::EntryType;
+
+use self::tarstream::Entry;
 
 use crate::config::{ImageConfig, MAX_CONFIG_BYTES};
 use crate::content::{self, ContentStore, RefEntry};
@@ -210,9 +220,9 @@ pub fn load(
     progress: &mut dyn FnMut(LoadProgress),
 ) -> Result<Vec<Loaded>> {
     let mut found = Found::default();
-    let mut archive = tar::Archive::new(BufReader::with_capacity(1 << 16, input));
-    for entry in archive.entries().context("read the archive")? {
-        found.entry(content, entry.context("read the archive")?, progress)?;
+    let mut archive = tarstream::Reader::new(BufReader::with_capacity(1 << 16, decompressed(input)?));
+    while let Some(entry) = archive.next().context("read the archive")? {
+        found.entry(content, entry, progress)?;
     }
     let images = match (&found.index, &found.manifest) {
         (Some(index), _) => oci_images(content, index)?,
@@ -222,6 +232,28 @@ pub fn load(
         }
     };
     name(content, images)
+}
+
+/// `input`, decompressed if its first bytes say it is gzip or zstd (as
+/// `docker load` takes a compressed archive); a plain tar as it is.
+fn decompressed(input: &mut dyn Read) -> Result<Box<dyn Read + '_>> {
+    let mut magic = [0u8; 4];
+    let mut have = 0;
+    while have < magic.len() {
+        match input.read(&mut magic[have..]) {
+            Ok(0) => break,
+            Ok(n) => have += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e).context("read the archive"),
+        }
+    }
+    let compression = media::detect_compression(&magic[..have]);
+    let whole = io::Cursor::new(magic[..have].to_vec()).chain(input);
+    Ok(match compression {
+        Compression::None => Box::new(whole),
+        Compression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(BufReader::with_capacity(1 << 16, whole))),
+        Compression::Zstd => Box::new(zstd::stream::read::Decoder::new(whole).context("start zstd decompression")?),
+    })
 }
 
 /// `save`'s header for a file: 0644, owned by root, from the epoch.
@@ -285,14 +317,14 @@ impl Found {
     fn entry<R: Read>(
         &mut self,
         content: &ContentStore,
-        mut entry: tar::Entry<'_, R>,
+        mut entry: Entry<'_, R>,
         progress: &mut dyn FnMut(LoadProgress),
     ) -> Result<()> {
-        let raw = entry.path_bytes().into_owned();
+        let raw = std::mem::take(&mut entry.path);
         let path = clean(&raw);
-        let kind = entry.header().entry_type();
+        let kind = entry.kind;
         if matches!(kind, EntryType::Symlink | EntryType::Link) {
-            let target = entry.link_name_bytes().map(|t| t.into_owned()).unwrap_or_default();
+            let target = entry.link.take().unwrap_or_default();
             // A symlink is relative to its directory, a hard link's target
             // to the archive's root.
             let target = match kind {
@@ -306,7 +338,7 @@ impl Found {
         if !matches!(kind, EntryType::Regular | EntryType::Continuous) || raw.ends_with(b"/") || path.is_empty() {
             return Ok(());
         }
-        let size = entry.size();
+        let size = entry.size;
         let held = match path.as_str() {
             "index.json" => {
                 self.index = Some(read_json(&mut entry, size, &path, MAX_MANIFEST_BYTES)?);
@@ -667,6 +699,176 @@ fn clean(raw: &[u8]) -> String {
 /// The directory a (clean) path is in; empty at the top.
 fn parent(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// A tar archive read entry by entry, as `load` needs it, and bounded: see
+/// the module docs for why it isn't the `tar` crate's reader. Headers are the
+/// crate's (`tar::Header` parses a block's fields), extension headers the
+/// unpacker's (`Extensions`, capped at 1 MiB), and where Go writes a size
+/// that doesn't fit the header's field (over 8 GiB) in a PAX record, that is
+/// the entry's size.
+mod tarstream {
+    use std::io::{self, Read};
+
+    use tar::EntryType;
+
+    use crate::copy::is_tar_header;
+    use crate::unpack::extensions::Extensions;
+
+    const BLOCK: usize = 512;
+
+    /// An archive being read.
+    pub(super) struct Reader<R> {
+        inner: R,
+        /// Of the entry last returned: the data its reader hasn't taken, and
+        /// the padding after it. Skipped by the next [`next`](Self::next).
+        unread: u64,
+        padding: u64,
+    }
+
+    /// One entry: what the archive says it is, and a reader of its data.
+    pub(super) struct Entry<'a, R> {
+        /// Its path (a long one from an extension header, if there is one).
+        pub(super) path: Vec<u8>,
+        pub(super) kind: EntryType,
+        /// A link's target.
+        pub(super) link: Option<Vec<u8>>,
+        /// The bytes of its data: a PAX `size` record's, else its header's;
+        /// none for a type that has no data (links, directories, devices,
+        /// FIFOs), whatever its header says, as Go's reader has it.
+        pub(super) size: u64,
+        data: Body<'a, R>,
+    }
+
+    /// The data of the entry being read: `left` bytes of the stream.
+    struct Body<'a, R> {
+        inner: &'a mut R,
+        unread: &'a mut u64,
+        left: u64,
+    }
+
+    impl<R: Read> Reader<R> {
+        pub(super) fn new(inner: R) -> Reader<R> {
+            Reader { inner, unread: 0, padding: 0 }
+        }
+
+        /// The next entry; `None` at the end of the archive (a block of
+        /// zeros, or the stream ending where a header would start). What the
+        /// last entry's reader left unread is skipped first.
+        pub(super) fn next(&mut self) -> io::Result<Option<Entry<'_, R>>> {
+            skip(&mut self.inner, self.unread, true)?;
+            // A stream may end without the last entry's padding.
+            skip(&mut self.inner, self.padding, false)?;
+            (self.unread, self.padding) = (0, 0);
+            let mut extensions = Extensions::default();
+            loop {
+                let mut block = [0u8; BLOCK];
+                if !read_block(&mut self.inner, &mut block)? || block.iter().all(|&b| b == 0) {
+                    if extensions.is_empty() {
+                        return Ok(None);
+                    }
+                    return Err(invalid("the archive ends with headers for an entry that never comes"));
+                }
+                if !is_tar_header(&block) {
+                    return Err(invalid("archive header checksum mismatch"));
+                }
+                let mut header = tar::Header::new_old();
+                header.as_mut_bytes().copy_from_slice(&block);
+                let kind = header.entry_type();
+                let has_data = !matches!(
+                    kind,
+                    EntryType::Link
+                        | EntryType::Symlink
+                        | EntryType::Char
+                        | EntryType::Block
+                        | EntryType::Directory
+                        | EntryType::Fifo
+                );
+                let size = if has_data { header.entry_size()? } else { 0 };
+                // Extension headers are read here, whole but for 1 MiB at most.
+                if extensions.absorb_data(kind, size, &mut (&mut self.inner).take(size))? {
+                    skip(&mut self.inner, padding(size), false)?;
+                    continue;
+                }
+                if kind == EntryType::GNUSparse
+                    || extensions.records().iter().any(|(k, _)| k.starts_with(b"GNU.sparse."))
+                {
+                    return Err(io::Error::new(io::ErrorKind::Unsupported, "sparse files are not supported"));
+                }
+                let size = match extensions.get("size").filter(|s| !s.is_empty()) {
+                    Some(record) if has_data => std::str::from_utf8(record)
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| invalid("a PAX size record that isn't a number"))?,
+                    _ => size,
+                };
+                let path = extensions.path().map_or_else(|| header.path_bytes().into_owned(), <[u8]>::to_vec);
+                let link = extensions
+                    .linkpath()
+                    .map(<[u8]>::to_vec)
+                    .or_else(|| header.link_name_bytes().map(|l| l.into_owned()));
+                (self.unread, self.padding) = (size, padding(size));
+                let data = Body { inner: &mut self.inner, unread: &mut self.unread, left: size };
+                return Ok(Some(Entry { path, kind, link, size, data }));
+            }
+        }
+    }
+
+    impl<R: Read> Read for Entry<'_, R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.data.read(buf)
+        }
+    }
+
+    impl<R: Read> Read for Body<'_, R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.left == 0 || buf.is_empty() {
+                return Ok(0);
+            }
+            let want = usize::try_from(self.left).map_or(buf.len(), |left| left.min(buf.len()));
+            let n = self.inner.read(&mut buf[..want])?;
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the archive ends inside an entry"));
+            }
+            self.left -= n as u64;
+            *self.unread -= n as u64;
+            Ok(n)
+        }
+    }
+
+    /// The zeros that fill the last block of `size` bytes of data.
+    fn padding(size: u64) -> u64 {
+        (BLOCK as u64 - size % BLOCK as u64) % BLOCK as u64
+    }
+
+    fn invalid(message: &str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, message.to_owned())
+    }
+
+    /// Reads a whole block; false if the stream ends before its first byte.
+    fn read_block(r: &mut impl Read, block: &mut [u8; BLOCK]) -> io::Result<bool> {
+        let mut have = 0;
+        while have < BLOCK {
+            match r.read(&mut block[have..]) {
+                Ok(0) if have == 0 => return Ok(false),
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the archive ends inside a header")),
+                Ok(n) => have += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Reads and drops `n` bytes; with `strict`, the stream ending first is
+    /// an error. Returns how many there were.
+    fn skip(r: &mut impl Read, n: u64, strict: bool) -> io::Result<u64> {
+        let done = io::copy(&mut r.by_ref().take(n), &mut io::sink())?;
+        if strict && done < n {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the archive ends inside an entry"));
+        }
+        Ok(done)
+    }
 }
 
 #[cfg(test)]
@@ -1246,5 +1448,448 @@ mod tests {
         assert_eq!(named(&format!("{hex}.json")), Some((Digest::of(b""), Some(MAX_CONFIG_BYTES))));
         assert_eq!(named(&format!("blobs/sha256/{hex}")), Some((Digest::of(b""), None)));
         assert_eq!(named(&format!("dir/{hex}.json")), None);
+    }
+
+    // `docker load` takes "a tar archive (even if compressed with gzip, bzip2,
+    // xz or zstd) from a file or STDIN" (Docker docs, `docker image load`:
+    // `docker load < busybox.tar.gz`; moby `tarexport.Load` untars through
+    // `DecompressStream`). `docker save | gzip` is the usual way to move an
+    // image. gzip and zstd are told by their first bytes, as `docker load`
+    // does (`media::detect_compression`); a stream cut short is an error.
+    #[test]
+    fn a_gzip_or_zstd_compressed_archive_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = store(tmp.path(), "a");
+        let img = image(&a, "x:1", &[layer(&[("x", "x")])]);
+        let saved = save_all(&a, &[(img.clone(), vec!["docker.io/library/x:1".into()])]);
+        let compressed = [("gzip", gzip(&saved)), ("zstd", zstd::stream::encode_all(&saved[..], 3).unwrap())];
+        for (i, (how, bytes)) in compressed.iter().enumerate() {
+            let b = store(tmp.path(), &format!("b{i}"));
+            let loaded = load_all(&b, bytes).0.unwrap_or_else(|e| panic!("{how}: {e}"));
+            assert_eq!(loaded[0].image.manifest_digest, img.manifest_digest, "{how}");
+            assert_eq!(ref_names(&b), ["docker.io/library/x:1"], "{how}");
+            // Cut short, or corrupt: an error, and nothing named.
+            let c = store(tmp.path(), &format!("c{i}"));
+            assert!(load_all(&c, &bytes[..bytes.len() / 2]).0.is_err(), "{how}: cut in half");
+            assert!(ref_names(&c).is_empty(), "{how}");
+        }
+        // A stream that hands out a byte or two at a time still tells (and so
+        // does a plain tar).
+        let b = store(tmp.path(), "trickled");
+        let mut events = Vec::new();
+        let mut trickle = Trickle { data: &compressed[0].1, calls: 0 };
+        let loaded = load(&b, &mut trickle, &mut |p| events.push(p)).unwrap();
+        assert_eq!(loaded[0].image.manifest_digest, img.manifest_digest);
+        let c = store(tmp.path(), "trickled-plain");
+        let loaded = load(&c, &mut Trickle { data: &saved, calls: 0 }, &mut |_| {}).unwrap();
+        assert_eq!(loaded[0].image.manifest_digest, img.manifest_digest);
+    }
+
+    /// Hands out one to seven bytes per read, as a network stream may.
+    struct Trickle<'a> {
+        data: &'a [u8],
+        calls: usize,
+    }
+
+    impl Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.data.len().min(buf.len()).min(1 + self.calls % 7);
+            self.calls += 1;
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    /// A tar stream made up as it is read: `head`, then `fill` bytes of
+    /// `b'a'`, then `tail`; `pos` is how much of it was read.
+    struct Generated {
+        head: Vec<u8>,
+        fill: u64,
+        tail: Vec<u8>,
+        pos: u64,
+    }
+
+    impl Read for Generated {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let (head, fill) = (self.head.len() as u64, self.fill);
+            let total = head + fill + self.tail.len() as u64;
+            if self.pos >= total || buf.is_empty() {
+                return Ok(0);
+            }
+            let n = if self.pos < head {
+                let from = &self.head[self.pos as usize..];
+                let n = from.len().min(buf.len());
+                buf[..n].copy_from_slice(&from[..n]);
+                n
+            } else if self.pos < head + fill {
+                let n = ((head + fill - self.pos) as usize).min(buf.len());
+                buf[..n].fill(b'a');
+                n
+            } else {
+                let from = &self.tail[(self.pos - head - fill) as usize..];
+                let n = from.len().min(buf.len());
+                buf[..n].copy_from_slice(&from[..n]);
+                n
+            };
+            self.pos += n as u64;
+            Ok(n)
+        }
+    }
+
+    /// A header block for an entry of this type, `size` bytes of data, and a
+    /// name of up to a hundred bytes.
+    fn header(name: &str, kind: EntryType, size: u64) -> tar::Header {
+        let mut h = tar::Header::new_gnu();
+        h.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+        h.set_entry_type(kind);
+        h.set_mode(0o644);
+        h.set_size(size);
+        h.set_cksum();
+        h
+    }
+
+    // `load` must not hold unbounded amounts of the archive in memory
+    // (archive.rs: "Blobs are streamed …"; JSON files are capped at 4 and 8
+    // MiB; the unpacker caps extension headers at 1 MiB for the same reason,
+    // §2.4 "Extension headers"). The `tar` crate's reader reads a GNU
+    // long-name (`L`) or PAX (`x`) header's data whole into a `Vec`
+    // (tar 0.4.46 `archive.rs` `next_entry`: `EntryFields::from(entry)
+    // .read_all()`), however large its header says it is: a crafted or
+    // corrupt archive with a 192 MiB long name made `load` allocate all of
+    // it (256 MiB of RSS were seen). Now the header is refused as the
+    // unpacker refuses one, before its data is read: the archive is read for
+    // a few KiB, not 192 MiB. One at the cap is read, as the unpacker reads
+    // it.
+    #[test]
+    fn an_oversized_extension_header_is_refused_without_reading_it() {
+        const HUGE: u64 = 192 << 20;
+        let tmp = tempfile::tempdir().unwrap();
+        let b = store(tmp.path(), "b");
+        let regular = header("x", EntryType::Regular, 0);
+        for (kind, name) in [
+            (EntryType::GNULongName, "././@LongLink"),
+            (EntryType::GNULongLink, "././@LongLink"),
+            (EntryType::XHeader, "PaxHeaders.0/x"),
+        ] {
+            let long = header(name, kind, HUGE);
+            let mut tail = vec![b'a'; ((512 - HUGE % 512) % 512) as usize];
+            tail.extend_from_slice(regular.as_bytes());
+            tail.extend_from_slice(&[0u8; 1024]);
+            let mut input = Generated { head: long.as_bytes().to_vec(), fill: HUGE, tail, pos: 0 };
+            let err = load(&b, &mut input, &mut |_| {}).unwrap_err().to_string();
+            assert!(err.contains("an extension header of 201326592 bytes (at most 1048576)"), "{kind:?}: {err}");
+            assert!(
+                input.pos < 1 << 20,
+                "{kind:?}: {} bytes of the archive were read before it was refused",
+                input.pos
+            );
+        }
+        // At the cap: a long name that is read (and then, in an archive of no
+        // images, the usual refusal).
+        let cap = crate::unpack::extensions::MAX_HEADER;
+        let mut at_cap = tar::Builder::new(Vec::new());
+        let long = header("././@LongLink", EntryType::GNULongName, cap);
+        at_cap.append(&long, &vec![b'n'; cap as usize][..]).unwrap();
+        at_cap.append(&header("x", EntryType::Regular, 0), io::empty()).unwrap();
+        let err = load_all(&b, &at_cap.into_inner().unwrap()).0.unwrap_err();
+        assert!(err.to_string().contains("not an image archive"), "{err}");
+    }
+
+    // Go writes a size that doesn't fit the header's field (over 8 GiB: a
+    // layer's blob, in `docker save` of a big image) in a PAX `size` record
+    // and leaves the field 0. The entry is that long, then: `tar`'s own
+    // reader applied the record, and so must the one that replaced it. (Here
+    // the data is small, the shape is the same.)
+    #[test]
+    fn a_pax_size_record_is_the_entrys_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (store(tmp.path(), "a"), store(tmp.path(), "b"));
+        let img = image(&a, "big:1", &[layer(&[("x", "x")]), layer(&[("y", "y")])]);
+        let saved = save_all(&a, &[(img.clone(), vec!["docker.io/library/big:1".into()])]);
+        let mut out = tar::Builder::new(Vec::new());
+        for (name, data) in files(&saved) {
+            let data = match &data {
+                Item::File(d) => d,
+                _ => unreachable!(),
+            };
+            if name.starts_with("blobs/") {
+                out.append_pax_extensions([("size", data.len().to_string().as_bytes())]).unwrap();
+                out.append(&header(&name, EntryType::Regular, 0), &data[..]).unwrap();
+            } else {
+                out.append(&header(&name, EntryType::Regular, data.len() as u64), &data[..]).unwrap();
+            }
+        }
+        let loaded = load_all(&b, &out.into_inner().unwrap()).0.unwrap();
+        assert_eq!(loaded[0].image.manifest_digest, img.manifest_digest);
+        assert_eq!(Image::load(&b, "big:1").unwrap().layers, img.layers);
+    }
+
+    // Names come from where the archive puts them: a ustar header's prefix
+    // field, GNU's `L` entries (the `tar` crate writes one for a name that
+    // doesn't fit), and PAX `path` records (what Go writes). Docker's older
+    // format has directories named by 64 hex digits, so only a long layer
+    // name tests them; its `manifest.json` names the paths in full.
+    #[test]
+    fn long_paths_come_from_ustar_prefixes_gnu_long_names_and_pax_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = store(tmp.path(), "b");
+        let layers = [layer(&[("a", "1")]), layer(&[("b", "2")]), layer(&[("c", "3")])];
+        let paths: Vec<String> =
+            ['g', 'u', 'p'].iter().map(|c| format!("{}/layer.tar", c.to_string().repeat(120))).collect();
+        let diff_ids: Vec<Digest> = layers.iter().map(|l| Digest::of(l)).collect();
+        let config = config_json(&diff_ids, "amd64");
+        let config_name = format!("{}.json", Digest::of(&config).hex());
+        let manifest = json!([{"Config": config_name, "RepoTags": ["long:1"], "Layers": paths}]);
+        let mut out = tar::Builder::new(Vec::new());
+        // GNU: the builder's own `L` entry.
+        let mut gnu = tar::Header::new_gnu();
+        gnu.set_size(layers[0].len() as u64);
+        gnu.set_mode(0o644);
+        out.append_data(&mut gnu, &paths[0], &layers[0][..]).unwrap();
+        // ustar: the path split into prefix and name.
+        let mut ustar = tar::Header::new_ustar();
+        ustar.set_size(layers[1].len() as u64);
+        ustar.set_mode(0o644);
+        let before_ustar = files_len(&out);
+        out.append_data(&mut ustar, &paths[1], &layers[1][..]).unwrap();
+        assert_eq!(
+            files_len(&out) - before_ustar,
+            512 + layers[1].len(),
+            "a `L` entry for the ustar name: its prefix wasn't used"
+        );
+        // PAX: a short name in the header, the path in a record.
+        out.append_pax_extensions([("path", paths[2].as_bytes())]).unwrap();
+        out.append(&header("short", EntryType::Regular, layers[2].len() as u64), &layers[2][..]).unwrap();
+        for (name, data) in
+            [(config_name.as_str(), config.clone()), ("manifest.json", manifest.to_string().into_bytes())]
+        {
+            out.append(&header(name, EntryType::Regular, data.len() as u64), &data[..]).unwrap();
+        }
+        let loaded = load_all(&b, &out.into_inner().unwrap()).0.unwrap();
+        assert_eq!(loaded[0].names, ["docker.io/library/long:1"]);
+        assert_eq!(loaded[0].image.layers.iter().map(|l| l.diff_id.clone()).collect::<Vec<_>>(), diff_ids);
+    }
+
+    /// How much of an archive being built is written so far.
+    fn files_len(b: &tar::Builder<Vec<u8>>) -> usize {
+        b.get_ref().len()
+    }
+
+    // A link has no data blocks, whatever its header's size field says (Go's
+    // reader: `isHeaderOnlyType`; some old tars wrote the file's size there):
+    // the entry after it is where it is, not that many bytes on.
+    #[test]
+    fn a_link_has_no_data_whatever_its_size_field_says() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = store(tmp.path(), "b");
+        let tar = layer(&[("etc/hostname", "legacy\n")]);
+        let config = config_json(&[Digest::of(&tar), Digest::of(&tar)], "amd64");
+        let config_name = format!("{}.json", Digest::of(&config).hex());
+        let manifest =
+            json!([{"Config": config_name, "RepoTags": ["links:1"], "Layers": ["aaa/layer.tar", "bbb/layer.tar"]}]);
+        let mut out = tar::Builder::new(Vec::new());
+        out.append(&header("aaa/layer.tar", EntryType::Regular, tar.len() as u64), &tar[..]).unwrap();
+        let mut link = header("bbb/layer.tar", EntryType::Link, tar.len() as u64);
+        link.as_old_mut().linkname[.."aaa/layer.tar".len()].copy_from_slice(b"aaa/layer.tar");
+        link.set_cksum();
+        out.append(&link, io::empty()).unwrap();
+        for (name, data) in
+            [(config_name.as_str(), config.clone()), ("manifest.json", manifest.to_string().into_bytes())]
+        {
+            out.append(&header(name, EntryType::Regular, data.len() as u64), &data[..]).unwrap();
+        }
+        let loaded = load_all(&b, &out.into_inner().unwrap()).0.unwrap();
+        assert_eq!(loaded[0].image.layers[0].blob, loaded[0].image.layers[1].blob);
+    }
+
+    // Entries that aren't files are passed over with their data (a global
+    // PAX header, such as `git archive` writes first); what the reader can't
+    // follow is an error naming what is wrong.
+    #[test]
+    fn global_headers_are_skipped_and_what_cant_be_read_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (store(tmp.path(), "a"), store(tmp.path(), "b"));
+        let img = image(&a, "x:1", &[layer(&[("x", "x")])]);
+        let saved = save_all(&a, &[(img.clone(), vec!["docker.io/library/x:1".into()])]);
+        let mut with_global = tar::Builder::new(Vec::new());
+        let record = b"17 comment=hello\n";
+        with_global.append(&header("pax_global_header", EntryType::XGlobalHeader, 17), &record[..]).unwrap();
+        let mut bytes = with_global.into_inner().unwrap();
+        bytes.truncate(bytes.len() - 1024);
+        bytes.extend_from_slice(&saved);
+        assert_eq!(load_all(&b, &bytes).0.unwrap()[0].image.manifest_digest, img.manifest_digest);
+
+        let refused = |bytes: Vec<u8>| load_all(&store(tmp.path(), "c"), &bytes).0.unwrap_err().to_string();
+        let mut sparse = tar::Builder::new(Vec::new());
+        sparse.append(&header("blobs/sha256/x", EntryType::GNUSparse, 0), io::empty()).unwrap();
+        assert!(refused(sparse.into_inner().unwrap()).contains("sparse"));
+        let mut flipped = saved.clone();
+        flipped[3] ^= 0xff;
+        assert!(refused(flipped).contains("checksum"));
+        let ends_in_a_header = saved[..1100].to_vec();
+        assert!(refused(ends_in_a_header).contains("ends inside"));
+        let mut dangling = tar::Builder::new(Vec::new());
+        dangling.append_pax_extensions([("path", &b"never"[..])]).unwrap();
+        assert!(refused(dangling.into_inner().unwrap()).contains("never comes"));
+    }
+
+    // Low severity, a design trade-off: archive.rs checks Docker's older
+    // format's layers against the config's diff IDs ("as Docker's loader
+    // checks": moby `image/tarexport/load.go`, "invalid diffID for layer"),
+    // and the module says names are set "only once every image loads"; the
+    // daemon promises "`rustlet load` means runnable" (rustletd/src/
+    // archive.rs). For an OCI layout (`save`'s own, Docker 25+'s) the diff IDs
+    // aren't checked until the unpack (as for a pull), so an image whose
+    // layer isn't what its config says is named, and the daemon's unpack then
+    // fails with the name already in place. Docker 25+ archives carry
+    // `manifest.json` too, which Docker's loader reads and checks; rustlet
+    // prefers `index.json`. The very same archive without `index.json` is
+    // refused. Kept as it is, and documented; this says what happens.
+    #[test]
+    fn an_oci_layout_is_not_checked_against_its_diff_ids_until_the_unpack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b, c) = (store(tmp.path(), "a"), store(tmp.path(), "b"), store(tmp.path(), "c"));
+        let tar = layer(&[("etc/motd", "hello")]);
+        let gz = gzip(&tar);
+        let blob = a.write_blob(&gz).unwrap();
+        let layers = [content::descriptor(media::OCI_LAYER_GZIP, &blob, gz.len() as u64)];
+        let target = import::write_image(&a, &config_json(&[Digest::of(b"not that layer")], "amd64"), &layers).unwrap();
+        let img = Image::from_manifest(&a, &Digest::from_oci(target.digest()).unwrap(), None, None).unwrap();
+        let saved = save_all(&a, &[(img, vec!["docker.io/library/lying:1".to_owned()])]);
+
+        // Docker's older format, from the same archive: refused.
+        let legacy: Vec<_> = files(&saved).into_iter().filter(|(n, _)| n != "index.json").collect();
+        let err = load_all(&c, &archive(&legacy)).0.unwrap_err();
+        assert!(matches!(err, Error::DigestMismatch { .. }), "{err}");
+        assert!(ref_names(&c).is_empty());
+
+        // The OCI layout: loaded, and named.
+        assert_eq!(load_all(&b, &saved).0.unwrap().len(), 1);
+        assert_eq!(ref_names(&b), ["docker.io/library/lying:1"]);
+    }
+
+    // save: Docker's own manifest.json beside a valid OCI layout, every blob
+    // named by the SHA-256 of its bytes, a shared blob once, entries in a
+    // fixed order with fixed headers, and the same bytes whatever the order
+    // asked for.
+    #[test]
+    fn save_writes_a_valid_layout_with_every_blob_named_by_its_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = store(tmp.path(), "a");
+        let base = layer(&[("etc/os-release", "ID=test\n")]);
+        let x = image(&a, "x:1", &[base.clone(), layer(&[("x", "x")])]);
+        let y = image(&a, "ghcr.io/o/y:2", &[base, layer(&[("y", "y")])]);
+        let names = |n: &str| vec![n.to_owned()];
+        let one = save_all(&a, &[(x.clone(), names("docker.io/library/x:1")), (y.clone(), names("ghcr.io/o/y:2"))]);
+        let two = save_all(&a, &[(y.clone(), names("ghcr.io/o/y:2")), (x.clone(), names("docker.io/library/x:1"))]);
+        assert_eq!(one, two);
+        let items = files(&one);
+        assert_eq!(data(&items, "oci-layout"), br#"{"imageLayoutVersion":"1.0.0"}"#);
+        let mut seen = BTreeSet::new();
+        for (name, _) in &items {
+            if let Some(hex) = name.strip_prefix("blobs/sha256/") {
+                assert_eq!(Digest::of(data(&items, name)).hex(), hex, "{name} isn't named by its hash");
+                assert!(seen.insert(hex.to_owned()), "{name} written twice");
+            }
+        }
+        // 2 manifests + 2 configs + 3 layers (the base is shared).
+        assert_eq!(seen.len(), 7);
+        let index: Value = serde_json::from_slice(data(&items, "index.json")).unwrap();
+        assert_eq!(index["schemaVersion"], 2);
+        for d in index["manifests"].as_array().unwrap() {
+            let digest = d["digest"].as_str().unwrap();
+            let blob = data(&items, &format!("blobs/sha256/{}", digest.strip_prefix("sha256:").unwrap()));
+            assert_eq!(d["size"].as_u64().unwrap(), blob.len() as u64);
+            let manifest: Value = serde_json::from_slice(blob).unwrap();
+            assert_eq!(manifest["mediaType"], d["mediaType"]);
+        }
+        let docker: Vec<Value> = serde_json::from_slice(data(&items, "manifest.json")).unwrap();
+        assert_eq!(docker.len(), 2);
+        for m in &docker {
+            assert!(m["Config"].as_str().unwrap().starts_with("blobs/sha256/"));
+            assert_eq!(m["Layers"].as_array().unwrap().len(), 2);
+        }
+    }
+
+    // load: a symlink between duplicate legacy layers may point at an entry
+    // that comes later in the archive, and entries may carry `./` prefixes.
+    #[test]
+    fn legacy_links_may_point_to_later_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = store(tmp.path(), "b");
+        let tar = layer(&[("etc/hostname", "legacy\n")]);
+        let config = config_json(&[Digest::of(&tar), Digest::of(&tar)], "amd64");
+        let config_name = format!("{}.json", Digest::of(&config).hex());
+        let manifest = json!([{
+            "Config": config_name, "RepoTags": ["later:1"], "Layers": ["./aaa/layer.tar", "bbb/layer.tar"],
+        }]);
+        let mut out = tar::Builder::new(Vec::new());
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(EntryType::Symlink);
+        link.set_size(0);
+        link.set_mode(0o777);
+        out.append_link(&mut link, "./aaa/layer.tar", "../bbb/layer.tar").unwrap();
+        for (name, data) in [
+            ("bbb/layer.tar", tar.clone()),
+            (config_name.as_str(), config.clone()),
+            ("manifest.json", manifest.to_string().into_bytes()),
+        ] {
+            let mut h = tar::Header::new_gnu();
+            h.set_mode(0o644);
+            h.set_size(data.len() as u64);
+            h.set_cksum();
+            out.append_data(&mut h, name, &data[..]).unwrap();
+        }
+        let loaded = load_all(&b, &out.into_inner().unwrap()).0.unwrap();
+        assert_eq!(loaded[0].names, ["docker.io/library/later:1"]);
+        assert_eq!(loaded[0].image.layers[0].blob, loaded[0].image.layers[1].blob);
+    }
+
+    // Cuts inside headers or payloads fail without names, kept images or
+    // partial files. Omitted final tar padding/trailers are accepted.
+    #[test]
+    fn a_truncated_archive_leaves_nothing_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (store(tmp.path(), "a"), store(tmp.path(), "b"));
+        let img = image(&a, "x:1", &[layer(&[("x", &"x".repeat(100_000))])]);
+        let saved = save_all(&a, &[(img.clone(), vec!["docker.io/library/x:1".into()])]);
+        let mut archive = tar::Archive::new(&saved[..]);
+        let mut cuts: Vec<usize> = archive
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.raw_file_position() + entry.size() - 1) as usize
+            })
+            .collect();
+        cuts.push(1100); // inside index.json's header
+        for cut in cuts {
+            assert!(load_all(&b, &saved[..cut]).0.is_err(), "cut {cut}");
+            assert_eq!(std::fs::read_dir(tmp.path().join("b/ingest")).unwrap().count(), 0, "cut {cut}: partials");
+            assert!(ref_names(&b).is_empty() && b.kept().unwrap().is_empty(), "cut {cut}");
+        }
+    }
+
+    // load: what `tar` makes of an extracted layout (`./` before every name,
+    // directory entries) loads as `save`'s own output does.
+    #[test]
+    fn a_layout_repacked_by_tar_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (store(tmp.path(), "a"), store(tmp.path(), "b"));
+        let img = image(&a, "x:1", &[layer(&[("x", "x")])]);
+        let saved = save_all(&a, &[(img.clone(), vec!["docker.io/library/x:1".into()])]);
+        let dir = tmp.path().join("layout");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(tmp.path().join("saved.tar"), &saved).unwrap();
+        let run = |args: &[&std::ffi::OsStr]| {
+            assert!(std::process::Command::new("tar").args(args).status().unwrap().success());
+        };
+        run(&["-xf".as_ref(), tmp.path().join("saved.tar").as_os_str(), "-C".as_ref(), dir.as_os_str()]);
+        let out = tmp.path().join("again.tar");
+        run(&["-C".as_ref(), dir.as_os_str(), "-cf".as_ref(), out.as_os_str(), ".".as_ref()]);
+        let loaded = load_all(&b, &std::fs::read(&out).unwrap()).0.unwrap();
+        assert_eq!(loaded[0].image.manifest_digest, img.manifest_digest);
+        assert_eq!(ref_names(&b), ["docker.io/library/x:1"]);
     }
 }

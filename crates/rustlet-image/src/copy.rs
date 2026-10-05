@@ -28,8 +28,12 @@
 //!
 //! - Each source is a path relative to the source root (a leading `/` is
 //!   the root too: the build context can't be left), and may hold wildcards
-//!   (`*`, `?`, `[…]`, Go's `filepath.Match`, per component). A source that
-//!   matches nothing is an error, naming it.
+//!   (`*`, `?`, `[…]`, Go's `filepath.Match`, per component). A name that
+//!   isn't there is an error, naming it; a wildcard that matches nothing is
+//!   not (BuildKit's rule, for `COPY package.json yarn.lock* ./`): it is
+//!   listed in [`CopyReport::unmatched`], and only a directory named before
+//!   the wildcard that doesn't exist is an error (as BuildKit's walk of it
+//!   fails).
 //! - The destination is absolute, or relative to the working directory; a
 //!   trailing `/` makes it a directory. With more than one source (or a
 //!   wildcard matching more than one), it must be one.
@@ -40,16 +44,20 @@
 //!   resolving it), else to the destination path itself.
 //! - Copies keep their source's mode (`spec.mode`, `--chmod`, replaces it
 //!   for every file and directory copied), modification time and extended
-//!   attributes (overlay's own excepted); their owner is `spec.owner`
-//!   (`0:0` unless `--chown`). Directories the copy has to create, the
-//!   destination's missing parents included, are `0755` and also
-//!   `spec.owner`'s. Hard links between copied files stay links.
+//!   attributes (overlay's own excepted); their owner is `spec.owner` (the
+//!   `--chown`, or root for a build context's files), or, if that is `None`,
+//!   their source's own (`COPY --from` without `--chown`, as Docker does).
+//!   Directories the copy has to create, the destination's missing parents
+//!   included, are `0755` and also `spec.owner`'s (root's, for `None`). Hard
+//!   links between copied files stay links.
 //! - `ADD` (`spec.extract_archives`): a source that is a tar archive
 //!   (plain, gzip or zstd, told by its content, not its name) is extracted
 //!   into the destination directory instead of copied, as `tar -x` would
 //!   (`unpack::unpack_with` without whiteouts, confined to that directory),
-//!   keeping the archive's owners and modes. Anything else is copied as by
-//!   `COPY`. (URLs are refused before this module is reached.)
+//!   keeping the archive's modes, and its owners unless `spec.owner` says
+//!   otherwise (BuildKit gives every extracted entry the `--chown` owner).
+//!   Anything else is copied as by `COPY`. (URLs are refused before this
+//!   module is reached.)
 //!
 //! Unprivileged (the unit tests), owners can't be set: the copies keep the
 //! caller's, as `unpack` does.
@@ -58,10 +66,11 @@
 //!
 //! [`digest`] hashes what [`copy`] would copy, with the same matching:
 //! every entry's path relative to its source, type, mode, size and content
-//! (a SHA-256 of a file's bytes), a symlink's target; plus the
-//! destination, owner and `--chmod`. Not modification times and not the
-//! source's owners (the copy sets its own): touching a file doesn't make a
-//! cached `COPY` run again, changing its content does.
+//! (a SHA-256 of a file's bytes), a symlink's target, its extended
+//! attributes (the ones `copy` copies); plus the destination, owner and
+//! `--chmod`. Not modification times, and not the source's owners unless
+//! `spec.owner` is `None` (the copy then has them): touching a file doesn't
+//! make a cached `COPY` run again, changing its content does.
 //!
 //! ## In detail
 //!
@@ -101,25 +110,31 @@
 //! left out; any other failure is an error.
 //!
 //! **An archive** is a regular file whose first 512 bytes, decompressed if
-//! a gzip or zstd magic number starts it, are a tar header: `ustar` at
-//! offset 257 (POSIX's `ustar\0`, GNU's `ustar `) and a checksum that adds
-//! up as the `tar` crate counts it. A compressed file that doesn't
-//! decompress, or holds anything else, is copied as it is; bzip2 and xz
-//! aren't recognised. Device nodes in an archive are skipped, and listed as
-//! `<archive>/<entry>`. An entry for the archive's own root (`./`) gives
-//! the destination directory its metadata, as `tar -x` does (Docker skips
-//! it).
+//! a gzip or zstd magic number starts it, are a tar header as Go's reader
+//! tells one (`archive/tar`, which Docker's `IsArchivePath` asks): a
+//! checksum, in octal, that is the sum of the block's bytes with its own
+//! field as spaces, unsigned or signed. The magic number only names the
+//! format, so V7 archives (none) count. A compressed file that doesn't
+//! decompress, or holds anything else, is copied as it is. A file with an
+//! xz or bzip2 magic number and a tar's name (`.tar.xz`, `.txz`, `.tar.bz2`,
+//! `.tbz`, `.tbz2`) is an error, not a copy: those aren't extracted, and the
+//! `ADD` that expects them to be would otherwise build a wrong image. Device
+//! nodes in an archive are skipped, and listed as `<archive>/<entry>`. An
+//! entry for the archive's own root (`./`) is skipped, as Docker skips it:
+//! the destination directory keeps its own metadata.
 //!
 //! A copy that fails leaves what it made: the builder throws the step's
 //! root filesystem away.
 //!
 //! **The digest** is a SHA-256 of length-prefixed fields: a version; the
 //! destination (absolute, cleaned, ending in `/` if it names a directory),
-//! the owner, `--chmod` and `ADD`; then, for each source matched, its path,
-//! and for each entry it copies, in the walk's order (names sorted, depth
-//! first): its kind, its path below the source, the mode its copy gets,
-//! and its size and content digest, its target, or, for a later name of an
-//! inode with several, the first name.
+//! the owner (a marker for `None`, apart from every `Some`), `--chmod` and
+//! `ADD`; then, for each source matched (a wildcard that matched nothing
+//! has none), its path, and for each entry it copies, in the walk's order
+//! (names sorted, depth first): its kind, its path below the source, the
+//! mode its copy gets (and, for a `None` owner, its source's), and its size
+//! and content digest, its target, or, for a later name of an inode with
+//! several, the first name; then the attributes its copy gets, sorted.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -149,11 +164,16 @@ const RESOLVE: ResolveFlags = ResolveFlags::IN_ROOT.union(ResolveFlags::NO_MAGIC
 /// How many levels below a copied directory the tree may go.
 const MAX_DEPTH: usize = 4096;
 /// Attribute namespaces overlayfs keeps for itself.
-const OVERLAY_XATTRS: [&str; 2] = ["trusted.overlay.", "user.overlay."];
-/// A tar header, and where in it the magic and the checksum are.
+fn overlay_xattr(name: &str) -> bool {
+    name.starts_with(if nix::unistd::geteuid().is_root() { "trusted.overlay." } else { "user.overlay." })
+}
+/// A tar header, and where in it the checksum is.
 const BLOCK: usize = 512;
-const MAGIC: std::ops::Range<usize> = 257..262;
 const CHECKSUM: std::ops::Range<usize> = 148..156;
+/// The names of tar archives `ADD` doesn't extract (see [`refuse_other_archive`]).
+const OTHER_TARS: [&[u8]; 5] = [b".tar.xz", b".txz", b".tar.bz2", b".tbz", b".tbz2"];
+/// An xz file starts with these; a bzip2 file with `BZh` and a digit.
+const XZ_MAGIC: [u8; 6] = [0xfd, b'7', b'z', b'X', b'Z', 0];
 
 /// One `COPY` or `ADD`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,8 +184,12 @@ pub struct CopySpec {
     pub dest: String,
     /// The image's working directory, absolute.
     pub workdir: String,
-    /// The owner of every copy and of the directories made (`--chown`).
-    pub owner: (u32, u32),
+    /// The owner of every copy and of the directories made for the
+    /// destination (`--chown`; root for a build context's files). `None`
+    /// keeps each copy's own source owner, as `COPY --from` does without
+    /// `--chown`; the directories made only to hold the destination are then
+    /// root's.
+    pub owner: Option<(u32, u32)>,
     /// `--chmod`: the mode of every file and directory copied.
     pub mode: Option<u32>,
     /// `ADD`: extract tar archives instead of copying them.
@@ -183,6 +207,9 @@ pub struct CopyReport {
     pub extracted: u64,
     /// Device nodes and sockets left out, as source paths.
     pub skipped: Vec<PathBuf>,
+    /// Wildcard sources that matched nothing, as the instruction gives them.
+    /// Not an error (`COPY package.json yarn.lock* ./`), but worth a warning.
+    pub unmatched: Vec<String>,
 }
 
 /// Copies `spec.sources` from the source root `src` (the build context's
@@ -192,7 +219,7 @@ pub fn copy(src: BorrowedFd<'_>, dest: BorrowedFd<'_>, spec: &CopySpec) -> Resul
     check_directory(src, "the source")?;
     check_directory(dest, "the root filesystem")?;
     let target = Target::new(spec);
-    let sources = expand(src, &spec.sources)?;
+    let Expanded { named: sources, unmatched } = expand(src, &spec.sources)?;
     // Docker's rule, checked before anything is written.
     let into = target.dir || existing_dir(dest, &target)?;
     if sources.len() > 1 && !into {
@@ -204,7 +231,8 @@ pub fn copy(src: BorrowedFd<'_>, dest: BorrowedFd<'_>, spec: &CopySpec) -> Resul
     let mut copier = Copier {
         spec,
         privileged: nix::unistd::geteuid().is_root(),
-        report: CopyReport::default(),
+        repeated_sources: sources.len() > 1,
+        report: CopyReport { unmatched, ..CopyReport::default() },
         links: HashMap::new(),
     };
     for named in &sources {
@@ -218,12 +246,24 @@ pub fn copy(src: BorrowedFd<'_>, dest: BorrowedFd<'_>, spec: &CopySpec) -> Resul
 pub fn digest(src: BorrowedFd<'_>, spec: &CopySpec) -> Result<Digest> {
     check_directory(src, "the source")?;
     let target = Target::new(spec);
-    let sources = expand(src, &spec.sources)?;
-    let mut digester = Digester { hasher: Hasher::new(), mode: spec.mode, links: HashMap::new() };
-    digester.field(b"rustlet copy 1");
+    let Expanded { named: sources, .. } = expand(src, &spec.sources)?;
+    let mut digester = Digester {
+        hasher: Hasher::new(),
+        mode: spec.mode,
+        source_owners: spec.owner.is_none(),
+        extract: spec.extract_archives,
+        links: HashMap::new(),
+    };
+    digester.field(b"rustlet copy 2");
     digester.field(target.absolute().as_bytes());
-    digester.number(spec.owner.0.into());
-    digester.number(spec.owner.1.into());
+    match spec.owner {
+        Some((uid, gid)) => {
+            digester.number(1);
+            digester.number(uid.into());
+            digester.number(gid.into());
+        }
+        None => digester.number(0),
+    }
     digester.number(spec.mode.map_or(u64::MAX, u64::from));
     digester.number(spec.extract_archives.into());
     for named in &sources {
@@ -318,12 +358,23 @@ impl fmt::Display for Named<'_> {
     }
 }
 
+/// The sources of a copy, their wildcards matched.
+struct Expanded<'a> {
+    /// In order, each match a source of its own.
+    named: Vec<Named<'a>>,
+    /// The wildcards that matched nothing, as given.
+    unmatched: Vec<String>,
+}
+
 /// `sources` with their wildcards matched, in order (see the module docs).
-fn expand<'a>(src: BorrowedFd<'_>, sources: &'a [String]) -> Result<Vec<Named<'a>>> {
+/// The one place that decides what a copy selects, for [`copy`] and
+/// [`digest`] alike.
+fn expand<'a>(src: BorrowedFd<'_>, sources: &'a [String]) -> Result<Expanded<'a>> {
     if sources.is_empty() {
         return Err(Error::invalid("no source files were specified"));
     }
     let mut out = Vec::new();
+    let mut unmatched = Vec::new();
     for given in sources {
         let components = clean(given);
         // Names up to the first pattern, patterns from there on, as
@@ -332,7 +383,11 @@ fn expand<'a>(src: BorrowedFd<'_>, sources: &'a [String]) -> Result<Vec<Named<'a
         let first = components.iter().position(|c| glob::is_pattern(c.as_bytes()));
         let (names_part, patterns) = components.split_at(first.unwrap_or(components.len()));
         let pattern = first.is_some();
-        let mut matched = vec![names_part.iter().collect::<PathBuf>()];
+        let base = names_part.iter().collect::<PathBuf>();
+        if pattern {
+            exists(src, &base, given)?;
+        }
+        let mut matched = vec![base];
         for component in patterns {
             // Checked here, whatever the directories hold: matching an
             // empty name goes through the whole pattern.
@@ -349,12 +404,28 @@ fn expand<'a>(src: BorrowedFd<'_>, sources: &'a [String]) -> Result<Vec<Named<'a
             }
             matched = next;
         }
+        // Only a wildcard can match nothing: a name is one match, there or
+        // not (`open_named` says which).
         if matched.is_empty() {
-            return Err(Error::NotFound(format!("source {given:?}: no file or directory matches it")));
+            unmatched.push(given.clone());
+            continue;
         }
         out.extend(matched.into_iter().map(|rel| Named { given, rel, pattern }));
     }
-    Ok(out)
+    Ok(Expanded { named: out, unmatched })
+}
+
+/// The names before a wildcard must be there, as BuildKit's walk of them
+/// fails if they aren't (a typo, not a pattern that matched nothing).
+fn exists(src: BorrowedFd<'_>, base: &Path, given: &str) -> Result<()> {
+    let p = if base.as_os_str().is_empty() { Path::new(".") } else { base };
+    match openat2(Some(src), p, OFlag::O_PATH, Mode::empty(), RESOLVE) {
+        Ok(_) => Ok(()),
+        Err(Errno::ENOENT | Errno::ENOTDIR) => {
+            Err(Error::NotFound(format!("source {given:?}: {} is not there", shown(base))))
+        }
+        Err(e) => Err(e).with_context(|| format!("source {given:?}: open {}", shown(base))),
+    }
 }
 
 /// The names in the directory `dir` of the source root, sorted; none if it
@@ -461,20 +532,60 @@ fn archive(file: &mut File) -> io::Result<Option<Compression>> {
     }
 }
 
-/// Is `block` a tar header: the magic, and a checksum that adds up as the
-/// `tar` crate counts it (bytes unsigned, the checksum field as spaces)?
-fn is_tar_header(block: &[u8]) -> bool {
-    if block.len() != BLOCK || &block[MAGIC] != b"ustar" {
+/// Is `block` a tar header? As Go's reader decides (`archive/tar`,
+/// `block.getFormat`, which Docker's `IsArchivePath` asks): its checksum
+/// field holds an octal number (padded with spaces or NULs) equal to the sum
+/// of the block's bytes with that field taken as spaces, counted unsigned or
+/// signed. The magic number only says which format it is: a V7 header has
+/// none, and is one.
+pub(crate) fn is_tar_header(block: &[u8]) -> bool {
+    if block.len() != BLOCK {
         return false;
     }
-    let mut header = tar::Header::new_old();
-    header.as_mut_bytes().copy_from_slice(block);
-    let sum = block
-        .iter()
-        .enumerate()
-        .map(|(i, &b)| if CHECKSUM.contains(&i) { u32::from(b' ') } else { u32::from(b) })
-        .sum::<u32>();
-    header.cksum().is_ok_and(|cksum| cksum == sum)
+    let padding = |b: &u8| *b == b' ' || *b == 0;
+    let field = &block[CHECKSUM];
+    let Some(start) = field.iter().position(|b| !padding(b)) else { return false };
+    let field = &field[start..];
+    // Up to the first NUL, as Go reads a string field.
+    let field = field.split(|&b| b == 0).next().unwrap_or_default();
+    let Some(field) = field.iter().rposition(|b| !padding(b)).map(|end| &field[..=end]) else { return false };
+    if !field.iter().all(|b| (b'0'..=b'7').contains(b)) {
+        return false;
+    }
+    let value = field.iter().fold(0i64, |v, &b| v * 8 + i64::from(b - b'0'));
+    let (mut unsigned, mut signed) = (0i64, 0i64);
+    for (i, &b) in block.iter().enumerate() {
+        let b = if CHECKSUM.contains(&i) { b' ' } else { b };
+        unsigned += i64::from(b);
+        signed += i64::from(b as i8);
+    }
+    value == unsigned || value == signed
+}
+
+/// `ADD` doesn't extract xz or bzip2 archives (it has no decompressor for
+/// them), and copying one as a file where the Dockerfile means it to be
+/// extracted would build a wrong image without a word: a file with such a
+/// magic number and a tar's name is an error, saying what to do instead.
+/// `file` is left at its start.
+fn refuse_other_archive(rel: &Path, file: &mut File, shown: &str) -> Result<()> {
+    let name = rel.file_name().map(|n| n.as_bytes().to_ascii_lowercase()).unwrap_or_default();
+    if !OTHER_TARS.iter().any(|ext| name.ends_with(ext)) {
+        return Ok(());
+    }
+    let mut magic = Vec::with_capacity(XZ_MAGIC.len());
+    (&mut *file).take(XZ_MAGIC.len() as u64).read_to_end(&mut magic).with_context(|| format!("{shown}: read"))?;
+    file.rewind().with_context(|| format!("{shown}: read"))?;
+    let kind = if magic == XZ_MAGIC {
+        "xz"
+    } else if magic.starts_with(b"BZh") && magic.get(3).is_some_and(|d| (b'1'..=b'9').contains(d)) {
+        "bzip2"
+    } else {
+        return Ok(());
+    };
+    Err(Error::unsupported(format!(
+        "{shown}: a {kind} archive, which ADD can't extract (rustlet extracts tar, gzip and zstd archives): \
+         decompress it first with RUN, or use COPY to copy the file as it is"
+    )))
 }
 
 /// A directory being copied: its entries are copied in turn, then its own
@@ -497,8 +608,6 @@ struct Linked {
     copy: OwnedFd,
     /// Its first name, as messages show it.
     shown: String,
-    /// Names of the source inode not seen yet. Names outside what is
-    /// copied are never seen: such an entry stays to the end.
     remaining: u64,
 }
 
@@ -506,6 +615,8 @@ struct Copier<'a> {
     spec: &'a CopySpec,
     /// Running as root: what is made gets `spec.owner`.
     privileged: bool,
+    /// Several sources may visit the same inode more than st_nlink times.
+    repeated_sources: bool,
     report: CopyReport,
     /// Inodes with more than one name, by the source's `(st_dev, st_ino)`.
     links: HashMap<(u64, u64), Linked>,
@@ -533,11 +644,12 @@ impl Copier<'_> {
             }
             libc::S_IFREG => {
                 let mut from = File::from(open_checked(fd.as_fd(), &st, &shown)?);
-                if self.spec.extract_archives
-                    && let Some(compression) = archive(&mut from).with_context(|| format!("{shown}: read"))?
-                {
-                    let to = self.dest_dir(root, &target.path, target)?;
-                    return self.extract(from, compression, to.as_fd(), &named.rel, &shown);
+                if self.spec.extract_archives {
+                    if let Some(compression) = archive(&mut from).with_context(|| format!("{shown}: read"))? {
+                        let to = self.dest_dir(root, &target.path, target)?;
+                        return self.extract(from, compression, to.as_fd(), &named.rel, &shown);
+                    }
+                    refuse_other_archive(&named.rel, &mut from, &shown)?;
                 }
                 let (dir, name) = self.place(root, named, target, into)?;
                 if st.st_nlink > 1 && self.link(&st, dir.as_fd(), &name, &shown)? {
@@ -618,7 +730,8 @@ impl Copier<'_> {
         Ok(cur)
     }
 
-    /// A directory the copy has to make: `0755`, and `spec.owner`'s.
+    /// A directory the copy has to make, only to hold the destination:
+    /// `0755`, and `spec.owner`'s (root's, for `None`).
     fn mkdir(&self, parent: BorrowedFd<'_>, name: &OsStr) -> rustlet_sys::Result<OwnedFd> {
         nix::sys::stat::mkdirat(parent, name, Mode::from_bits_truncate(0o755))?;
         let fd = nix::fcntl::openat(
@@ -627,18 +740,22 @@ impl Copier<'_> {
             OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             Mode::empty(),
         )?;
-        self.chown(fd.as_fd())?;
+        self.chown(fd.as_fd(), self.spec.owner.unwrap_or((0, 0)))?;
         // Explicitly: mkdirat's mode is subject to the umask.
         nix::sys::stat::fchmod(&fd, Mode::from_bits_truncate(0o755))?;
         Ok(fd)
     }
 
-    /// Gives `fd` the copy's owner, if the copy can.
-    fn chown(&self, fd: BorrowedFd<'_>) -> rustlet_sys::Result<()> {
+    /// The owner of the copy of the entry `st`: `spec.owner`, else its own.
+    fn owner(&self, st: &FileStat) -> (u32, u32) {
+        self.spec.owner.unwrap_or((st.st_uid, st.st_gid))
+    }
+
+    /// Gives `fd` the owner `(uid, gid)`, if the copy can.
+    fn chown(&self, fd: BorrowedFd<'_>, (uid, gid): (u32, u32)) -> rustlet_sys::Result<()> {
         if !self.privileged {
             return Ok(());
         }
-        let (uid, gid) = self.spec.owner;
         nix::unistd::fchown(fd, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
     }
 
@@ -730,10 +847,29 @@ impl Copier<'_> {
         let key = (st.st_dev, st.st_ino);
         let Some(linked) = self.links.get_mut(&key) else { return Ok(false) };
         make_room(dst, name, false, shown)?;
-        link_fd(linked.copy.as_fd(), dst, name).with_context(|| format!("{shown}: link it to {}", linked.shown))?;
-        linked.remaining -= 1;
-        if linked.remaining == 0 {
+        // The copy may have lost its last name to an entry of the same name
+        // (a later source's, or this one's own: `COPY a a /dst/`), and an
+        // inode with no name can't be linked. As Docker, which copies each
+        // source on its own, this name is a copy of its own then.
+        let nameless = nix::sys::stat::fstat(&linked.copy)
+            .with_context(|| format!("{shown}: stat the copy of {}", linked.shown))?
+            .st_nlink
+            == 0;
+        if nameless {
             self.links.remove(&key);
+            return Ok(false);
+        }
+        link_fd(linked.copy.as_fd(), dst, name).with_context(|| format!("{shown}: link it to {}", linked.shown))?;
+        // A later source can repeat an earlier name, so st_nlink isn't
+        // the number of copies still to come. Keep this inode until the
+        // instruction ends, or until all its destination names are gone.
+        // A single directory walk visits each name once and can release
+        // completed pairs, avoiding one open fd per pair in large trees.
+        if !self.repeated_sources {
+            linked.remaining -= 1;
+            if linked.remaining == 0 {
+                self.links.remove(&key);
+            }
         }
         self.report.entries += 1;
         Ok(true)
@@ -832,7 +968,7 @@ impl Copier<'_> {
         make_room(dst, name, false, shown)?;
         nix::unistd::symlinkat(target.as_os_str(), dst, name).with_context(|| format!("{shown}: create the copy"))?;
         if self.privileged {
-            let (uid, gid) = self.spec.owner;
+            let (uid, gid) = self.owner(st);
             let (uid, gid) = (Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)));
             nix::unistd::fchownat(dst, name, uid, gid, AtFlags::AT_SYMLINK_NOFOLLOW)
                 .with_context(|| format!("{shown}: set the owner"))?;
@@ -851,7 +987,7 @@ impl Copier<'_> {
     /// Owner, mode, attributes, times, in that order (`copyup` says why),
     /// through the copy's fd.
     fn apply(&self, from: Option<&Attrs<'_>>, to: BorrowedFd<'_>, st: &FileStat, shown: &str) -> Result<()> {
-        self.chown(to).with_context(|| format!("{shown}: set the owner"))?;
+        self.chown(to, self.owner(st)).with_context(|| format!("{shown}: set the owner"))?;
         let mode = self.spec.mode.unwrap_or(st.st_mode) & 0o7777;
         nix::sys::stat::fchmod(to, Mode::from_bits_truncate(mode)).with_context(|| format!("{shown}: set the mode"))?;
         if let Some(from) = from {
@@ -875,7 +1011,7 @@ impl Copier<'_> {
             Err(Errno::ENOTSUP) => return Ok(()),
             Err(e) => return Err(e).with_context(|| format!("{shown}: list the attributes")),
         };
-        for name in names.iter().filter(|name| !OVERLAY_XATTRS.iter().any(|p| name.starts_with(p))) {
+        for name in names.iter().filter(|name| !overlay_xattr(name)) {
             let value = from.get(name).with_context(|| format!("{shown}: read attribute {name}"))?;
             match set(name, &value) {
                 Ok(()) | Err(Errno::ENOTSUP) => {}
@@ -895,7 +1031,7 @@ impl Copier<'_> {
         rel: &Path,
         shown: &str,
     ) -> Result<()> {
-        let r = unpack_with(from, compression, to, &UnpackOptions { whiteouts: false })
+        let r = unpack_with(from, compression, to, &UnpackOptions { whiteouts: false, owner: self.spec.owner })
             .map_err(|e| Error::invalid(format!("{shown}: extract the archive: {e}")))?;
         let skipped = (r.skipped_devices.len() + r.skipped_other.len()) as u64;
         self.report.entries += r.entries.saturating_sub(skipped);
@@ -912,9 +1048,14 @@ struct Digester {
     hasher: Hasher,
     /// `--chmod`: the mode every file and directory gets.
     mode: Option<u32>,
-    /// Inodes with more than one name, as [`Copier`] keeps them: the first
-    /// name's path below the source root, and the names not seen yet.
-    links: HashMap<(u64, u64), (PathBuf, u64)>,
+    /// `spec.owner` is `None`: the copies have their sources' owners, which
+    /// are then part of what is copied.
+    source_owners: bool,
+    /// `ADD`: [`refuse_other_archive`] applies.
+    extract: bool,
+    /// Inodes with more than one name: their first path below the source
+    /// root, kept across repeated sources as the copier keeps its inode.
+    links: HashMap<(u64, u64), PathBuf>,
 }
 
 /// A directory being hashed.
@@ -937,12 +1078,41 @@ impl Digester {
         self.hasher.update(&n.to_le_bytes());
     }
 
-    /// An entry: what it is, its path below its source, and the mode its
-    /// copy gets (`None`: a symlink's, which has none).
-    fn entry(&mut self, kind: &[u8], rel: &Path, mode: Option<u32>) {
+    /// An entry: what it is, its path below its source, the mode its copy
+    /// gets (`None`: a symlink's, which has none) and, if the copies keep
+    /// their sources' owners, that.
+    fn entry(&mut self, kind: &[u8], rel: &Path, mode: Option<u32>, st: &FileStat) {
         self.field(kind);
         self.field(rel.as_os_str().as_bytes());
         self.number(mode.map_or(u64::MAX, u64::from));
+        if self.source_owners {
+            self.number(st.st_uid.into());
+            self.number(st.st_gid.into());
+        }
+    }
+
+    /// The attributes `copy` gives the copy of what `from` is, as it copies
+    /// them (overlay's own excepted), in name order: how many, then each.
+    fn xattrs(&mut self, from: &Attrs<'_>, shown: &str) -> Result<()> {
+        let mut attrs = Vec::new();
+        match from.list() {
+            Ok(names) => {
+                for name in names.into_iter().filter(|name| !overlay_xattr(name)) {
+                    let value = from.get(&name).with_context(|| format!("{shown}: read attribute {name}"))?;
+                    attrs.push((name, value));
+                }
+            }
+            // A filesystem without attributes has none to copy.
+            Err(Errno::ENOTSUP) => {}
+            Err(e) => return Err(e).with_context(|| format!("{shown}: list the attributes")),
+        }
+        attrs.sort();
+        self.number(attrs.len() as u64);
+        for (name, value) in &attrs {
+            self.field(name.as_bytes());
+            self.field(value);
+        }
+        Ok(())
     }
 
     /// The mode the copy of a file or directory gets.
@@ -968,10 +1138,15 @@ impl Digester {
                     return Ok(());
                 }
                 if kind == libc::S_IFIFO {
-                    self.entry(b"fifo", here, Some(self.mode(&st)));
+                    // Made anew without its attributes (see `Copier::named`).
+                    self.entry(b"fifo", here, Some(self.mode(&st)), &st);
                     return Ok(());
                 }
-                self.file(here, File::from(open_checked(fd.as_fd(), &st, &shown)?), &st, &shown)
+                let mut file = File::from(open_checked(fd.as_fd(), &st, &shown)?);
+                if self.extract {
+                    refuse_other_archive(&named.rel, &mut file, &shown)?;
+                }
+                self.file(here, file, &st, &shown)
             }
             // Device nodes and sockets aren't copied.
             _ => Ok(()),
@@ -1010,8 +1185,9 @@ impl Digester {
         let kind = st.st_mode & libc::S_IFMT;
         match kind {
             libc::S_IFDIR => {
-                self.entry(b"directory", &rel, Some(self.mode(&st)));
+                self.entry(b"directory", &rel, Some(self.mode(&st)), &st);
                 let fd = open_source(level.fd.as_fd(), name, &st, &shown)?;
+                self.xattrs(&Attrs::Fd(fd.as_fd()), &shown)?;
                 let names = entries(fd.as_fd()).with_context(|| format!("{shown}: list it"))?;
                 return Ok(Some(Level { fd, names: names.into_iter(), rel }));
             }
@@ -1030,10 +1206,14 @@ impl Digester {
             libc::S_IFLNK => {
                 let target =
                     nix::fcntl::readlinkat(&level.fd, name).with_context(|| format!("{shown}: read the link"))?;
-                self.entry(b"symlink", &rel, None);
+                self.entry(b"symlink", &rel, None, &st);
                 self.field(target.as_bytes());
+                self.xattrs(&Attrs::at(level.fd.as_fd(), name), &shown)?;
             }
-            _ => self.entry(b"fifo", &rel, Some(self.mode(&st))),
+            _ => {
+                self.entry(b"fifo", &rel, Some(self.mode(&st)), &st);
+                self.xattrs(&Attrs::at(level.fd.as_fd(), name), &shown)?;
+            }
         }
         Ok(None)
     }
@@ -1046,13 +1226,10 @@ impl Digester {
         }
         let first = match self.links.entry((st.st_dev, st.st_ino)) {
             Entry::Vacant(entry) => {
-                entry.insert((full.to_owned(), st.st_nlink - 1));
+                entry.insert(full.to_owned());
                 return false;
             }
-            Entry::Occupied(mut entry) => {
-                entry.get_mut().1 -= 1;
-                if entry.get().1 == 0 { entry.remove().0 } else { entry.get().0.clone() }
-            }
+            Entry::Occupied(entry) => entry.get().clone(),
         };
         self.field(b"link");
         self.field(rel.as_os_str().as_bytes());
@@ -1060,14 +1237,15 @@ impl Digester {
         true
     }
 
-    /// A regular file: its size and the digest of its contents.
+    /// A regular file: its size and the digest of its contents, then its
+    /// attributes.
     fn file(&mut self, rel: &Path, file: File, st: &FileStat, shown: &str) -> Result<()> {
         let mut contents = HashingReader::new(file);
         io::copy(&mut contents, &mut io::sink()).with_context(|| format!("{shown}: read it"))?;
-        self.entry(b"file", rel, Some(self.mode(st)));
+        self.entry(b"file", rel, Some(self.mode(st)), st);
         self.number(contents.count());
         self.field(contents.digest().hex().as_bytes());
-        Ok(())
+        self.xattrs(&Attrs::Fd(contents.get_mut().as_fd()), shown)
     }
 }
 

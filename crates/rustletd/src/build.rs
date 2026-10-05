@@ -82,6 +82,12 @@ use crate::lifecycle::blocking;
 pub const BUILD_LABEL: &str = "io.rustlet.build";
 /// A Containerfile is read whole; refuse anything larger.
 const MAX_CONTAINERFILE: u64 = 1 << 20;
+/// What the client calls a Containerfile it added to the archive only for
+/// the daemon: one outside the context, or one the ignore file excludes
+/// (`rustlet_build::context`'s name for it). Not part of what `COPY` can
+/// take: removed once read, as Docker's daemon does with the Dockerfile
+/// and `.dockerignore` it was sent.
+const CLIENT_CONTAINERFILE: &str = ".rustlet-containerfile";
 /// How context paths are resolved: inside the context.
 const IN_CONTEXT: ResolveFlags = ResolveFlags::IN_ROOT.union(ResolveFlags::NO_MAGICLINKS);
 
@@ -209,7 +215,7 @@ impl Daemon {
                     &mut input,
                     rustlet_image::media::Compression::None,
                     fd.as_fd(),
-                    &UnpackOptions { whiteouts: false },
+                    &UnpackOptions { whiteouts: false, owner: None },
                 )
                 .map_err(|e| ApiError::invalid(format!("the build context: {e}")))?;
                 Ok::<_, ApiError>((report.entries, report.bytes))
@@ -218,6 +224,11 @@ impl Daemon {
         };
         send(events, BuildEvent::Context { files, bytes }).await?;
         let text = read_containerfile(&context, options.dockerfile.as_deref())?;
+        if options.dockerfile.as_deref() == Some(CLIENT_CONTAINERFILE) {
+            // The name only (a symlink there is removed, not followed).
+            std::fs::remove_file(context.join(CLIENT_CONTAINERFILE))
+                .map_err(|e| ApiError::internal(format!("remove {CLIENT_CONTAINERFILE} from the context: {e}")))?;
+        }
         let file = rustlet_build::parse(&text).map_err(|e| ApiError::invalid(format!("Containerfile: {e}")))?;
         for w in &file.warnings {
             send(events, BuildEvent::Warning { message: format!("Containerfile: {w}") }).await?;
@@ -330,7 +341,7 @@ impl Build {
             Base::Scratch => StageState::scratch(args),
             Base::Stage(i) => {
                 let prev = self.done.get(i).ok_or_else(|| ApiError::internal(format!("stage {i} wasn't built")))?;
-                StageState { config: ImageConfigState { cmd_set: false, ..prev.config.clone() }, args, ..prev.clone() }
+                StageState { config: ImageConfigState { cmd_set: false, ..prev.config.clone() }, ..prev.clone() }
             }
             Base::Image(reference) => {
                 let image = self.base_image(reference).await?;
@@ -363,8 +374,13 @@ impl Build {
             let at = |e: String| ApiError::invalid(format!("Containerfile line {}: {e}", instruction.line));
             let op = {
                 let (config, args) = (&st.config, &st.args);
-                Op::new(&instruction.kind, self.file.escape, &|name| config.env_var(name).or_else(|| args.get(name)))
-                    .map_err(at)?
+                Op::new_with_build_args(
+                    &instruction.kind,
+                    self.file.escape,
+                    &|name| config.env_var(name).or_else(|| args.get(name)),
+                    &self.options.build_args,
+                )
+                .map_err(at)?
             };
             let layer = match &op {
                 Op::Arg(decls) => {
@@ -382,10 +398,13 @@ impl Build {
                 Op::Copy(copy) => {
                     Some(self.copy(&mut st, &op, copy).await.map_err(|e| e.context(format!("step {step}")))?)
                 }
+                Op::Workdir(_) => {
+                    Some(self.workdir(&mut st, &op).await.map_err(|e| e.context(format!("step {step}")))?)
+                }
                 _ => {
                     let line = created_by(&op, &st.config);
                     st.config.apply(&op).map_err(at)?;
-                    st.key = next_key(&st.key, &line);
+                    st.key = next_key(&st.key, &config_key(&op, &line));
                     // Dated as the last change of the filesystem, so that a
                     // build whose layers all come from the cache makes the
                     // same config, and so the same image, as the one before.
@@ -612,22 +631,45 @@ impl Build {
         let mut stream = waiting.stream().await?;
         let step = self.step;
         let mut gone = false;
+        // Stdout's and stderr's, each decoded on its own.
+        let mut decoders = [Utf8Chunks::default(), Utf8Chunks::default()];
         loop {
-            let event = match stream.recv().await {
-                Ok(Some(event)) => event,
-                Ok(None) | Err(_) => break,
+            let event = tokio::select! {
+                event = stream.recv() => match event {
+                    Ok(Some(event)) => event,
+                    Ok(None) | Err(_) => break,
+                },
+                // The client hung up while the step prints nothing (one
+                // that prints is noticed by the send below): the step is
+                // stopped, and so is the build. Its output has nowhere to
+                // go, so the stream isn't read again.
+                () = self.events.closed() => {
+                    gone = true;
+                    let _ = d.kill(c, Some("KILL")).await;
+                    break;
+                }
             };
             let (stream_kind, bytes) = match event {
                 StreamEvent::Stdout(b) => (LogStream::Stdout, b),
                 StreamEvent::Stderr(b) => (LogStream::Stderr, b),
                 StreamEvent::Exited(_) => break,
             };
-            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let text = decoders[(stream_kind == LogStream::Stderr) as usize].push(&bytes);
+            if text.is_empty() {
+                continue;
+            }
             if !gone && self.events.send(BuildEvent::Output { step, stream: stream_kind, text }).await.is_err() {
                 // The client went away: the step is stopped, and so is the
                 // build.
                 gone = true;
                 let _ = d.kill(c, Some("KILL")).await;
+            }
+        }
+        // A character cut off by the end of the output.
+        for (kind, decoder) in [LogStream::Stdout, LogStream::Stderr].into_iter().zip(&mut decoders) {
+            let text = decoder.finish();
+            if !gone && !text.is_empty() {
+                let _ = self.events.send(BuildEvent::Output { step, stream: kind, text }).await;
             }
         }
         let exit = d.wait(c, WaitCondition::NotRunning).await;
@@ -650,11 +692,46 @@ impl Build {
         let store = self.d.images.store().clone();
         blocking(move || {
             let identity = |uid, gid| (uid, gid);
-            let options = DiffOptions { skip: &skip, map_owner: &identity, lowers: &lowers };
+            let options = DiffOptions { skip: &skip, map_owner: &identity, lowers: &lowers, userxattr: false };
             commit_layer(store.content(), &upper, &options)
         })
         .await
         .map_err(|e| e.context("commit the step's changes"))
+    }
+
+    /// WORKDIR creates its directory, including in a stage never run.
+    async fn workdir(&mut self, st: &mut StageState, op: &Op) -> ApiResult<String> {
+        let line = created_by(op, &st.config);
+        st.config.apply(op).map_err(ApiError::invalid)?;
+        let key = next_key(&st.key, &config_key(op, &line));
+        if let Some((layer, history)) = self.cached(st, &key) {
+            self.emit(BuildEvent::Cached { step: self.step }).await?;
+            let digest = layer.descriptor.digest().to_string();
+            self.add_layer(st, key, layer, history, false)?;
+            return Ok(digest);
+        }
+        let parent = self.write_image(st)?;
+        let dest = self.scratch_rootfs(&parent, "workdir").await?;
+        let (rootfs, path, user) = (dest.rootfs(), st.config.workdir(), st.config.user());
+        let made = blocking(move || {
+            let root = open_dir(&rootfs)?;
+            let owner = rustlet_image::user::resolve(root.as_fd(), user.as_deref())?;
+            create_workdir(root.as_fd(), &path, owner.uid, owner.gid)
+        })
+        .await;
+        let layer = match made {
+            Ok(()) => match dest.unmount().await {
+                Ok(()) => self.commit(dest.upper(), Vec::new(), Vec::new()).await,
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        };
+        dest.remove().await;
+        let layer = layer?;
+        let digest = layer.descriptor.digest().to_string();
+        let history = json!({"created": now(), "created_by": line});
+        self.add_layer(st, key, LayerRef { descriptor: layer.descriptor, diff_id: layer.diff_id }, history, true)?;
+        Ok(digest)
     }
 
     /// A `COPY` or `ADD` step.
@@ -664,7 +741,10 @@ impl Build {
             sources: copy.sources.clone(),
             dest: copy.dest.clone(),
             workdir: st.config.workdir(),
-            owner: (0, 0),
+            // The context's files are root's (the client sends them as such)
+            // unless `--chown` says; what comes from another stage or image
+            // keeps its owners, as Docker's `--from` does without `--chown`.
+            owner: if copy.from.is_some() && copy.chown.is_none() { None } else { Some((0, 0)) },
             mode: copy.chmod,
             extract_archives: copy.add,
         };
@@ -687,8 +767,7 @@ impl Build {
                 .to_string()
             }
             Some(FromSource::Stage(i)) => {
-                // Planned with the global variables only: a --from that only
-                // the stage's own ARGs make a stage's name wasn't built.
+                // The literal stage dependency was included by the plan.
                 let from = copy.from.as_deref().unwrap_or_default();
                 let src = self.done.get(i).ok_or_else(|| {
                     ApiError::invalid(format!("COPY --from={from}: stage {i} isn't built before this one"))
@@ -737,7 +816,7 @@ impl Build {
             blocking(move || {
                 let dest_fd = open_dir(&dest_dir)?;
                 if let Some(chown) = chown {
-                    spec.owner = owner(dest_fd.as_fd(), &chown)?;
+                    spec.owner = Some(owner(dest_fd.as_fd(), &chown)?);
                 }
                 let src_fd = open_dir(src_dir.as_deref().unwrap_or(&context))?;
                 rustlet_image::copy::copy(src_fd.as_fd(), dest_fd.as_fd(), &spec).map_err(|e| {
@@ -751,7 +830,14 @@ impl Build {
         }
         let upper = dest.upper();
         let layer = match copied {
-            Ok(_) => {
+            Ok(report) => {
+                // A wildcard that matched nothing copies nothing (as BuildKit's
+                // does, `COPY package.json yarn.lock* ./`), but is said.
+                let instruction = if copy.add { "ADD" } else { "COPY" };
+                for pattern in &report.unmatched {
+                    let message = format!("{instruction} {pattern}: matches no files");
+                    let _ = self.emit(BuildEvent::Warning { message }).await;
+                }
                 let unmounted = dest.unmount().await;
                 match unmounted {
                     Ok(()) => self.commit(upper, Vec::new(), Vec::new()).await,
@@ -829,6 +915,67 @@ pub fn check_options(options: &BuildOptions) -> ApiResult<Vec<String>> {
         .collect()
 }
 
+/// A step's output as text, read in pieces that may end inside a character
+/// (a read is cut at any byte): the cut character is held for the next
+/// piece, not replaced by two `U+FFFD`s. Bytes that are not UTF-8 at all
+/// are replaced one run at a time, as `String::from_utf8_lossy` does.
+#[derive(Default)]
+struct Utf8Chunks {
+    held: Vec<u8>,
+}
+
+impl Utf8Chunks {
+    /// The text of what was held and `bytes`, less a character cut off at
+    /// its end.
+    fn push(&mut self, bytes: &[u8]) -> String {
+        self.held.extend_from_slice(bytes);
+        let mut out = String::new();
+        let mut rest: &[u8] = &self.held;
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(valid) => {
+                    out.push_str(valid);
+                    rest = &[];
+                    break;
+                }
+                Err(e) => {
+                    let (valid, after) = rest.split_at(e.valid_up_to());
+                    out.push_str(&String::from_utf8_lossy(valid));
+                    match e.error_len() {
+                        Some(n) => {
+                            out.push('\u{fffd}');
+                            rest = &after[n..];
+                        }
+                        // The end of the piece cuts a character: wait for the rest of it.
+                        None => {
+                            rest = after;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        self.held = rest.to_vec();
+        out
+    }
+
+    /// What the end of the output leaves: a character that never ended.
+    fn finish(&mut self) -> String {
+        if std::mem::take(&mut self.held).is_empty() { String::new() } else { "\u{fffd}".to_owned() }
+    }
+}
+
+/// What a config-only step adds to the key: its history line, except for
+/// `ENV`, whose line can't tell `ENV A="b C=d"` from `ENV A=b C=d` (a value
+/// may hold spaces and `=`), and whose values the `RUN`s after it see: its
+/// pairs as JSON.
+fn config_key(op: &Op, line: &str) -> String {
+    match op {
+        Op::Env(pairs) => format!("ENV {}", serde_json::to_string(pairs).unwrap_or_default()),
+        _ => line.to_owned(),
+    }
+}
+
 /// The next cache key: a SHA-256 of the key so far and the step.
 fn next_key(key: &str, step: &str) -> String {
     let mut h = Sha256::new();
@@ -868,13 +1015,42 @@ fn open_dir(path: &Path) -> ApiResult<OwnedFd> {
     .map_err(|e| ApiError::internal(format!("open {}: {e}", path.display())))
 }
 
+/// Walks through the container root, following container symlinks with
+/// IN_ROOT. Only newly created directories receive the selected user's ids.
+fn create_workdir(root: std::os::fd::BorrowedFd<'_>, path: &str, uid: u32, gid: u32) -> ApiResult<()> {
+    use nix::fcntl::OFlag;
+    use nix::sys::stat::{Mode, mkdirat};
+    use nix::unistd::{Gid, Uid, fchown};
+    let mut prefix = PathBuf::from("/");
+    for component in Path::new(path).components() {
+        let std::path::Component::Normal(name) = component else { continue };
+        let parent = prefix.clone();
+        prefix.push(name);
+        let open = || openat2(Some(root), &prefix, OFlag::O_RDONLY | OFlag::O_DIRECTORY, Mode::empty(), IN_CONTEXT);
+        match open() {
+            Ok(_) => continue,
+            Err(rustlet_sys::Errno::ENOENT) => {}
+            Err(e) => return Err(ApiError::invalid(format!("WORKDIR {path}: {e}"))),
+        }
+        let parent_fd = openat2(Some(root), &parent, OFlag::O_PATH | OFlag::O_DIRECTORY, Mode::empty(), IN_CONTEXT)
+            .map_err(|e| ApiError::invalid(format!("WORKDIR {path}: {e}")))?;
+        mkdirat(parent_fd.as_fd(), Path::new(name), Mode::from_bits_truncate(0o755))
+            .map_err(|e| ApiError::invalid(format!("WORKDIR {path}: {e}")))?;
+        let fd = open().map_err(|e| ApiError::invalid(format!("WORKDIR {path}: {e}")))?;
+        fchown(fd.as_fd(), Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+            .map_err(|e| ApiError::invalid(format!("WORKDIR {path}: {e}")))?;
+    }
+    Ok(())
+}
+
 /// The Containerfile: `name` in the context, else `Containerfile`, else
-/// `Dockerfile`; read through the context (a symlink can't lead out of it).
+/// `Dockerfile`, else `dockerfile` (the last two as Docker's CLI looks);
+/// read through the context (a symlink can't lead out of it).
 fn read_containerfile(context: &Path, name: Option<&str>) -> ApiResult<String> {
     let root = open_dir(context)?;
     let candidates: Vec<&str> = match name.filter(|n| !n.is_empty()) {
         Some(n) => vec![n],
-        None => vec!["Containerfile", "Dockerfile"],
+        None => vec!["Containerfile", "Dockerfile", "dockerfile"],
     };
     for candidate in &candidates {
         let fd = match openat2(
@@ -903,7 +1079,7 @@ fn read_containerfile(context: &Path, name: Option<&str>) -> ApiResult<String> {
     }
     Err(ApiError::invalid(match name {
         Some(n) => format!("the build context has no Containerfile {n:?}"),
-        None => "the build context has no Containerfile or Dockerfile".to_owned(),
+        None => "the build context has no Containerfile, Dockerfile or dockerfile".to_owned(),
     }))
 }
 
@@ -948,6 +1124,55 @@ mod tests {
         assert_eq!(a, next_key("scratch", "RUN x"));
         assert_ne!(a, next_key("scratch", "RUN y"));
         assert_ne!(next_key(&a, "RUN x"), a);
+    }
+
+    #[test]
+    fn output_cut_inside_a_character_is_decoded_whole() {
+        let mut d = Utf8Chunks::default();
+        let bar = "━".as_bytes(); // E2 94 81
+        assert_eq!(d.push(&[b'a', bar[0]]), "a");
+        assert_eq!(d.push(&bar[1..2]), "");
+        assert_eq!(d.push(&[bar[2], b'b']), "━b");
+        // Not UTF-8 at all: replaced where it is, the rest kept.
+        assert_eq!(d.push(&[b'x', 0xff, b'y']), "x\u{fffd}y");
+        // A character that never ends.
+        assert_eq!(d.push(&[0xc3]), "");
+        assert_eq!(d.finish(), "\u{fffd}");
+        assert_eq!(d.finish(), "", "nothing is held any more");
+        // A lead byte followed by ASCII isn't a cut character.
+        assert_eq!(d.push(&[0xc3, b'a']), "\u{fffd}a");
+    }
+
+    #[test]
+    fn env_keys_tell_values_with_spaces_apart() {
+        let state = ImageConfigState::new(None);
+        let pair = |n: &str, v: &str| (n.to_owned(), v.to_owned());
+        let one = Op::Env(vec![pair("A", "b C=d")]);
+        let two = Op::Env(vec![pair("A", "b"), pair("C", "d")]);
+        let (l1, l2) = (created_by(&one, &state), created_by(&two, &state));
+        assert_eq!(l1, l2, "the history lines are alike");
+        assert_ne!(config_key(&one, &l1), config_key(&two, &l2));
+        let workdir = Op::Workdir("/app".into());
+        assert_eq!(config_key(&workdir, "WORKDIR /app"), "WORKDIR /app", "the others are their lines");
+    }
+
+    #[test]
+    fn workdir_creation_follows_container_symlinks_and_keeps_existing_metadata() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("inside")).unwrap();
+        std::fs::set_permissions(root.path().join("inside"), std::fs::Permissions::from_mode(0o711)).unwrap();
+        symlink("/inside", root.path().join("alias")).unwrap();
+        let fd = open_dir(root.path()).unwrap();
+        let meta = std::fs::metadata(root.path().join("inside")).unwrap();
+        create_workdir(fd.as_fd(), "/alias/new/nested", meta.uid(), meta.gid()).unwrap();
+        assert!(root.path().join("inside/new/nested").is_dir());
+        assert_eq!(std::fs::metadata(root.path().join("inside")).unwrap().mode() & 0o777, 0o711);
+        symlink("/../../inside", root.path().join("escape")).unwrap();
+        create_workdir(fd.as_fd(), "/escape/still-inside", meta.uid(), meta.gid()).unwrap();
+        assert!(root.path().join("inside/still-inside").is_dir());
+        std::fs::write(root.path().join("file"), "x").unwrap();
+        assert!(create_workdir(fd.as_fd(), "/file/child", meta.uid(), meta.gid()).is_err());
     }
 
     #[test]

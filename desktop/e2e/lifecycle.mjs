@@ -14,7 +14,7 @@
 // the start of the next.
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -320,4 +320,5 @@ try {
   rustlet("volume", "rm", "e2e-vol");
   compose("down");
   rustlet("rmi", "e2e-built");
+  rmSync(work, { recursive: true, force: true });
 }

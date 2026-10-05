@@ -360,9 +360,10 @@ pub async fn compose_up(
 }
 
 /// `compose -p PROJECT down`: stops and removes the project's containers
-/// and networks, and with `volumes` its volumes.
+/// and networks, and with `volumes` its volumes. The result is what stayed
+/// because something else uses it (warnings, not failures).
 #[tauri::command(rename_all = "snake_case")]
-pub async fn compose_down(app: S<'_>, project: String, volumes: bool) -> CommandResult<()> {
+pub async fn compose_down(app: S<'_>, project: String, volumes: bool) -> CommandResult<Vec<String>> {
     compose::down(&app.client, &project, volumes).await
 }
 

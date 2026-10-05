@@ -44,7 +44,7 @@
 //!   links: the first name (in the archive's order) is the file, later ones
 //!   are link entries to it.
 //! - **Attributes**: every extended attribute except overlay's own
-//!   (`trusted.overlay.*`, `user.overlay.*`: opaque markers, `origin`,
+//!   (the active `trusted.overlay.*` or `user.overlay.*`: opaque markers, `origin`,
 //!   `impure`, `uuid`…), as PAX `SCHILY.xattr.<name>` records. Owners are
 //!   translated by [`DiffOptions::map_owner`] (an upper directory of a
 //!   `--userns=remap` container holds host ids: [`unmap_remap`]), and so
@@ -95,8 +95,6 @@ use crate::unpack::{OPAQUE_XATTR, USER_OPAQUE_XATTR};
 /// How many levels below the upper directory the tree may go (as in
 /// `copyup`: each level holds an fd).
 const MAX_DEPTH: usize = 4096;
-/// Attribute namespaces overlayfs keeps for itself.
-const OVERLAY_XATTRS: [&str; 2] = ["trusted.overlay.", "user.overlay."];
 const WHITEOUT_PREFIX: &[u8] = b".wh.";
 const OPAQUE_MARKER: &[u8] = b".wh..wh..opq";
 
@@ -108,6 +106,7 @@ const MAX_TIME: i64 = 0o77_777_777_777;
 const BLOCK: usize = 512;
 
 /// How [`diff`] reads an upper directory.
+#[derive(Clone, Copy)]
 pub struct DiffOptions<'a> {
     /// Absolute paths in the container that were mount points while it
     /// ran: left out, with everything below them.
@@ -118,11 +117,15 @@ pub struct DiffOptions<'a> {
     /// directories (the snapshots' `fs`). A directory that held only
     /// mount points is compared with what they show at its path.
     pub lowers: &'a [PathBuf],
+    /// The overlay was mounted with `userxattr`: its private attributes
+    /// use `user.overlay.*`. Otherwise only `trusted.overlay.*` is private;
+    /// `user.overlay.*` is ordinary container data and must be preserved.
+    pub userxattr: bool,
 }
 
 impl Default for DiffOptions<'_> {
     fn default() -> Self {
-        DiffOptions { skip: &[], map_owner: &|uid, gid| (uid, gid), lowers: &[] }
+        DiffOptions { skip: &[], map_owner: &|uid, gid| (uid, gid), lowers: &[], userxattr: false }
     }
 }
 
@@ -161,6 +164,7 @@ pub fn diff(upper: &Path, out: &mut dyn Write, options: &DiffOptions<'_>) -> Res
         map_owner: options.map_owner,
         skip: options.skip.iter().map(|p| relative(p)).collect(),
         lowers: options.lowers,
+        userxattr: options.userxattr,
         links: HashMap::new(),
         report: DiffReport::default(),
     };
@@ -217,6 +221,8 @@ struct Frame {
     /// Something below it was left out as a mount point, or was a directory
     /// that held only such.
     held_mounts: bool,
+    /// An opaque directory in this upper tree hides the lower layers.
+    lowers_hidden: bool,
 }
 
 /// A directory's entry, not written yet.
@@ -233,6 +239,7 @@ struct Differ<'w, 'a> {
     /// [`DiffOptions::skip`], relative to the upper directory.
     skip: HashSet<Vec<u8>>,
     lowers: &'a [PathBuf],
+    userxattr: bool,
     /// The archive name of each inode with more than one name, by
     /// `(st_dev, st_ino)`: the first one written.
     links: HashMap<(u64, u64), Vec<u8>>,
@@ -243,8 +250,14 @@ impl Differ<'_, '_> {
     /// The walk, depth first, from the upper directory `root`.
     fn walk(&mut self, root: OwnedFd) -> Result<()> {
         let names = entries(root.as_fd()).context("list the upper directory")?;
-        let mut stack =
-            vec![Frame { dir: root, rel: Vec::new(), names: names.into_iter(), pending: None, held_mounts: false }];
+        let mut stack = vec![Frame {
+            dir: root,
+            rel: Vec::new(),
+            names: names.into_iter(),
+            pending: None,
+            held_mounts: false,
+            lowers_hidden: false,
+        }];
         while let Some(dir) = stack.last_mut() {
             let Some(name) = dir.names.next() else {
                 let done = stack.pop().expect("the loop just looked at it");
@@ -314,6 +327,7 @@ impl Differ<'_, '_> {
         shown: &str,
     ) -> Result<Frame> {
         let parent = stack.last().expect("the walk is in a directory");
+        let lowers_hidden = parent.lowers_hidden;
         let dir = open_checked(parent.dir.as_fd(), name, st, shown)?;
         let attrs = self.xattrs(&Attrs::Fd(dir.as_fd()), shown)?;
         let mut entry = rel.clone();
@@ -327,9 +341,16 @@ impl Differ<'_, '_> {
             marker.extend_from_slice(OPAQUE_MARKER);
             self.marker(&marker)?;
             self.report.opaque_dirs += 1;
-            return Ok(Frame { dir, rel, names: names.into_iter(), pending: None, held_mounts: false });
+            return Ok(Frame {
+                dir,
+                rel,
+                names: names.into_iter(),
+                pending: None,
+                held_mounts: false,
+                lowers_hidden: true,
+            });
         }
-        Ok(Frame { dir, rel, names: names.into_iter(), pending: Some(pending), held_mounts: false })
+        Ok(Frame { dir, rel, names: names.into_iter(), pending: Some(pending), held_mounts: false, lowers_hidden })
     }
 
     /// The directories being walked whose entries aren't written yet,
@@ -353,7 +374,7 @@ impl Differ<'_, '_> {
     /// init layer keeps such paths out of a container's diff.
     fn finish_dir(&mut self, stack: &mut [Frame], done: Frame) -> Result<()> {
         let Some(pending) = done.pending else { return Ok(()) };
-        if done.held_mounts && self.as_made(&done.rel, &pending)? {
+        if done.held_mounts && self.as_made(&done.rel, &pending, done.lowers_hidden)? {
             self.report.skipped.push(in_container(&done.rel).to_string_lossy().into_owned());
             if let Some(parent) = stack.last_mut() {
                 parent.held_mounts = true;
@@ -371,10 +392,11 @@ impl Differ<'_, '_> {
     /// the runtime makes one: `0755`, root's, no attributes. A `chown` or
     /// `chmod` of it (of `/var/lib/app`, say, above a volume's target) is
     /// a change, and the directory stays.
-    fn as_made(&self, rel: &[u8], dir: &PendingDir) -> Result<bool> {
+    fn as_made(&self, rel: &[u8], dir: &PendingDir, lowers_hidden: bool) -> Result<bool> {
         let mode = dir.st.st_mode & 0o7777;
         let owner = (self.map_owner)(dir.st.st_uid, dir.st.st_gid);
-        Ok(match below(self.lowers, rel)? {
+        let lower = if lowers_hidden { Below::Nothing } else { below(self.lowers, rel, self.userxattr)? };
+        Ok(match lower {
             Below::Dir { mode: m, owner: o, xattrs } => (mode, owner) == (m, o) && dir.xattrs == xattrs,
             Below::Nothing => mode == 0o755 && owner == (0, 0) && dir.xattrs.is_empty(),
             Below::Other => false,
@@ -477,13 +499,18 @@ impl Differ<'_, '_> {
     /// The attributes `from` has, as the layer keeps them (see the module
     /// docs), and whether overlay's own mark it opaque.
     fn xattrs(&self, from: &Attrs<'_>, shown: &str) -> Result<Xattrs> {
-        read_xattrs(from, shown, self.map_owner)
+        read_xattrs(from, shown, self.map_owner, self.userxattr)
     }
 }
 
 /// An entry's attributes: overlay's own aside (but for the opaque mark),
 /// the ids in the others' values mapped by `map_owner`.
-fn read_xattrs(from: &Attrs<'_>, shown: &str, map_owner: &dyn Fn(u32, u32) -> (u32, u32)) -> Result<Xattrs> {
+fn read_xattrs(
+    from: &Attrs<'_>,
+    shown: &str,
+    map_owner: &dyn Fn(u32, u32) -> (u32, u32),
+    userxattr: bool,
+) -> Result<Xattrs> {
     let mut out = Xattrs { kept: Vec::new(), opaque: false };
     let names = match from.list() {
         Ok(names) => names,
@@ -492,9 +519,15 @@ fn read_xattrs(from: &Attrs<'_>, shown: &str, map_owner: &dyn Fn(u32, u32) -> (u
         Err(e) => return Err(e).with_context(|| format!("{shown}: list the attributes")),
     };
     for name in names {
-        let value = || from.get(&name).with_context(|| format!("{shown}: read attribute {name}"));
-        if OVERLAY_XATTRS.iter().any(|p| name.starts_with(p)) {
-            if name == OPAQUE_XATTR || name == USER_OPAQUE_XATTR {
+        let value = || match from.get(&name) {
+            Err(Errno::ENODATA) if name.contains('\u{fffd}') => Err(Error::unsupported(format!(
+                "{shown}: attribute name {name:?} is not UTF-8; this archive writer can't hold it"
+            ))),
+            result => result.with_context(|| format!("{shown}: read attribute {name}")),
+        };
+        let prefix = if userxattr { "user.overlay." } else { "trusted.overlay." };
+        if name.starts_with(prefix) {
+            if name == if userxattr { USER_OPAQUE_XATTR } else { OPAQUE_XATTR } {
                 out.opaque |= value()? == b"y";
             }
             continue;
@@ -525,7 +558,7 @@ enum Below {
 /// first layer to have it decides, a whiteout says it is gone, and an
 /// opaque directory on the way hides the layers below it. Nothing is
 /// followed.
-fn below(lowers: &[PathBuf], rel: &[u8]) -> Result<Below> {
+fn below(lowers: &[PathBuf], rel: &[u8], userxattr: bool) -> Result<Below> {
     let names: Vec<&OsStr> = rel.split(|&b| b == b'/').filter(|n| !n.is_empty()).map(OsStr::from_bytes).collect();
     let identity = |uid, gid| (uid, gid);
     'layers: for lower in lowers {
@@ -550,7 +583,7 @@ fn below(lowers: &[PathBuf], rel: &[u8]) -> Result<Below> {
             match st.st_mode & libc::S_IFMT {
                 libc::S_IFDIR => {
                     let sub = open_checked(dir.as_fd(), name, &st, &shown)?;
-                    let attrs = read_xattrs(&Attrs::Fd(sub.as_fd()), &shown, &identity)?;
+                    let attrs = read_xattrs(&Attrs::Fd(sub.as_fd()), &shown, &identity, userxattr)?;
                     if last {
                         let owner = (st.st_uid, st.st_gid);
                         return Ok(Below::Dir { mode: st.st_mode & 0o7777, owner, xattrs: attrs.kept });
@@ -891,6 +924,10 @@ mod tests {
     use nix::unistd::{getegid, geteuid};
 
     use super::*;
+
+    fn test_options() -> DiffOptions<'static> {
+        DiffOptions { userxattr: true, ..DiffOptions::default() }
+    }
     use crate::media::Compression;
 
     const MTIME: i64 = 1_600_000_000;
@@ -966,7 +1003,7 @@ mod tests {
         }
 
         fn diff(&self) -> (Vec<u8>, DiffReport) {
-            self.diff_with(&DiffOptions::default()).unwrap()
+            self.diff_with(&test_options()).unwrap()
         }
 
         /// [`diff`](Self::diff) on a thread of its own, so that a test
@@ -976,7 +1013,7 @@ mod tests {
             let (tx, rx) = mpsc::channel();
             std::thread::spawn(move || {
                 let mut out = Vec::new();
-                let report = diff(&upper, &mut out, &DiffOptions::default()).map_err(|e| e.to_string());
+                let report = diff(&upper, &mut out, &test_options()).map_err(|e| e.to_string());
                 let _ = tx.send(report.map(|r| (out, r)));
             });
             rx.recv_timeout(Duration::from_secs(30)).expect("blocked (opening a FIFO?)").unwrap()
@@ -1319,7 +1356,7 @@ mod tests {
         let map = |uid: u32, gid: u32| {
             (if uid == me { 3_000_000 } else { uid + 1 }, if gid == my_group { 7 } else { gid + 1 })
         };
-        let (tar, _) = u.diff_with(&DiffOptions { map_owner: &map, ..DiffOptions::default() }).unwrap();
+        let (tar, _) = u.diff_with(&DiffOptions { map_owner: &map, ..test_options() }).unwrap();
         let entries = read(&tar);
         for name in ["dir/", "dir/file", "dir/link"] {
             let e = find(&entries, name);
@@ -1539,8 +1576,7 @@ mod tests {
         ];
         // As the runtime would have made it: 0755 and root's.
         let as_root = |_, _| (0, 0);
-        let (tar, report) =
-            u.diff_with(&DiffOptions { skip: &skip, map_owner: &as_root, ..DiffOptions::default() }).unwrap();
+        let (tar, report) = u.diff_with(&DiffOptions { skip: &skip, map_owner: &as_root, ..test_options() }).unwrap();
         // `data/` held only a skipped path: left out with it.
         assert_eq!(names(&read(&tar)), ["dir/", "etc/", "etc/hosts", "run/"]);
         assert_eq!(
@@ -1550,8 +1586,7 @@ mod tests {
         assert_eq!(report.entries, 4);
 
         // A mount on `/`: nothing is the container's.
-        let (tar, report) =
-            u.diff_with(&DiffOptions { skip: &[PathBuf::from("/")], ..DiffOptions::default() }).unwrap();
+        let (tar, report) = u.diff_with(&DiffOptions { skip: &[PathBuf::from("/")], ..test_options() }).unwrap();
         assert!(read(&tar).is_empty());
         assert_eq!(report.skipped, ["/"]);
     }
@@ -1583,7 +1618,7 @@ mod tests {
         ];
         // No layers below: what the runtime makes is 0755 and root's.
         let as_root = |_, _| (0, 0);
-        let options = DiffOptions { skip: &skip, map_owner: &as_root, ..DiffOptions::default() };
+        let options = DiffOptions { skip: &skip, map_owner: &as_root, ..test_options() };
         let (tar, report) = u.diff_with(&options).unwrap();
         assert_eq!(names(&read(&tar)), ["empty/", "opaque/", "opaque/.wh..wh..opq", "private/"]);
         for gone in ["/etc", "/a/b", "/a"] {
@@ -1649,8 +1684,7 @@ mod tests {
             .file("same2/m", "", 0o644);
         let skip = ["/etc/resolv.conf", "/srv/app/data", "/old/m", "/opq/m/x", "/blk/x", "/same/m", "/same2/m"]
             .map(PathBuf::from);
-        let (tar, report) =
-            u.diff_with(&DiffOptions { skip: &skip, lowers: &lowers, ..DiffOptions::default() }).unwrap();
+        let (tar, report) = u.diff_with(&DiffOptions { skip: &skip, lowers: &lowers, ..test_options() }).unwrap();
         let entries = read(&tar);
         assert_eq!(names(&entries), ["blk/", "old/", "opq/", "opq/m/", "same/", "srv/", "srv/app/"]);
         assert_eq!(find(&entries, "srv/app/").mode, 0o700);
@@ -1673,7 +1707,7 @@ mod tests {
             .dir("blk/x", 0o755);
         let skip = ["/etc/resolv.conf", "/gone/m", "/new/m", "/blk/x"].map(PathBuf::from);
         let as_root = |_, _| (0, 0);
-        let options = DiffOptions { skip: &skip, map_owner: &as_root, lowers: &lowers };
+        let options = DiffOptions { skip: &skip, map_owner: &as_root, lowers: &lowers, userxattr: true };
         let (tar, report) = u.diff_with(&options).unwrap();
         assert_eq!(names(&read(&tar)), ["blk/", "etc/"]);
         for gone in ["/gone", "/new"] {
@@ -1747,7 +1781,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let content =
             ContentStore::open(dir.path().join("content"), dir.path().join("ingest"), dir.path().join("lock")).unwrap();
-        let layer = commit_layer(&content, &u.path(""), &DiffOptions::default()).unwrap();
+        let layer = commit_layer(&content, &u.path(""), &test_options()).unwrap();
         let digest = Digest::from_oci(layer.descriptor.digest()).unwrap();
         assert_eq!(layer.descriptor.media_type().to_string(), media::OCI_LAYER_GZIP);
         let blob = std::fs::read(content.blob_path(&digest)).unwrap();
@@ -1761,7 +1795,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path().join("ingest")).unwrap().count(), 0, "nothing left behind");
 
         // Twice: the same blob.
-        let again = commit_layer(&content, &u.path(""), &DiffOptions::default()).unwrap();
+        let again = commit_layer(&content, &u.path(""), &test_options()).unwrap();
         assert_eq!(again.descriptor, layer.descriptor);
     }
 }

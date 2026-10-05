@@ -298,6 +298,9 @@ function Output({ step }: { step: BuildStep }) {
       data-testid="build-output"
     >
       {step.dropped > 0 && <div className="text-[oklch(0.6_0_0)]">… {plural(step.dropped, "earlier line")} not kept</div>}
+      {step.droppedChars > 0 && (
+        <div className="text-[oklch(0.6_0_0)]">… {plural(step.droppedChars, "character")} from long lines not kept</div>
+      )}
       {lines.map((l, i) => {
         const spans = parseAnsi(displayLine(l.text), style);
         return (

@@ -11,6 +11,8 @@ import {
   failBuild,
   initialBuild,
   MAX_STEP_LINES,
+  MAX_STEP_LINE_CHARS,
+  MAX_STEP_OUTPUT_CHARS,
   parseBuildArgs,
   parseTags,
   stopBuild,
@@ -110,6 +112,28 @@ describe("build progress", () => {
     expect(s.steps[1].output).toHaveLength(MAX_STEP_LINES);
     expect(s.steps[1].dropped).toBe(5);
     expect(s.steps[1].output[0].text).toBe("line 5");
+  });
+
+  it("bounds a long output line across repeated events, keeping its tail", () => {
+    let s = fold(start);
+    const chunk = "x".repeat(64 * 1024);
+    for (let i = 0; i < 64; i++) s = buildReducer(s, { type: "output", step: 2, stream: "stdout", text: chunk });
+    s = buildReducer(s, { type: "output", step: 2, stream: "stdout", text: "tail" });
+    const step = s.steps[1];
+    expect(step.partial?.text.length).toBe(MAX_STEP_LINE_CHARS);
+    expect(step.partial?.text.endsWith("tail")).toBe(true);
+    expect(step.droppedChars).toBe(64 * chunk.length + 4 - MAX_STEP_LINE_CHARS);
+    expect(step.dropped).toBe(0);
+  });
+
+  it("bounds the total characters kept across completed lines and partial output", () => {
+    const line = "x".repeat(MAX_STEP_LINE_CHARS);
+    const s = fold([...start, { type: "output", step: 2, stream: "stderr", text: (line + "\n").repeat(256) + "tail" }]);
+    const step = s.steps[1];
+    const chars = step.output.reduce((sum, item) => sum + item.text.length, step.partial?.text.length ?? 0);
+    expect(chars).toBeLessThanOrEqual(MAX_STEP_OUTPUT_CHARS);
+    expect(step.dropped).toBeGreaterThan(0);
+    expect(step.partial?.text).toBe("tail");
   });
 
   it("a failure marks the step under way as the one that failed", () => {

@@ -21,12 +21,12 @@ Code: in `rustlet-build`, plain computation over text and files that the
 daemon and the clients share: [`parser.rs`](../../crates/rustlet-build/src/parser.rs)
 (`parse`, `logical_lines`, `extract_flags`, `json_array`),
 [`expand.rs`](../../crates/rustlet-build/src/expand.rs) (`word`, `words`),
-[`op.rs`](../../crates/rustlet-build/src/op.rs) (`Op::new`),
+[`op.rs`](../../crates/rustlet-build/src/op.rs) (`Op::new`, `Op::new_with_build_args`),
 [`config.rs`](../../crates/rustlet-build/src/config.rs) (`ImageConfigState::apply`, `created_by`),
 [`plan.rs`](../../crates/rustlet-build/src/plan.rs) (`plan`, `ArgScope`, `platform_args`, `resolve_from`),
 [`ignore.rs`](../../crates/rustlet-build/src/ignore.rs) (`IgnoreRules`, `ignore_file`) and
 [`context.rs`](../../crates/rustlet-build/src/context.rs) (`pack`). In the daemon,
-[`build.rs`](../../crates/rustletd/src/build.rs) (`Daemon::build`, `Build::stage`, `run`, `copy`,
+[`build.rs`](../../crates/rustletd/src/build.rs) (`Daemon::build`, `Build::stage`, `run`, `copy`, `workdir`,
 `cached`, `add_layer`, `write_image`, `next_key`, `remove_build_leftovers`),
 [`commit.rs`](../../crates/rustletd/src/commit.rs) (`commit`, `commit_config`, `container_options`,
 `mount_points`), [`archive.rs`](../../crates/rustletd/src/archive.rs) (`save_images`, `load_images`,
@@ -41,7 +41,7 @@ daemon and the clients share: [`parser.rs`](../../crates/rustlet-build/src/parse
 (`Extensions`, `parse_records`). The CLI's [`build.rs`](../../crates/rustlet-cli/src/build.rs)
 (`build`, `BuildProgress`, `prune`, `commit`). Tests: [`build.rs`](../../tests/tests/build.rs)
 (`cargo xtask itest -- bd_ cm_ sl_`: 9 builds, 2 commits, a save and load),
-`rustlet-build`'s 164 unit tests, those of `diff.rs` (18), `copy.rs` (31) and
+`rustlet-build`'s 173 unit tests, those of `diff.rs` (18), `copy.rs` (31) and
 `archive.rs` (15), and the unpacker's PAX tests in
 [`unpack/tests.rs`](../../crates/rustlet-image/src/unpack/tests.rs). Design:
 [architecture.md §2.4](../architecture.md#24-rustlet-image--oci-images-storage-snapshots)
@@ -49,6 +49,7 @@ daemon and the clients share: [`parser.rs`](../../crates/rustlet-build/src/parse
 Extension headers) and [§2.9](../architecture.md#29-builder-and-compose).
 
 The transcripts were recorded on 2026-10-04, between 17:40 and 17:47 UTC,
+before the independent Phase 7 review,
 against the installed service (`rustletd.service`, this phase's debug
 build at commit `f659ddc`), kernel 7.0.0-34-generic, as my normal user in
 the repository's root. `rustlet` is `sudo target/debug/rustlet`, which the
@@ -63,6 +64,11 @@ the `hits` project's image, `hits-web`, and no container was running.
 Digests and ids are cut to 12 hex digits and `…`, omitted lines are `…`.
 Times are UTC, except in `ls -l` listings on the host and in `tar -tv` of
 an archive I made (`copy/data.tar.gz`), which are EDT, four hours behind.
+
+The prose describes the reviewed implementation. The recorded outputs
+retain their original digests, file counts and history: current builds
+give `WORKDIR` a filesystem layer and exclude ignored build metadata from
+the copyable context, so those details differ from the transcripts.
 
 ## 1. A build, end to end
 
@@ -163,9 +169,13 @@ What happened, in order:
    In the archive, owners are 0:0 without names (the client's ids mean
    nothing in an image), modes and modification times are kept, symlinks
    are symlinks, and FIFOs, sockets and devices are left out. The
-   Containerfile and the ignore file always go, whatever the patterns say.
-   What is excluded is never opened, so a `target/` of gigabytes, `.git`
-   or a key file never leaves the client. The ignore file is
+   selected Containerfile is always delivered. If the rules exclude it,
+   or `-f` names a file outside the context, it travels under the reserved
+   `.rustlet-containerfile` name, rather than at its source path. The daemon
+   reads and removes that transport file before any `COPY`. An excluded
+   ignore file stays on the client: the daemon needs the filtered archive,
+   not the rules. Other excluded files are never opened, so a `target/` of
+   gigabytes, `.git` or a key file never leaves the client. The ignore file is
    `<Containerfile>.dockerignore` beside the Containerfile if there is one,
    else `.containerignore`, else `.dockerignore`, with
    `moby/patternmatcher`'s rules (`**`, `!` exceptions, a matching parent
@@ -174,15 +184,20 @@ What happened, in order:
    root's) with chapter 11's unpacker in its plain mode: confined to that
    directory, and a file named `.wh.x` is a file there, not a whiteout.
    The CLI's "Sending build context" line comes when the daemon says it
-   has the context: here 3 files, 1,900 bytes of data. The daemon read the
-   Containerfile through the context (`openat2` with `RESOLVE_IN_ROOT`, so
+   has the context: the recorded build had 3 files, 1,900 bytes of data;
+   the reviewed client sends only `app.py` and the included Containerfile
+   for these rules. The daemon read the Containerfile through the context
+   (`openat2` with `RESOLVE_IN_ROOT`, so
    a Containerfile that is a symlink can't lead out of it; 1 MiB at most),
    parsed all of it (§2), and planned the stages (§8).
 3. **FROM**: python:3-slim was in the store. The default pull policy is
    `missing`; `--pull` asks the registry for a newer image. The stage
    starts with the base's four layers and its config.
-4. **WORKDIR, ENV, EXPOSE, HEALTHCHECK, USER, CMD** only change the
-   image's config: no layer, no ` ---> ` line.
+4. **WORKDIR** sets the config and creates `/app` in a mounted root
+   filesystem, committing a layer without running a container. New
+   directories belong to the current `USER`; existing directories keep
+   their owners and modes. **ENV, EXPOSE, HEALTHCHECK, USER, CMD** only
+   change the image's config: no layer, no ` ---> ` line.
 5. **RUN** ran in a container of the image so far (§4),
    `build-786bf6a6bc93-3`: the build's id and the step's number. Its image
    is an unnamed one the daemon had just written, python:3-slim plus
@@ -193,8 +208,9 @@ What happened, in order:
    far, wrote `app.py` into `/app` (the working directory), and made a
    layer of the overlay's upper directory (§6).
 7. **The image**: a config (the base's, with a new `config`,
-   `rootfs.diff_ids` and `history`), a manifest naming it and the six
-   layers, and the name `ch18-hits:latest` in `index.json` (chapter 11).
+   `rootfs.diff_ids` and `history`), a manifest naming it and its layers
+   (six in the recording, seven with the reviewed `WORKDIR` layer), and
+   the name `ch18-hits:latest` in `index.json` (chapter 11).
    Its id, `e48844cda9f8`, is the digest of its manifest (Docker's classic
    image store uses the config's). Then the context directory went, as it
    goes after a failure too.
@@ -222,8 +238,8 @@ on the client.
 The syntax is Docker's as BuildKit's parser reads it (`parser.rs`), with
 the classic builder's instructions. Reading a file goes in layers.
 
-**Lines.** A line that ends with the escape character (spaces or tabs may
-follow it) goes on in the next, which is appended as it is, indentation
+**Lines.** A line that ends with an unescaped escape character (spaces or
+tabs may follow it) goes on in the next, which is appended as it is, indentation
 included: hence the five spaces in step 7 above, the one before the `\`
 and the next line's four of indentation. A line whose first non-blank
 character is `#` is a comment, inside a continuation too; an empty line
@@ -362,16 +378,21 @@ after it in its stage see it, `RUN` gets it in its environment, and the
 image doesn't keep it. Where both have a name, `ENV` wins.
 
 **Scopes.** An `ARG` before the first `FROM` is **global**, and only
-`FROM` lines see it (and `COPY --from`, which is planned before anything
-runs). Each stage starts with no `ARG`s; it sees a global one once it
-declares it again, without a value. A declared `ARG`'s value is the build
+`FROM` lines see it. A stage starting from an image or `scratch` has no
+declared `ARG`s; it sees a global one once it declares it again, without
+a value. A stage starting `FROM` an earlier stage inherits that stage's
+declared arguments and their values. A declared `ARG`'s value is the build
 arg (`--build-arg NAME=VALUE`, or a bare `--build-arg NAME` taking the
-client's environment), else its default, else the global's. Two kinds
-exist without an `ARG` in the file. BuildKit's **platform args**
+client's environment), else its default, else the global's. An explicit
+override skips expansion of the default: `ARG V=${MISSING:?required}`
+works with `--build-arg V=value`. Two kinds exist without an `ARG` in the
+file. BuildKit's **platform args**
 (`TARGETPLATFORM=linux/amd64`, `TARGETOS=linux`, `TARGETARCH=amd64`,
 `TARGETVARIANT` empty, and the `BUILD…` ones with the same values) are
 predefined global ones: `FROM` lines see them, and a stage declares `ARG
-TARGETARCH` to see one. Docker's **proxy args** (`HTTP_PROXY`,
+TARGETARCH` to see one. Explicit build args can override these predefined
+values; the supported build platform remains `linux/amd64`.
+Docker's **proxy args** (`HTTP_PROXY`,
 `https_proxy`, `NO_PROXY`… in both cases) reach every `RUN` from the build
 args alone, and stay out of the cache key and the history. A build arg
 that nothing declares is warned about.
@@ -379,8 +400,8 @@ that nothing declares is warned about.
 **Expansion.** The builder expands the arguments of `FROM` (with the
 global `ARG`s), `ENV`, `ARG` defaults, `LABEL`, `WORKDIR`, `USER`,
 `EXPOSE`, `VOLUME`, `STOPSIGNAL`, and `COPY` and `ADD` (sources,
-destination and flags), as Docker does (`expand.rs`, after BuildKit's
-`shell.Lex`). `$V` and `${V}` are the value, nothing if unset;
+destination, `--chown` and `--chmod`), as Docker does (`expand.rs`, after
+BuildKit's `shell.Lex`). `$V` and `${V}` are the value, nothing if unset;
 `${V:-word}` is `word` if `V` is unset or empty, `${V-word}` only if
 unset; `${V:+word}` is `word` if `V` is set and not empty, `${V+word}` if
 set; `${V:?message}` and `${V?message}` fail with the message. Single
@@ -390,6 +411,15 @@ character makes the next character literal. `ENV`, `LABEL` and
 `VOLUME` split it into words at unquoted whitespace, in what a variable
 expands to as well, as a shell does. One rule surprises: all the pairs of
 one `ENV` are expanded against the variables as they were before it.
+
+`COPY --from` keeps its literal stage or image name and refuses variables,
+so planning and copying resolve the same source. `MAINTAINER` keeps its
+text without expansion. Nested `${…}` substitutions are limited to 64
+levels; deeper input returns a build error before it can exhaust the
+daemon's stack. `STOPSIGNAL` accepts traditional signal names and numbers
+1–31; realtime names (`SIGRTMIN`, `SIGRTMAX` and their offsets) and
+numbers 32–64 are refused because the runtime's signal API does not
+support them.
 
 ```text
 $ cat vars/Containerfile
@@ -619,8 +649,11 @@ headers, one block of data, two zero blocks). The rules (`diff.rs`):
   read, or the commit fails rather than write a wrong header. FIFOs are
   never opened.
 - **Attributes** are kept as PAX `SCHILY.xattr.<name>` records, except
-  overlay's own (`trusted.overlay.*`, `user.overlay.*`: the opaque mark,
-  `origin`, `impure`, `uuid`), which are read only to find `opaque=y`.
+  the overlay's active namespace: `trusted.overlay.*` for the rootful
+  daemon, `user.overlay.*` when mounted with `userxattr` (selected by
+  `DiffOptions::userxattr`). Its opaque mark is read to find `opaque=y`;
+  `origin`, `impure`, `uuid` and the other private attributes are skipped.
+  The inactive namespace stays ordinary container data.
 - **Hard links** among the container's files stay hard links: the first
   name written is the file, later ones are links to it.
 - **Left out**: `work/`, device nodes and sockets, any entry the
@@ -772,7 +805,7 @@ the id the container saw as `nobody`; the ids inside a version 3
 The archive is gzipped into the store as it is written (`commit_layer`,
 through a `BlobWriter`: a blob whose digest is known only at its end,
 renamed into `blobs/sha256/` under it then). The uncompressed archive's
-digest is the layer's diff ID. Every `RUN`, `COPY` and `ADD` and every
+digest is the layer's diff ID. Every `RUN`, `COPY`, `ADD`, `WORKDIR` and every
 `commit` goes through it.
 
 ## 6. COPY and ADD
@@ -961,7 +994,9 @@ newline, and the step:
 
 | step | after the key so far |
 |---|---|
-| config only (`ENV`, `WORKDIR`, `CMD`…) | its history line, expanded (`EXPOSE 8000/tcp`) |
+| config only (`CMD`, `LABEL`, `EXPOSE`…) | its history line, expanded (`EXPOSE 8000/tcp`) |
+| `ENV` | its expanded name/value pairs as JSON, so spaces and `=` inside values cannot collide with separate pairs |
+| `WORKDIR` | its history line with the expanded path; its directory layer is cached like `COPY` |
 | `ARG` | `ARG` and each name with its value now (`ARG TARGETARCH=amd64 GREETING=hey`) |
 | `RUN` | its history line, the command as a JSON array, the stage's `ARG` values |
 | `COPY`, `ADD` | its history line, `--chown` as written, and its source: `copy::digest` of the context's files, `stage:<chain ID>` of a source stage's top layer, `image:<manifest digest>` of a source image |
@@ -994,11 +1029,12 @@ $ for m in a5ed9dbd664a… 6bf25dbf7444…; do cargo xtask images cat content/bl
 
 (18 entries by then, most of them from this chapter's other builds; the
 full digests went into the loop.) A cache entry is an **image**: when a
-`RUN`, `COPY` or `ADD` has run, the image so far is written and listed in
-`index.json` with the annotation `io.rustlet.build.cache-key` instead of
-a name. The
-`RUN`'s entry has python:3-slim's four layers and `74750aeebec3`; the
-`COPY`'s has one more. `images` never lists them, and like every
+`RUN`, `COPY`, `ADD` or `WORKDIR` has run, the image so far is written and
+listed in `index.json` with the annotation `io.rustlet.build.cache-key`
+instead of a name. The recorded `RUN`'s entry has python:3-slim's four
+layers and `74750aeebec3`;
+the `COPY`'s has one more. Current entries also include the preceding
+`WORKDIR` layer. `images` never lists them, and like every
 `index.json` entry they are garbage-collection roots: they keep their
 layers. A key that is found counts only if the entry's layers are this
 build's plus one (`Build::cached`); then that one layer is taken, with its
@@ -1038,10 +1074,11 @@ The same image id, not merely the same layers. That needs care.
 Config-only steps leave history entries and the config's `created`; dated
 "now", they would make a new config at every build, so a new manifest and
 a new id. They are dated as the stage's last filesystem change instead:
-`WORKDIR /app` has python:3-slim's last date, the `RUN` and the `COPY`
-the times they really ran (from the cache entries), everything after
-the `COPY` its time, and so does the image's `created`. Docker's classic
-builder gets the same result another way: there, config-only steps make
+the `WORKDIR`, `RUN` and `COPY` keep the times they really ran (from their
+cache entries), everything after the `COPY` uses its time, and so does
+the image's `created`. The recorded `WORKDIR` history predates its
+filesystem layer and therefore shows the base image's date. Docker's
+classic builder gets the same result another way: there, config-only steps make
 intermediate images too, and a cached step reuses them.
 
 **What makes a step run again.** Touching `app.py` doesn't; changing it
@@ -1174,14 +1211,13 @@ nothing else of `build` reaches it, its `/junk` and its alpine included.
 - **`COPY --from=<image>`** reads an image, pulled if missing, as a
   `FROM` would be; its key is the image's manifest digest.
 - **`FROM <stage>`** starts a stage from an earlier one: its layers,
-  config, history and cache key carry on, so the cache chain does too. A
+  config, history, cache key and declared `ARG` scope carry on, so the
+  cache chain does too. A
   stage name is matched before an image name, in `FROM` as in `--from`
   (`--from=build` above is the stage, not an image named `build`),
-  case-insensitively. `--from` is expanded with the global `ARG`s
-  when the build is planned, to know which stages are needed, so a
-  `--from` that only a stage's own `ARG` makes a stage's name fails
-  ("stage 1 isn't built before this one") unless that stage was needed
-  anyway. A stage can't be named `scratch`, which is always the empty
+  case-insensitively. `--from` is resolved literally when the build is
+  planned; variable references are refused before any stage runs.
+  A stage can't be named `scratch`, which is always the empty
   image (Docker only warns, then reads `FROM scratch` as that stage).
 - **`ONBUILD`** in a stage goes into its config, and stays there in an
   image of that stage (`--target`). A stage built `FROM` it doesn't keep
@@ -1480,17 +1516,18 @@ reads.
   visible in `ps -a`; what it writes below a `VOLUME` is lost; the output
   is `Step N/M`, `Running in`, `Removed intermediate container`.
 - **Like BuildKit**: the parser's rules; only the stages the target needs
-  are built; the automatic platform args; `COPY --from` planned with the
-  global `ARG`s.
+  are built; the automatic platform args; literal `COPY --from` names;
+  declared `ARG`s inherited by stages based on earlier stages.
 - **The output's ` ---> `** lines name layers, not intermediate images,
   and config-only steps have none. An image's id is its manifest's digest.
 - **The cache** keys a changed build arg from its `ARG` on, not from its
   first use (§7). Cache entries are images in `index.json`; `builder
   prune` removes them all and doesn't count the space.
-- **`WORKDIR`** only changes the config. Docker makes the directory at
-  that step; here the runtime makes it when a container starts there, so
-  a `RUN` after it has it in its layer, and an image with no `RUN` after
-  it gets it at each container's start.
+- **`WORKDIR`** makes the directory at that step, under the current
+  `USER`, including in a stage that has no `RUN`. It has a cached layer
+  and a ` ---> ` line; an existing directory keeps its metadata. A
+  step that finds the whole directory already present still adds an
+  empty layer, as an empty `RUN` does below.
 - **Mount points** stay out of a `RUN`'s or a commit's layer, and so do
   the directories that only held them, unchanged: Docker keeps them out
   with an init layer, Rustlets by comparing with the layers below (§5).
@@ -1502,7 +1539,8 @@ reads.
   git, a `--platform` other than `linux/amd64`, a stage named `scratch`,
   `EXPOSE 8080:80` (BuildKit keeps the container port with a warning), a
   `COPY` into a symlink to nothing (BuildKit makes the directory), a
-  context that is a URL, an archive or stdin, and `-f -`.
+  context that is a URL, an archive or stdin, `-f -`, realtime stop
+  signals and variable references in `COPY --from`.
 - **Not done, with a warning or as documented**: a base's `ONBUILD`
   triggers, an image's or an earlier stage's, aren't run (Docker runs a
   base image's first thing), nor passed on; bzip2 and xz
@@ -1513,7 +1551,8 @@ reads.
 - **Expansion**: `COPY`, `ADD` and `VOLUME` in shell form split words as
   a shell does, so quotes can hold a space (`COPY "my file" /dst/`) and a
   variable can hold several sources; `$1` and `$$` stay as written;
-  `${V#…}` and the other newer forms are refused.
+  `${V#…}` and the other newer forms are refused, and nested `${…}`
+  substitutions beyond 64 levels return a build error.
 - **The history** has no `ARG` entries, and a `RUN`'s line doesn't list
   the `ARG` values it got (Docker's builders write `RUN |1 NAME=value
   /bin/sh -c …`).
@@ -1522,6 +1561,8 @@ reads.
   container's last run.
 - **save** writes the same bytes for the same images; **load** takes both
   formats and checks every blob as it arrives.
+- **Attribute names** that are not UTF-8 or contain `=` are refused by
+  the diff's current PAX writer.
 
 ## 13. Try it
 
@@ -1541,11 +1582,13 @@ cargo xtask itest -- bd_ cm_ sl_                     # the tests behind this cha
 
 ## Check yourself
 
-1. The context of `examples/hits` holds three files although its
-   `.dockerignore` starts with `*`. Which three, and why each?
+1. The context of `examples/hits` now holds two files although its
+   `.dockerignore` starts with `*`. Which two, and why each?
    *`app.py` and the Containerfile, taken back by `!` lines (the last
-   matching pattern decides), and `.dockerignore` itself, which, like the
-   Containerfile, always goes.*
+   matching pattern decides). The ignored `.dockerignore` is used by the
+   client and stays there. If the Containerfile were ignored too, the
+   client would send it under `.rustlet-containerfile` and the daemon
+   would remove that file before `COPY`.*
 2. `RUN ["echo", "$HOME"]` prints `$HOME`. Why, and what prints the home
    directory?
    *Nothing expands an exec form: the builder never expands `RUN`, and

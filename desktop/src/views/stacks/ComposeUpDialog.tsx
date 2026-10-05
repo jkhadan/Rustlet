@@ -106,7 +106,10 @@ export function ComposeUpDialog({ request, up, onClose }: { request: UpRequest; 
   const submit = () => {
     const files = several ? request.files : [file.trim()];
     if (!files[0]) return;
-    up.start({ files, projectName, projectDir: request.projectDir });
+    // The stack's directory goes with the file its labels name: another
+    // file is loaded as a project of its own directory (the project moved).
+    const named = several || files[0] === request.files[0];
+    up.start({ files, projectName, projectDir: named ? request.projectDir : null });
   };
 
   return (

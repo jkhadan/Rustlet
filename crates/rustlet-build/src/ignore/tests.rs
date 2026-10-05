@@ -187,6 +187,30 @@ fn escapes_make_wildcards_literal() {
 }
 
 #[test]
+fn backslashes_have_patternmatchers_regex_semantics() {
+    for pattern in [r"docs\images", r"build\output", r"secrets\keys"] {
+        let error = IgnoreRules::parse(pattern).unwrap_err();
+        assert!(error.contains("syntax error in pattern"), "{error}");
+    }
+    for (pattern, path, matches) in [
+        (r"file\d", "file7", true),
+        (r"file\d", "filed", false),
+        (r"file\d", "file٧", false),
+        (r"file[\d]", "file7", true),
+        (r"file[\d]", "filed", false),
+        (r"a\b", "a", true),
+        (r"a\b", "ab", false),
+        (r"x\s", "x\t", true),
+        (r"x\s", "x\u{a0}", false),
+        (r"x\w", "x_", true),
+        (r"x\w", "xé", false),
+        (r"\123", "S", true),
+    ] {
+        assert_eq!(excluded(pattern, path), matches, "{pattern:?} against {path:?}");
+    }
+}
+
+#[test]
 fn malformed_patterns_are_errors_with_their_line() {
     for (text, line) in
         [("[", 1), ("ok\n[^", 2), ("a[]b", 1), ("[a-", 1), ("[a-]", 1), ("[-a]", 1), ("trailing\\", 1), ("x\n\n!", 3)]

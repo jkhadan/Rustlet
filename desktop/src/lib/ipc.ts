@@ -268,7 +268,9 @@ export const api = {
         { files: args.files, project_name: args.project_name ?? null, project_dir: args.project_dir ?? null },
         onMessage,
       ),
-    down: (project: string, volumes: boolean) => call<void>("compose_down", { project, volumes }),
+    /** The project's containers and networks (and volumes) gone; resolves to
+     * what stayed because something else uses it. */
+    down: (project: string, volumes: boolean) => call<string[]>("compose_down", { project, volumes }),
   },
   networks: {
     list: () => call<Network[]>("network_list"),

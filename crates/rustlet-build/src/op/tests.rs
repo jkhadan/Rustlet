@@ -95,20 +95,41 @@ fn single_word_instructions_are_expanded() {
     assert_eq!(ok("WORKDIR $DIR/${NAME}"), Op::Workdir(s("/srv/my app")));
     assert_eq!(ok("USER ${UNSET:-app}"), Op::User(s("app")));
     assert_eq!(ok("USER $EMPTY"), Op::User(String::new()), "an empty user is root again");
-    assert_eq!(ok("MAINTAINER $NAME"), Op::Maintainer(s("my app")));
+    assert_eq!(ok("MAINTAINER $NAME"), Op::Maintainer(s("$NAME")));
     assert_eq!(ok("STOPSIGNAL ${UNSET:-SIGQUIT}"), Op::StopSignal(s("SIGQUIT")));
     assert!(err("WORKDIR $UNSET").contains("WORKDIR $UNSET: the path is empty"));
 }
 
 #[test]
+fn maintainer_keeps_variables_quotes_and_apostrophes_as_written() {
+    assert_eq!(ok("MAINTAINER Pat O'Brien <pat@example.com>"), Op::Maintainer(s("Pat O'Brien <pat@example.com>")));
+    assert_eq!(ok("MAINTAINER \"$NAME\""), Op::Maintainer(s("\"$NAME\"")));
+}
+
+#[test]
+fn build_arg_overrides_skip_their_defaults_expansion() {
+    let instruction = parse_instruction("ARG VERSION=${VERSION:?required}").unwrap();
+    let args = [(s("VERSION"), s("1.2"))].into();
+    let expanded = Op::new_with_build_args(&instruction.kind, '\\', &|_| None, &args).unwrap();
+    let Op::Arg(declarations) = expanded else { panic!("{expanded:?}") };
+    let mut scope = crate::plan::ArgScope::new(BTreeMap::new(), args);
+    for (name, default) in declarations {
+        scope.declare(&name, default);
+    }
+    assert_eq!(scope.get("VERSION").as_deref(), Some("1.2"));
+    assert!(Op::new(&instruction.kind, '\\', &|_| None).unwrap_err().contains("required"));
+}
+
+#[test]
 fn stop_signals_are_names_or_numbers() {
-    for signal in
-        ["SIGTERM", "TERM", "term", "SIGKILL", "9", "1", "64", "SIGRTMIN", "RTMIN+3", "SIGRTMAX-2", "SIGWINCH"]
-    {
+    for signal in ["SIGTERM", "TERM", "term", "SIGKILL", "9", "1", "31", "SIGWINCH"] {
         ok(&format!("STOPSIGNAL {signal}"));
     }
-    for signal in ["SIGFOO", "0", "65", "-1", "RTMIN+16", "RTMAX-15", "TERM9"] {
+    for signal in ["SIGFOO", "0", "65", "-1", "TERM9"] {
         assert!(err(&format!("STOPSIGNAL {signal}")).contains("unknown signal"), "{signal}");
+    }
+    for signal in ["32", "34", "64", "SIGRTMIN", "RTMIN+3", "SIGRTMAX-2"] {
+        assert!(err(&format!("STOPSIGNAL {signal}")).contains("realtime signals are not supported"), "{signal}");
     }
 }
 
@@ -154,7 +175,7 @@ fn volumes_are_expanded_and_split() {
 #[test]
 fn copy_expands_its_words_and_flags() {
     assert_eq!(
-        copy("COPY --from=$STAGE --chown=${UID:-1000}:app --chmod=$MODE $FILES \"$NAME\" $DIR/"),
+        copy("COPY --from=build --chown=${UID:-1000}:app --chmod=$MODE $FILES \"$NAME\" $DIR/"),
         CopyOp {
             add: false,
             sources: strings(&["a.txt", "b.txt", "my app"]),
@@ -180,7 +201,7 @@ fn copy_expands_its_words_and_flags() {
 
 #[test]
 fn a_flag_that_expands_to_nothing_is_no_flag() {
-    let copy = copy("COPY --from=$UNSET --chown=$EMPTY --chmod=${UNSET} a b");
+    let copy = copy("COPY --from= --chown=$EMPTY --chmod=${UNSET} a b");
     assert_eq!((copy.from, copy.chown, copy.chmod), (None, None, None));
 }
 
@@ -287,11 +308,12 @@ fn the_escape_character_is_the_files() {
 }
 
 #[test]
-fn only_run_copy_and_add_make_layers() {
+fn filesystem_instructions_make_layers() {
     assert!(ok("RUN true").makes_layer());
     assert!(ok("COPY a b").makes_layer());
     assert!(ok("ADD a b").makes_layer());
-    for text in ["ENV a=b", "CMD x", "WORKDIR /x", "ARG a", "LABEL a=b", "EXPOSE 80", "USER x", "VOLUME /v"] {
+    assert!(ok("WORKDIR /x").makes_layer());
+    for text in ["ENV a=b", "CMD x", "ARG a", "LABEL a=b", "EXPOSE 80", "USER x", "VOLUME /v"] {
         assert!(!ok(text).makes_layer(), "{text}");
     }
 }

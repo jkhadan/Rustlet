@@ -326,3 +326,5 @@ mod tests {
         assert_eq!(short_id("abc"), "abc");
     }
 }
+#[cfg(test)]
+mod review_tests;

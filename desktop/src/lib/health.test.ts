@@ -2,7 +2,15 @@ import { describe, expect, it } from "vitest";
 
 import type { ContainerStatus, Health, HealthConfig } from "@/bindings";
 
-import { checkMillis, checkOutcome, checksNewestFirst, describeTest, healthSettings, shownHealth } from "./health";
+import {
+  checkMillis,
+  checkOutcome,
+  checksNewestFirst,
+  describeTest,
+  healthPollMs,
+  healthSettings,
+  shownHealth,
+} from "./health";
 
 const health = (status: Health["status"]): Health => ({ status, failing_streak: 0, log: [] });
 
@@ -76,5 +84,30 @@ describe("a container's healthcheck", () => {
       "every 5s · timeout 3s · 1 retry · start period 15s",
     );
     expect(healthSettings(config({ retries: 0, start_interval: 5e8 }))).toBe("every 500ms while starting");
+  });
+});
+
+describe("asking again while a container is checked", () => {
+  const container = (status: ContainerStatus, h: Health | null, interval: number | null) =>
+    ({ state: { status, health: h }, config: { healthcheck: interval == null ? null : config({ interval }) } }) as Parameters<
+      typeof healthPollMs
+    >[0];
+
+  it("is about as often as it is checked, between one second and five", () => {
+    expect(healthPollMs(container("running", health("healthy"), 300e6))).toBe(1_000);
+    expect(healthPollMs(container("running", health("healthy"), 2e9))).toBe(2_000);
+    expect(healthPollMs(container("running", health("healthy"), 30e9))).toBe(5_000);
+    // The image's interval isn't in the container's config.
+    expect(healthPollMs(container("running", health("starting"), null))).toBe(5_000);
+    expect(healthPollMs(container("running", health("starting"), 0))).toBe(5_000);
+  });
+
+  it("is never for a container that isn't being checked", () => {
+    expect(healthPollMs(undefined)).toBe(false);
+    expect(healthPollMs(container("running", null, 2e9))).toBe(false);
+    // Paused: its checks wait; ended: its last checks are about a run that is over.
+    for (const status of ["paused", "exited", "created", "restarting", "dead"] as ContainerStatus[]) {
+      expect(healthPollMs(container(status, health("healthy"), 2e9))).toBe(false);
+    }
   });
 });

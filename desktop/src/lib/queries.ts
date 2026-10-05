@@ -4,13 +4,19 @@
 import { useQuery } from "@tanstack/react-query";
 
 import { keys } from "./events";
+import { healthPollMs } from "./health";
 import { api } from "./ipc";
 
 export const useContainers = (all = true) =>
   useQuery({ queryKey: keys.containers(all), queryFn: () => api.containers.list(all) });
 
 export const useContainer = (id: string) =>
-  useQuery({ queryKey: keys.container(id), queryFn: () => api.containers.inspect(id) });
+  useQuery({
+    queryKey: keys.container(id),
+    queryFn: () => api.containers.inspect(id),
+    // A check that doesn't change the verdict has no event: see healthPollMs.
+    refetchInterval: (query) => healthPollMs(query.state.data),
+  });
 
 export const useIsolation = (id: string, enabled: boolean) =>
   useQuery({ queryKey: keys.isolation(id), queryFn: () => api.containers.isolation(id), enabled });

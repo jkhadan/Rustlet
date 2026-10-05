@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Facts, Mono, Spinner } from "@/components/ui/misc";
 import { cn } from "@/lib/cn";
-import { hideBuildContainers } from "@/lib/containers";
+import { countsLessBuilds, hideBuildContainers } from "@/lib/containers";
 import { useDaemon, useNow } from "@/lib/daemon";
 import { describeEvent } from "@/lib/events";
 import { ago, bytes, imageName, isLive, plural, statusText } from "@/lib/format";
@@ -35,8 +35,10 @@ export function Dashboard() {
       </div>
     );
   }
-  const i = info.data;
-  // A build's RUN steps run in containers of their own, for a step each.
+  // A build's RUN steps run in containers of their own, for a step each:
+  // left out of the counts too, as of the list below (until the list is
+  // here to say which they are).
+  const i = info.data && containers.data && !builds ? countsLessBuilds(info.data, containers.data) : info.data;
   const { shown: live, hidden } = hideBuildContainers((containers.data ?? []).filter(isLive), builds);
   // Network events name containers by id: the names come from the
   // containers' own events (removed ones too) and from those still here.

@@ -22,10 +22,14 @@ pub struct ContainerConfig {
     pub name: Option<String>,
     /// Replaces the image's `Cmd` (`IMAGE ARGS…`).
     pub cmd: Vec<String>,
+    /// Suppresses the image's `Cmd`, including when `cmd` is empty.
+    pub clear_cmd: bool,
     /// Replaces the image's `Entrypoint`; `Some([])` clears it.
     pub entrypoint: Option<Vec<String>>,
     /// `KEY=VALUE`, over the image's `Env`.
     pub env: Vec<String>,
+    /// Names removed from the image's environment before applying `env`.
+    pub unset_env: Vec<String>,
     /// `user[:group]`, names or ids from the image's `/etc/passwd` and
     /// `/etc/group`.
     pub user: Option<String>,

@@ -24,11 +24,11 @@ pub struct Project {
     pub files: Vec<PathBuf>,
     /// The services, in the file's order (profiles applied).
     pub services: Vec<Service>,
-    /// By key in the file, those the services use (as Compose, which
-    /// creates no network nothing is on): `default` too, if a service uses
-    /// it.
+    /// Every network declared in the file, by key, plus `default` if a
+    /// service uses it. `up` creates only the selected services' networks;
+    /// teardown retains external declarations even when unused.
     pub networks: BTreeMap<String, Network>,
-    /// By key in the file, those the services mount.
+    /// Every named volume declared in the file, by key.
     pub volumes: BTreeMap<String, Volume>,
     /// Services that profiles left out. Their containers aren't orphans:
     /// `up --remove-orphans` leaves them alone, as Compose does.
@@ -54,6 +54,12 @@ pub struct Service {
     /// `scale` / `deploy.replicas` (default 1).
     pub replicas: u32,
     pub depends_on: Vec<Dependency>,
+    /// The service whose first container's network namespace its containers
+    /// join (`network_mode: service:x`). `config.network` names that
+    /// container (`<project>-x-1`), and a recreated container has the same
+    /// name: only its id says which one it is, so that goes into the hash
+    /// the containers are compared by ([`Service::effective_hash`]).
+    pub shares_network_with: Option<String>,
     /// What each of its containers is created with: everything but its
     /// name and the compose labels, which `run` adds per container; its
     /// networks as `network` + `extra_networks` (daemon names), its named
@@ -237,8 +243,9 @@ impl Service {
     }
 
     /// A hash of everything its containers are created from (config,
-    /// image name, networks): a container labelled with another hash is
-    /// recreated by `up`.
+    /// image name, networks), as the file says it: see
+    /// [`effective_hash`](Self::effective_hash) for the one containers are
+    /// labelled with and compared by.
     ///
     /// SHA-256 of the canonical JSON of those (object keys sorted, no
     /// blanks), so it is the same for the same service whatever order its
@@ -264,6 +271,28 @@ impl Service {
         let mut text = String::new();
         canonical_json(&value, &mut text);
         hex::encode(Sha256::digest(text.as_bytes()))
+    }
+}
+
+impl Service {
+    /// The hash a container is labelled with when it is created, and a later
+    /// `up` compares: [`config_hash`](Self::config_hash), and for a service
+    /// that joins another's network namespace ([`Service::shares_network_with`])
+    /// the id of the container it joins, `namespace_owner`.
+    ///
+    /// Compose resolves `network_mode: service:x` to `container:<id>` before
+    /// it hashes (`resolveSharedNamespaces`), so that the dependent follows
+    /// its namespace's owner into a new container: the daemon ties a
+    /// container to the namespace it joined by the owner's id, and one that
+    /// outlives its owner has no network left. Without `namespace_owner`, the
+    /// hash is `config_hash`'s, unchanged, so no other service's containers
+    /// are recreated for it.
+    pub fn effective_hash(&self, namespace_owner: Option<&str>) -> String {
+        let own = self.config_hash();
+        match namespace_owner {
+            None => own,
+            Some(id) => hex::encode(Sha256::digest(format!("{own}\nnetwork_mode=container:{id}").as_bytes())),
+        }
     }
 }
 
@@ -321,6 +350,7 @@ mod tests {
                     required: *required,
                 })
                 .collect(),
+            shares_network_with: None,
             config: ContainerConfig { image: "alpine".into(), ..ContainerConfig::default() },
             networks: Vec::new(),
         }
@@ -440,6 +470,26 @@ mod tests {
             })),
             hash
         );
+    }
+
+    #[test]
+    fn a_service_joining_a_namespace_is_hashed_with_its_owners_id() {
+        let mut sidecar = service("vpn-client", &[("vpn", true)]);
+        sidecar.shares_network_with = Some("vpn".into());
+        sidecar.config.network = NetworkMode::Container("demo-vpn-1".into());
+        // Without an owner's id, or for a service that joins nothing, it is the config's hash.
+        assert_eq!(sidecar.effective_hash(None), sidecar.config_hash());
+        assert_eq!(service("web", &[]).effective_hash(None), service("web", &[]).config_hash());
+        // With one, it is another hash, the same for the same id and another for another.
+        let first = sidecar.effective_hash(Some("c0ffee"));
+        assert_ne!(first, sidecar.config_hash());
+        assert_eq!(first.len(), 64);
+        assert_eq!(first, sidecar.clone().effective_hash(Some("c0ffee")), "stable");
+        assert_ne!(first, sidecar.effective_hash(Some("decaf")), "the owner was recreated");
+        // The config still counts.
+        let mut changed = sidecar.clone();
+        changed.config.env = vec!["A=1".into()];
+        assert_ne!(first, changed.effective_hash(Some("c0ffee")));
     }
 
     #[test]

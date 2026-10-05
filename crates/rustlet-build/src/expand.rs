@@ -91,11 +91,16 @@ struct Lexer<'a> {
     pos: usize,
     escape: char,
     lookup: &'a dyn Fn(&str) -> Option<String>,
+    depth: usize,
 }
+
+// Expansion runs on the daemon's worker threads, whose stacks are fixed.
+// Leave room for the parser and executor around a deeply nested default.
+const MAX_EXPANSION_DEPTH: usize = 64;
 
 impl Lexer<'_> {
     fn run(raw: &str, escape: char, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Vec<Piece>, ExpandError> {
-        let mut lexer = Lexer { chars: raw.chars().collect(), pos: 0, escape, lookup };
+        let mut lexer = Lexer { chars: raw.chars().collect(), pos: 0, escape, lookup, depth: 0 };
         lexer.until(None).map_err(|e| ExpandError(format!("failed to process {raw:?}: {e}")))
     }
 
@@ -172,7 +177,13 @@ impl Lexer<'_> {
         match self.peek() {
             Some('{') => {
                 self.pos += 1;
-                self.braced()
+                if self.depth == MAX_EXPANSION_DEPTH {
+                    return Err(format!("variable expansion nesting exceeds {MAX_EXPANSION_DEPTH} levels"));
+                }
+                self.depth += 1;
+                let result = self.braced();
+                self.depth -= 1;
+                result
             }
             Some(c) if is_name_start(c) => {
                 let name = self.name();

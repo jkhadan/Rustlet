@@ -14,11 +14,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use axum::Json;
 use axum::Router;
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use rustlet_client::Client;
+use rustlet_spec::build::{BuildEvent, BuildQuery};
 use rustlet_spec::container::{
     ContainerConfig, ContainerInspect, ContainerState, ContainerStatus, ContainerSummary, CreateResponse, Health,
     HealthStatus, ListQuery, RemoveQuery, StopQuery,
@@ -75,6 +77,8 @@ pub struct Daemon {
     pub logs: BTreeMap<String, Vec<LogEntry>>,
     /// What it did, in order.
     pub calls: Vec<String>,
+    /// Scripted build response; absent means a successful build.
+    pub build_events: Option<Vec<BuildEvent>>,
     serial: u64,
 }
 
@@ -215,6 +219,7 @@ fn router(daemon: Shared) -> Router {
         .route(p::IMAGE_INSPECT, get(inspect_image))
         .route(p::IMAGE_PULL, post(pull))
         .route(p::IMAGES, delete(remove_image))
+        .route(p::BUILD, post(build))
         .with_state(daemon)
 }
 
@@ -517,4 +522,21 @@ async fn remove_image(State(d): State<Shared>, Query(q): Query<ImageDeleteQuery>
     }
     d.calls.push(format!("rmi {}", q.name));
     Json(ImageDeleteResponse { untagged: vec![q.name], deleted: Vec::new() }).into_response()
+}
+
+async fn build(State(d): State<Shared>, Query(q): Query<BuildQuery>, body: Body) -> Response {
+    let _context = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    let options = q.options().unwrap();
+    let mut d = d.lock().unwrap();
+    d.calls.push(format!("build {}", options.tags.join(",")));
+    let events = d.build_events.clone().unwrap_or_else(|| {
+        for tag in &options.tags {
+            d.add_image(tag);
+        }
+        vec![BuildEvent::Done {
+            id: options.tags.first().map(|tag| d.images[tag].clone()).unwrap_or_default(),
+            names: options.tags,
+        }]
+    });
+    ndjson(&events)
 }

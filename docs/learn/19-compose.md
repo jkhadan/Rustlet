@@ -18,9 +18,11 @@ Code: the library, [`crates/rustlet-compose/src/`](../../crates/rustlet-compose/
 [`model.rs`](../../crates/rustlet-compose/src/model.rs) (`parse`, `service`, `healthcheck`,
 `depends_on`, `other_key`), [`interpolate.rs`](../../crates/rustlet-compose/src/interpolate.rs)
 (`substitute`, `parse_dotenv`), [`load.rs`](../../crates/rustlet-compose/src/load.rs) (`load`,
-`default_files`, `variables`, `merge` and `rule`, `project_name`, `Context::service`,
+`load_selected`, `has_config_file`, `default_files`, `variables`, `merge`
+and `rule`, `project_name`, `Context::service`,
 `Context::networks`), [`project.rs`](../../crates/rustlet-compose/src/project.rs)
-(`Project::startup_order`, `Service::config_hash`), [`run.rs`](../../crates/rustlet-compose/src/run.rs)
+(`Project::startup_order`, `Service::config_hash`, `Service::effective_hash`),
+[`run.rs`](../../crates/rustlet-compose/src/run.rs)
 (`Compose::up`, `wait_for`, `check`, `converge`, `recreate`, `create`, `labels`, `down`,
 `stacks`, `down_project`, `shutdown_order`) and the labels in
 [`lib.rs`](../../crates/rustlet-compose/src/lib.rs). The CLI:
@@ -32,9 +34,10 @@ daemon: [`health.rs`](../../crates/rustletd/src/health.rs) (`HealthPlan::resolve
 [`lifecycle.rs`](../../crates/rustletd/src/lifecycle.rs) by `start_shim` and `take_over`,
 stopped by `handle_exit`; the options checked in [`spec.rs`](../../crates/rustletd/src/spec.rs)
 (`check_healthcheck`). The types: `HealthConfig`, `Health`, `HealthResult` in
-[`rustlet-spec/src/container.rs`](../../crates/rustlet-spec/src/container.rs). Tests: 63 unit
-tests in `rustlet-compose`'s modules and 23 in
-[`tests/run.rs`](../../crates/rustlet-compose/tests/run.rs) against a fake daemon, 9 in the CLI's
+[`rustlet-spec/src/container.rs`](../../crates/rustlet-spec/src/container.rs). Tests: 72 unit
+tests in `rustlet-compose`'s modules, 24 loading regressions in
+[`tests/semantics.rs`](../../crates/rustlet-compose/tests/semantics.rs), and 34 in
+[`tests/run.rs`](../../crates/rustlet-compose/tests/run.rs) against a fake daemon, 13 in the CLI's
 `compose.rs`, 3 in `health.rs`; against a real daemon, [`compose.rs`](../../tests/tests/compose.rs)
 (`cp_`, 3) and [`health.rs`](../../tests/tests/health.rs) (`hc_`, 5), run by `cargo xtask
 itest`. The example: [`examples/hits`](../../examples/hits). Design:
@@ -57,6 +60,10 @@ only the lines about this chapter's containers. A later fix changed what
 a `RUN`'s layer holds, so the build lines of §1's `up` and the image ID
 in §3 come from running that `up` again, at 17:58 UTC against commit
 `f659ddc`, with chapter 18's build cache.
+
+The explanations below include the 2026-10-05 review fixes. The recorded
+transcripts remain from 2026-10-04; their image IDs and config hashes
+describe that build.
 
 ## 1. Compose is a client
 
@@ -306,26 +313,37 @@ file and the place. Since substitution comes first, a variable may stand
 where a number or a boolean belongs (`scale: ${N:-1}`): the reader
 converts the string by the field's type, as Compose does.
 
-**Several files.** Without `-f`, Rustlets looks in the project directory
-for `compose.yaml`, `compose.yml`, `docker-compose.yaml` and
-`docker-compose.yml`, in that order, and takes `compose.override.yaml`
-(or its other spellings) beside it as a second file. (Compose also looks
-in parent directories; Rustlets doesn't.) With `-f`, only the files
-named, in order. Each file is parsed, interpolated and checked on its own
-first, so that an error names its file. Then each is merged into those
-before it by Compose's rules (`merge` and `rule` in `load.rs`):
+**Several files.** `-f` chooses only the files named, in order. Otherwise,
+`COMPOSE_FILE`, from the environment or the project directory's `.env`,
+chooses the files: separated by `COMPOSE_PATH_SEPARATOR` (`:` by default),
+with relative entries resolved from the current directory. If neither
+selects files, Rustlets looks in the project directory for `compose.yaml`,
+`compose.yml`, `docker-compose.yaml` and `docker-compose.yml`, in that
+order, and takes `compose.override.yaml` (or its other spellings) beside
+it as a second file. Parent directories aren't searched; `-f -` is
+refused. An invalid `COMPOSE_FILE` entry is an error.
+
+Each file's YAML anchors and `<<` merge keys are resolved, including
+nested merges, then its values are interpolated and checked on their own,
+so that an error names its file. Each is then merged into those before it
+by Compose's rules (`merge` and `rule` in `load.rs`):
 
 - mappings merge key by key; a scalar, or a list not named below, is
   replaced (`command`, `image`, `healthcheck.test`);
-- `ports`, `expose`, `dns`, `dns_search`, `dns_opt`, `tmpfs`, `cap_add`,
-  `cap_drop`, `devices`, `security_opt`, `extra_hosts` and `env_file` are
-  concatenated, an item given twice kept once;
-- `volumes` merge by target: a later mount on `/data` replaces the
-  earlier one, in its place;
+- `expose`, `dns`, `dns_search`, `dns_opt`, `tmpfs`, `cap_add`,
+  `cap_drop`, `security_opt`, `extra_hosts`, `env_file`, `profiles` and
+  each network's `aliases` are concatenated, an item given twice kept once;
+- `ports` merge by their normalized host IP, target port, published port
+  and protocol: `"8080:80"` and `{target: 80, published: 8080}` are one
+  mapping, with default `tcp` and host address accounted for;
+- `volumes` and `devices` merge by their path in the container: a later
+  entry for `/data` replaces the earlier one, in its place;
 - `environment`, `labels` and `build.args`, written as lists or as
   mappings, merge as mappings; so do a service's `networks` and
-  `depends_on`;
-- an empty value replaces nothing. The YAML tags `!reset` (forget what
+  `depends_on`. A dependency named again in short syntax resets its
+  condition to `service_started` and `required` to true;
+- a null field leaves an earlier value alone; a null `environment` entry
+  overrides that key (§3). The YAML tags `!reset` (forget what
   the earlier files said) and `!override` (replace rather than merge)
   change that for one key.
 
@@ -389,8 +407,11 @@ rustlet: error: invalid project name "my shop" (-p): only letters, digits, '-' a
 `compose config` prints the project as `up` would make it, every default
 applied and every path absolute, as JSON; with `--services`, the
 services in the order they start (§5). **Profiles** leave services out:
-one with `profiles: [debug]` is in the project only with `--profile
-debug` or `COMPOSE_PROFILES=debug` (`*` enables them all).
+one with `profiles: [debug]` is included with `--profile debug` or
+`COMPOSE_PROFILES=debug` (`*` enables them all). Naming a service on the
+command line (`up debug`, `logs debug`, `ps debug`…) also enables its
+profiles while loading (`load_selected`). `up debug` targets that service
+and its dependencies.
 
 ## 3. From services to containers
 
@@ -417,6 +438,29 @@ The names follow Compose v2:
 | the network of the services that name none | `<project>_default` | `hits_default` |
 | a network or volume `x` | `<project>_x`, or its `name:`; an `external` one as it is called | `hits_data` |
 | a service with `build:` and no `image:` | the image `<project>-<service>` | `hits-web` |
+
+**The command and environment.** An omitted or null `command` inherits
+the image's CMD. `command: []` or `command: ""` clears it; a list supplies
+the arguments directly, and a string is split into shell words. Clearing
+the command changes the config hash too, so `up` recreates a container
+that had inherited the image's command.
+
+`env_file` paths are resolved from the project directory and read in
+order, with `environment` over their results. Variables in an env file
+look first in the project's variables (the shell over `.env`), then in
+the service's resolved `environment`, then in earlier lines and files.
+A later line can replace an earlier file's value before the next line
+interpolates it. Single-quoted values are literal; unquoted and
+double-quoted values are interpolated.
+
+A bare `environment` name (`- CLEAR` or `CLEAR: null`) takes the
+project's variable if it exists. If unresolved, it removes an earlier
+file's value and the image's ENV entry. A bare `CLEAR` in an env file
+also removes earlier values when neither the project's variables nor
+the service's resolved `environment` supply a value. `CLEAR=` or
+`CLEAR: ""` keeps an empty value. This is distinct from
+`CLEAR: ${MISSING}`: ordinary YAML interpolation produces an empty string
+with a warning (§2).
 
 **The network.** `hits_default` is an ordinary user-defined network: a
 bridge, a subnet, and the embedded DNS server of chapter 16. Each service
@@ -481,6 +525,12 @@ missing, as Compose does), anything else a volume of the file (one not
 declared under `volumes:` is an error), and no source an anonymous
 volume.
 
+`up` creates only the networks and named volumes used by the services it
+is bringing up. A used `external: true` resource must already exist.
+The project retains every top-level declaration, including unused ones
+and those used only by inactive profiles, so `down` can protect all
+external resources (§7).
+
 **The image.** `build: .` with no `image:` makes the image `hits-web`.
 `up` builds it when it is missing, every time with `--build` or
 `pull_policy: build`, and never with `--no-build`, which pulls a missing
@@ -490,8 +540,12 @@ context on a blocking thread as the request sends it, and the progress
 comes back as the `Step …` lines of §1. A service with `image:` alone is
 pulled when its image is missing (every time with `pull_policy: always`;
 with `never`, a missing image is an error). One with both `image:` and
-`build:` builds an image of that name. To the daemon it is an image like
-any other, with its containers:
+`build:` builds an image of that name. When several selected services use
+one image name, `up` chooses a service with `build:` before preparing that
+image once; an earlier service with only `image:` therefore cannot skip
+the shared build. A build is complete only after the daemon sends its
+`Done` event: a stream that ends early fails `up` or `compose build`.
+To the daemon it is an image like any other, with its containers:
 
 ```text
 $ rustlet inspect --type image hits-web | jq -c '.[0] | {id: .id[0:19], containers}'
@@ -724,6 +778,10 @@ PID   COMMAND
     4 ps -o pid,args
 ```
 
+The shim also kills an internal healthcheck when its daemon connection
+is lost, so a daemon restart cannot leave the old check running beyond
+its timeout. User exec sessions retain their normal disconnect behavior.
+
 Each check was killed a second after it started, and no `sleep 5` is
 left behind. The next check came two seconds after the last one *ended*:
 the interval runs between checks, as in Docker. And no check at all:
@@ -925,6 +983,12 @@ Without a file there is nothing to line the names up by, hence the
 ragged columns. Everything `down` needed, it found in the labels
 (`down_project`).
 
+That fallback requires both `-p` and no file selected by `-f`,
+`COMPOSE_FILE`/`.env`, or default discovery. Selected files are loaded
+before teardown; an invalid selection is an error. The given project
+name is validated and lowercased just as it is for `up`, so `-p SHOP`
+targets `shop` in either case.
+
 ## 6. `up` again: what changed?
 
 `up` **converges**: it makes the daemon's containers what the file says,
@@ -945,8 +1009,10 @@ networks, written as canonical JSON (keys sorted, no blanks), so that the
 order in which the file wrote them doesn't matter. It leaves out what
 changes no container: the number of replicas, `depends_on`, and how the
 image is made (`build`, `pull_policy`). The image is compared by its ID,
-so a rebuilt image recreates the containers that ran the old one. Run
-`up` again, unchanged:
+so a rebuilt image recreates the containers that ran the old one. For
+`network_mode: service:db`, the effective hash also holds `db`'s current
+first container ID. Recreating `db` therefore recreates its namespace
+sharers, which must join the new namespace. Run `up` again, unchanged:
 
 ```text
 $ rustlet compose up -d
@@ -999,12 +1065,19 @@ the default timeout: the old container's `die` event said
 a function of the service, not a record of what was there.
 
 The flags change the rules: `--force-recreate` recreates unchanged
-containers too, `--no-recreate` never recreates, `--build` builds the
-images first even if they exist, and `--remove-orphans` removes the
+containers of the services named (all services when none are named);
+`--always-recreate-deps` also recreates the dependencies brought along.
+`--no-recreate` never recreates and conflicts with either flag. `--build`
+builds the images first even if they exist, and `--remove-orphans` removes the
 containers of services the file no longer has (without it, `up` warns
 about them in Compose's words). A recreated container gets new anonymous
 volumes. The old container's are left behind, unused, where Compose
 would hand them to the new one.
+
+The old container is removed before its replacement is created. If the
+daemon refuses the replacement, that service has no container until a
+successful `up`. Compose creates the replacement under a temporary name
+first; Rustlets' daemon has no rename or configuration preflight API.
 
 ## 7. `ps`, `logs`, `stop`, `start`, `ls`, `down`
 
@@ -1095,8 +1168,10 @@ projects with something running, counted by state.
 **Down** removes what `up` made, dependents first: the containers in the
 reverse of the startup order, then the networks labelled as the
 project's, and with `-v` the volumes labelled as the project's and the
-containers' anonymous volumes. External networks and volumes never carry
-the label, so they stay. `--rmi local` also removes the images built for
+containers' anonymous volumes. Every network or volume the file declares
+external stays, even if it carries this project's label from an earlier
+configuration, is unused now, or is used only by an inactive-profile
+service. `--rmi local` also removes the images built for
 services without `image:`, `--rmi all` every service's image;
 `--remove-orphans`, the containers of services the file no longer has.
 `-t` is each container's stop timeout:
@@ -1218,13 +1293,16 @@ ps` shows. The path under the name is the `project.working-dir` label:
   `watch`…); no `up --wait`, `--scale` or `--abort-on-container-exit`.
   `rustlet exec hits-web-1 …` does what `compose exec web …` would.
 - **Files.** Parent directories aren't searched for the compose file, and
-  there is no `--env-file`. Warnings found while loading (unset
+  there is no `--env-file` or `-f -`. Warnings found while loading (unset
   variables, `version`, `expose`) are printed as `WARN: …` lines, where
   Compose prints `WARN[0000] …`.
 - **`config` prints JSON**: the project as Rustlets reads it,
   normalized, rather than Compose's canonical YAML.
 - **Recreated containers get new anonymous volumes**; Compose hands them
   the old container's (unless `-V`).
+- **Old containers are removed before replacement.** A rejected replacement
+  leaves its service without a container; Compose uses a temporary name
+  and renames the replacement (§6).
 - **`logs` without `-f` is sorted by time** across containers; Compose
   prints each container's lines as it reads them.
 - **Images.** A service with `build:` is pulled only when its image is
@@ -1264,9 +1342,11 @@ cargo xtask itest -- cp_ hc_                 # the tests behind this chapter
    find the project's containers, and what does `compose -p hits down`
    need besides the daemon?
    *By label: it lists every container and keeps those whose
-   `io.rustlet.compose.project` is `hits`. Nothing else: networks and
-   volumes carry the label too, and the `depends-on` label gives the
-   order.*
+   `io.rustlet.compose.project` is `hits`. With no selected compose file,
+   `down` needs only the project name: networks and volumes carry the
+   label too, and `depends-on` gives the order. With a selected file, it
+   also loads its declarations, including the external resources to
+   keep.*
 2. Why can `app.py` connect to `redis` with no address anywhere in the
    file, and why would that fail on the daemon's default network?
    *Every service is on `hits_default` with its name as an alias, and

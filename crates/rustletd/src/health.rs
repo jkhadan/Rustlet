@@ -221,6 +221,7 @@ async fn run_check(socket: &Path, plan: &HealthPlan) -> HealthResult {
         output,
     };
     let request = Request::Exec(ExecRequest {
+        kill_on_disconnect: true,
         exec_id: format!("health-{}", N.fetch_add(1, Ordering::Relaxed)),
         args: plan.args.clone(),
         ..ExecRequest::default()

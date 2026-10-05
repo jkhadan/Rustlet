@@ -26,6 +26,10 @@ name: string | null,
  */
 cmd: Array<string>, 
 /**
+ * Suppresses the image's `Cmd`, including when `cmd` is empty.
+ */
+clear_cmd: boolean, 
+/**
  * Replaces the image's `Entrypoint`; `Some([])` clears it.
  */
 entrypoint: Array<string> | null, 
@@ -33,6 +37,10 @@ entrypoint: Array<string> | null,
  * `KEY=VALUE`, over the image's `Env`.
  */
 env: Array<string>, 
+/**
+ * Names removed from the image's environment before applying `env`.
+ */
+unset_env: Array<string>, 
 /**
  * `user[:group]`, names or ids from the image's `/etc/passwd` and
  * `/etc/group`.

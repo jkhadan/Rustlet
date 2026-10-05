@@ -126,10 +126,16 @@ const OCI_IMAGE: &str = "org.opencontainers.image.";
 pub struct RunOptions {
     /// Command arguments (`IMAGE ARGS…`), replacing the image's `Cmd`.
     pub args: Vec<String>,
+    /// Explicitly discard the image's `Cmd`, including with no arguments
+    /// and an inherited entrypoint (Compose's empty `command`).
+    pub clear_cmd: bool,
     /// `--entrypoint`; `Some(vec![])` clears the image's.
     pub entrypoint: Option<Vec<String>>,
     /// `-e KEY=VALUE`, in order.
     pub env: Vec<String>,
+    /// Names explicitly removed from the inherited image environment.
+    /// Values supplied in `env` take precedence over these removals.
+    pub unset_env: Vec<String>,
     /// `-u user[:group]`.
     pub user: Option<String>,
     /// `-w DIR`.
@@ -210,7 +216,13 @@ pub fn process_args(
         Some(ours) => (ours.as_slice(), &[][..]),
         None => (entrypoint.unwrap_or_default(), cmd.unwrap_or_default()),
     };
-    let command = if options.args.is_empty() { cmd } else { options.args.as_slice() };
+    let command = if !options.args.is_empty() {
+        options.args.as_slice()
+    } else if options.clear_cmd {
+        &[][..]
+    } else {
+        cmd
+    };
     let args: Vec<String> = entrypoint.iter().chain(command).cloned().collect();
     match args.first() {
         Some(program) if !program.is_empty() => Ok(args),
@@ -225,12 +237,21 @@ pub fn process_args(
 /// `process.env` from the image's `Env` and the options; `hostname` is the
 /// container's, for `HOSTNAME`.
 pub fn process_env(image_env: &[String], options: &RunOptions, hostname: &str) -> Result<Vec<String>> {
+    for name in &options.unset_env {
+        if name.is_empty() || name.contains(['=', '\0']) {
+            return Err(Error::invalid(format!(
+                "unset environment name {name:?}: expected a nonempty name without '=' or NUL"
+            )));
+        }
+    }
     let mut env = Vec::with_capacity(image_env.len() + options.env.len() + 3);
     for entry in image_env {
         if env_name(entry).is_none() {
             return Err(Error::invalid(format!("the image's Env entry {entry:?} is not KEY=value")));
         }
-        env.push(entry.clone());
+        if !options.unset_env.iter().any(|name| env_name(entry) == Some(name.as_str())) {
+            env.push(entry.clone());
+        }
     }
     for entry in &options.env {
         let Some(name) = env_name(entry) else {
@@ -618,6 +639,32 @@ mod tests {
         assert!(
             matches!(process_args(Some(&empty), Some(&cmd), &run(&[], None)), Err(Error::Invalid(m)) if m.contains("empty"))
         );
+    }
+
+    #[test]
+    fn an_explicit_empty_command_keeps_only_the_entrypoint() {
+        let ep = strings(&["/entrypoint"]);
+        let cmd = strings(&["default", "argument"]);
+        let clear = RunOptions { clear_cmd: true, ..RunOptions::default() };
+        assert_eq!(process_args(Some(&ep), Some(&cmd), &clear).unwrap(), ep);
+        assert!(process_args(None, Some(&cmd), &clear).is_err());
+        let explicit = RunOptions { args: strings(&["replacement"]), ..clear };
+        assert_eq!(process_args(Some(&ep), Some(&cmd), &explicit).unwrap(), ["/entrypoint", "replacement"]);
+    }
+
+    #[test]
+    fn environment_removals_apply_before_explicit_values() {
+        let inherited = strings(&["A=first", "A=last", "B=base", "C=keep"]);
+        let options =
+            RunOptions { unset_env: strings(&["A", "B"]), env: strings(&["B=override"]), ..RunOptions::default() };
+        let env = process_env(&inherited, &options, "box").unwrap();
+        assert!(!env.iter().any(|e| e.starts_with("A=")));
+        assert!(env.contains(&"B=override".to_owned()));
+        assert!(env.contains(&"C=keep".to_owned()));
+        for name in ["", "A=B", "A\0B"] {
+            let invalid = RunOptions { unset_env: vec![name.to_owned()], ..RunOptions::default() };
+            assert!(matches!(process_env(&[], &invalid, "box"), Err(Error::Invalid(_))), "{name:?}");
+        }
     }
 
     #[test]

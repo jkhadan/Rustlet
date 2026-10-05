@@ -32,13 +32,18 @@ e2e/             a WebDriver client and the lifecycle scenario
   Inspect and Isolation tabs), **Images**, **Networks**, **Volumes**, as in Phase 6.
   A container's healthcheck shows as a badge beside its status while it runs, and
   in a Health section of its Overview (the check, its settings, the last five
-  results). A build runs each `RUN` step in a container of its own (label
-  `io.rustlet.build`): the lists hide those unless asked to show them.
+  results; the page asks again every few seconds while the container runs,
+  since the daemon announces only a change of verdict, not each check). A build
+  runs each `RUN` step in a container of its own (label `io.rustlet.build`): the
+  lists hide those unless asked to show them, and the dashboard's counts leave
+  them out.
 - **Stacks**: the compose projects the daemon has containers of, found by their
   labels (the daemon knows no projects), live from the daemon's events: what runs,
   each service's containers, health and ports. *Down* removes a project's
-  containers and networks (and, if asked, its volumes); *Up* brings it up again
-  from the files its labels name; *Up from file* takes a compose file's path.
+  containers and networks (and, if asked, its volumes; what stays because
+  something else uses it is said in a warning); *Up* brings it up again from the
+  files its labels name; *Up from file* takes a compose file's path, and shows
+  what loading it noted (an unset `${VAR}`, an ignored key) before the progress.
 - **Build**: a context directory, its Containerfile, names, build args, target;
   the steps as rustletd runs them, with each `RUN`'s output. Leaving the view
   doesn't stop a build; *Stop* does.
@@ -120,3 +125,8 @@ the two binaries (their libraries are installed with WebKitGTK and X); point
 `WEBKIT_WEBDRIVER` and `XVFB` at them. `E2E_XVFB=:99` runs the app on a private
 virtual display, `E2E_SHOTS=dir` saves a screenshot after each step, and
 `E2E_RESTART='<command>'` adds a daemon restart to the scenario.
+
+For headless WebKit runs, use a language locale such as
+`LC_ALL=en_US.UTF-8` (installed on this development host). With
+`LC_ALL=C.UTF-8`, WebKit reports `navigator.language` as `C`, and uPlot's
+number formatter throws before the app renders.

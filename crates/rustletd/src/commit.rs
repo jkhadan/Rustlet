@@ -79,7 +79,11 @@ impl Daemon {
         let layer = blocking(move || {
             let identity = |uid, gid| (uid, gid);
             let map_owner: &dyn Fn(u32, u32) -> (u32, u32) = if remap { &unmap_remap } else { &identity };
-            commit_layer(store.content(), &upper, &DiffOptions { skip: &skip, map_owner, lowers: &lowers })
+            commit_layer(
+                store.content(),
+                &upper,
+                &DiffOptions { skip: &skip, map_owner, lowers: &lowers, userxattr: false },
+            )
         })
         .await;
         if freeze && let Err(e) = shim_ok(&socket, Request::Resume).await {
@@ -156,6 +160,12 @@ fn commit_config(
     let mut json: Value =
         serde_json::from_slice(&bytes).map_err(|e| ApiError::internal(format!("the image's config: {e}")))?;
     let mut state = ImageConfigState::new(json.get("config"));
+    if let Some(Value::Array(env)) = state.config.get_mut("Env") {
+        env.retain(|entry| {
+            let name = entry.as_str().unwrap_or_default().split('=').next().unwrap_or_default();
+            !record.config.unset_env.iter().any(|unset| unset == name)
+        });
+    }
     for op in container_options(record, image) {
         state.apply(&op).map_err(ApiError::internal)?;
     }
@@ -204,7 +214,7 @@ fn container_options(record: &Record, image: &Image) -> Vec<Op> {
     if let Some(entrypoint) = &c.entrypoint {
         ops.push(Op::Entrypoint(Command::Exec(entrypoint.clone())));
     }
-    if !c.cmd.is_empty() {
+    if c.clear_cmd || !c.cmd.is_empty() {
         ops.push(Op::Cmd(Command::Exec(c.cmd.clone())));
     }
     if let Some(user) = c.user.as_ref().filter(|u| !u.is_empty()) {

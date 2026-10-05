@@ -18,9 +18,8 @@
 //! their value ([`ArgScope`]). A build arg no `ARG` declares is reported
 //! ([`Plan::unused_args`]), as Docker warns.
 //!
-//! `COPY --from` is expanded here with the same variables as `FROM` (the
-//! global ones), as BuildKit does to know a stage's dependencies before
-//! anything runs. Docker's predefined proxy args (`HTTP_PROXY`,
+//! `COPY --from` names a stage or image literally; variable expansion is
+//! refused, as Docker does. Docker's predefined proxy args (`HTTP_PROXY`,
 //! `no_proxy`…) need no `ARG`: a `RUN` gets them from the build args
 //! ([`ArgScope::proxy_env`]), and they are never reported unused.
 
@@ -118,13 +117,11 @@ pub fn plan(file: &Containerfile, target: Option<&str>, build_args: &BTreeMap<St
         for instruction in &file.stages[index].instructions {
             let InstructionKind::Copy(copy) = &instruction.kind else { continue };
             let Some(from) = &copy.from else { continue };
-            let at = |message: String| format!("line {}: COPY --from={from}: {message}", instruction.line);
-            let from = expand(from).map_err(|e| at(e.to_string()))?;
-            if from.is_empty() {
-                continue;
+            if from.contains('$') {
+                return Err(format!("line {}: COPY: variable expansion is not supported for --from", instruction.line));
             }
             if let FromSource::Stage(source) =
-                resolve_from(file, index, &from).map_err(|e| format!("line {}: {e}", instruction.line))?
+                resolve_from(file, index, from).map_err(|e| format!("line {}: {e}", instruction.line))?
             {
                 queue.push(source);
             }
@@ -164,6 +161,11 @@ fn global_values(
 ) -> Result<BTreeMap<String, Option<String>>, String> {
     let mut values: BTreeMap<String, Option<String>> =
         platform_args().into_iter().map(|(name, value)| (name, Some(value))).collect();
+    for (name, value) in &mut values {
+        if let Some(override_value) = build_args.get(name) {
+            *value = Some(override_value.clone());
+        }
+    }
     for arg in &file.global_args {
         let value = match (build_args.get(&arg.name), &arg.default) {
             (Some(value), _) => Some(value.clone()),

@@ -218,6 +218,11 @@ pub async fn up(
         .map_err(|e| CommandError::failed(format!("loading the compose file failed: {e}")))?
         .map_err(error)?;
     let (tx, rx) = unbounded();
+    // What loading the file noted (an unset `${VAR}`, a key that is
+    // ignored) comes first, as `rustlet compose up` prints it first.
+    for progress in load_warnings(&project) {
+        let _ = tx.unbounded_send(Ok(progress));
+    }
     tauri::async_runtime::spawn(async move {
         let name = project.name.clone();
         let compose = rustlet_compose::Compose::new(client, project);
@@ -236,13 +241,41 @@ pub async fn up(
     Ok(rx)
 }
 
+/// What loading a project's file noted, as the first lines of its `up`'s
+/// progress.
+fn load_warnings(project: &rustlet_compose::Project) -> Vec<ComposeProgress> {
+    project.warnings.iter().map(|message| ComposeProgress::Warning { message: message.clone() }).collect()
+}
+
+/// A `down`'s warnings: what stays because something else still uses it
+/// (a network, a volume, an image), which is no failure but isn't to go
+/// unsaid. Its other events are only logged: the stack's card follows the
+/// daemon's own.
+#[derive(Default)]
+struct DownNotes(std::sync::Mutex<Vec<String>>);
+
+impl DownNotes {
+    fn note(&self, project: &str, event: ComposeEvent) {
+        match event {
+            ComposeEvent::Warning(message) => self.0.lock().unwrap_or_else(|e| e.into_inner()).push(message),
+            event => tracing::debug!(project, ?event, "compose down"),
+        }
+    }
+
+    fn into_warnings(self) -> Vec<String> {
+        self.0.into_inner().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// `compose -p PROJECT down`: the project's containers and networks, found
-/// by their labels (no file needed), and with `volumes` its volumes.
-pub async fn down(client: &Client, project: &str, volumes: bool) -> CommandResult<()> {
+/// by their labels (no file needed), and with `volumes` its volumes. The
+/// warnings it gives are the result: what stayed, and why.
+pub async fn down(client: &Client, project: &str, volumes: bool) -> CommandResult<Vec<String>> {
     let options = DownOptions { volumes, ..DownOptions::default() };
-    // Nobody watches a down: the stack's card follows the daemon's events.
-    let log = |event: ComposeEvent| tracing::debug!(project, ?event, "compose down");
-    rustlet_compose::run::down_project(client, project, &options, &log).await.map_err(error)
+    let notes = DownNotes::default();
+    let log = |event: ComposeEvent| notes.note(project, event);
+    rustlet_compose::run::down_project(client, project, &options, &log).await.map_err(error)?;
+    Ok(notes.into_warnings())
 }
 
 #[cfg(test)]
@@ -255,6 +288,43 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn what_loading_the_file_noted_comes_first_in_the_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml =
+            "name: hits\nservices:\n  web:\n    image: alpine\n    command: [\"echo\", \"${NOT_SET_ANYWHERE}\"]\n";
+        let project = rustlet_compose::load_str(yaml, dir.path(), &LoadOptions::default()).unwrap();
+        let progress = load_warnings(&project);
+        assert_eq!(progress.len(), 1, "{progress:?}");
+        assert!(
+            matches!(&progress[0], ComposeProgress::Warning { message } if message.contains("NOT_SET_ANYWHERE")),
+            "{progress:?}"
+        );
+        let clean =
+            rustlet_compose::load_str("services:\n  a:\n    image: alpine\n", dir.path(), &LoadOptions::default());
+        assert!(load_warnings(&clean.unwrap()).is_empty());
+    }
+
+    #[test]
+    fn a_downs_warnings_are_its_result_and_its_other_events_are_not() {
+        let notes = DownNotes::default();
+        notes.note("hits", ComposeEvent::Warning("volume hits_data is still in use, so it stays: in use".into()));
+        notes.note(
+            "hits",
+            ComposeEvent::Resource {
+                kind: ResourceKind::Network,
+                name: "hits_default".into(),
+                action: Action::Removed,
+            },
+        );
+        notes.note("hits", ComposeEvent::Warning("network other stays".into()));
+        assert_eq!(
+            notes.into_warnings(),
+            ["volume hits_data is still in use, so it stays: in use", "network other stays"]
+        );
+        assert!(DownNotes::default().into_warnings().is_empty());
+    }
 
     #[test]
     fn a_stack_keeps_its_containers_whole_by_service_and_number() {

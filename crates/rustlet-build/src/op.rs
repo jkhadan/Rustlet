@@ -3,15 +3,17 @@
 //!
 //! Which arguments are expanded is Docker's choice: `FROM` (with the
 //! global `ARG`s only), `ENV`, `ARG` defaults, `LABEL`, `WORKDIR`, `USER`,
-//! `EXPOSE`, `VOLUME`, `STOPSIGNAL`, `COPY`/`ADD` (sources, destination and
-//! flags). `RUN`, `CMD`, `ENTRYPOINT`, `SHELL`, `HEALTHCHECK`'s command and
-//! `ONBUILD` are not: the shell, or the program, sees them as written.
+//! `EXPOSE`, `VOLUME`, `STOPSIGNAL`, `COPY`/`ADD` (sources, destination,
+//! `--chown` and `--chmod`). `COPY --from` is literal and refuses variables.
+//! `RUN`, `CMD`, `ENTRYPOINT`, `SHELL`, `HEALTHCHECK`'s command, `MAINTAINER`
+//! and `ONBUILD` are not expanded: they are kept as written.
 //!
 //! Checked here: `EXPOSE` ports (`80`, `80/tcp`, `53/udp`, ranges
 //! `8000-8002`, become one `port/proto` each), `--chmod` (octal), the
 //! `HEALTHCHECK` options (Go durations such as `30s` or `1m30s`, a retry
 //! count), a `COPY` with fewer than two words, `ADD` from a URL (refused:
-//! "use RUN with curl or wget"), `STOPSIGNAL` (a signal's name or number).
+//! "use RUN with curl or wget"), `STOPSIGNAL` (a traditional signal's name
+//! or number, 1–31; realtime signals are unsupported).
 //!
 //! Where this differs from BuildKit: `COPY`, `ADD` and `VOLUME` in shell
 //! form split their words as a shell would ([`expand::words`]): quotes can
@@ -21,7 +23,7 @@
 //! takes the container port and warns). An `ADD` source that names a git
 //! repository gets its own hint ("use RUN with git clone").
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use crate::config::parse_duration;
@@ -81,6 +83,19 @@ impl Op {
     /// `kind` with its words expanded (`escape`: the file's escape
     /// character; `lookup`: the variables in scope, `ENV` over `ARG`).
     pub fn new(kind: &InstructionKind, escape: char, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Op, String> {
+        Self::new_with_build_args(kind, escape, lookup, &BTreeMap::new())
+    }
+
+    /// Expands an instruction with the build's explicit ARG overrides.
+    /// An overridden ARG default is not evaluated, including required-variable
+    /// substitutions that would otherwise fail. `ArgScope::declare` applies
+    /// the override when it receives the resulting declaration.
+    pub fn new_with_build_args(
+        kind: &InstructionKind,
+        escape: char,
+        lookup: &dyn Fn(&str) -> Option<String>,
+        build_args: &BTreeMap<String, String>,
+    ) -> Result<Op, String> {
         let x = Expander { escape, lookup };
         Ok(match kind {
             InstructionKind::Run(command) => Op::Run(command.clone()),
@@ -93,7 +108,14 @@ impl Op {
             InstructionKind::Arg(decls) => Op::Arg(
                 decls
                     .iter()
-                    .map(|decl| Ok((decl.name.clone(), decl.default.as_deref().map(|d| x.word("ARG", d)).transpose()?)))
+                    .map(|decl| {
+                        let default = if build_args.contains_key(&decl.name) {
+                            None
+                        } else {
+                            decl.default.as_deref().map(|d| x.word("ARG", d)).transpose()?
+                        };
+                        Ok((decl.name.clone(), default))
+                    })
                     .collect::<Result<_, String>>()?,
             ),
             InstructionKind::Workdir(raw) => {
@@ -113,15 +135,15 @@ impl Op {
             }
             InstructionKind::Healthcheck(check) => Op::Healthcheck(healthcheck(check)?),
             InstructionKind::Shell(shell) => Op::Shell(shell.clone()),
-            InstructionKind::Maintainer(raw) => Op::Maintainer(x.word("MAINTAINER", raw)?),
+            InstructionKind::Maintainer(raw) => Op::Maintainer(raw.clone()),
             InstructionKind::Onbuild(trigger) => Op::Onbuild(trigger.clone()),
         })
     }
 
-    /// Does this step change the filesystem (`RUN`, `COPY`, `ADD`)? The
+    /// Does this step change the filesystem (`RUN`, `COPY`, `ADD`, `WORKDIR`)? The
     /// others only change the config, or the build's variables.
     pub fn makes_layer(&self) -> bool {
-        matches!(self, Op::Run(_) | Op::Copy(_))
+        matches!(self, Op::Run(_) | Op::Copy(_) | Op::Workdir(_))
     }
 }
 
@@ -186,7 +208,12 @@ fn copy_op(args: &CopyArgs, add: bool, x: &Expander<'_>) -> Result<CopyOp, Strin
         let hint = if is_git(source) { "use RUN with git clone" } else { "use RUN with curl or wget" };
         return Err(format!("ADD from a URL is not supported: {hint} ({source})"));
     }
-    Ok(CopyOp { add, sources: words, dest, from: flag(&args.from)?, chown: flag(&args.chown)?, chmod })
+    if args.from.as_ref().is_some_and(|from| from.contains('$')) {
+        return Err(
+            "COPY: variable expansion is not supported for --from; use a stage declared with FROM instead".into()
+        );
+    }
+    Ok(CopyOp { add, sources: words, dest, from: args.from.clone(), chown: flag(&args.chown)?, chmod })
 }
 
 /// `--chmod`: octal, at most `7777`.
@@ -280,25 +307,26 @@ fn volumes(args: &Args, x: &Expander<'_>) -> Result<Vec<String>, String> {
 const SIGNALS: &[&str] = &[
     "ABRT", "ALRM", "BUS", "CHLD", "CLD", "CONT", "FPE", "HUP", "ILL", "INT", "IO", "IOT", "KILL", "PIPE", "POLL",
     "PROF", "PWR", "QUIT", "SEGV", "STKFLT", "STOP", "SYS", "TERM", "TRAP", "TSTP", "TTIN", "TTOU", "URG", "USR1",
-    "USR2", "VTALRM", "WINCH", "XCPU", "XFSZ", "RTMIN", "RTMAX",
+    "USR2", "VTALRM", "WINCH", "XCPU", "XFSZ",
 ];
 
-/// `STOPSIGNAL`: a number from 1 to 64, or a name (`SIGTERM`, `term`,
-/// `RTMIN+3`), as Docker accepts them.
+/// `STOPSIGNAL`: a traditional Linux signal, by name or number. The runtime
+/// does not support realtime signals; refuse them before producing an image.
 fn check_signal(signal: &str) -> Result<(), String> {
-    if signal.parse::<u32>().is_ok_and(|n| (1..=64).contains(&n)) {
-        return Ok(());
+    if let Ok(number) = signal.parse::<u32>() {
+        if (1..=31).contains(&number) {
+            return Ok(());
+        }
+        if (32..=64).contains(&number) {
+            return Err(format!("STOPSIGNAL {signal}: realtime signals are not supported"));
+        }
     }
     let upper = signal.to_ascii_uppercase();
     let name = upper.strip_prefix("SIG").unwrap_or(&upper);
-    let realtime = |prefix: &str, max: u32| {
-        name.strip_prefix(prefix).and_then(|n| n.parse::<u32>().ok()).is_some_and(|n| (1..=max).contains(&n))
-    };
-    if SIGNALS.contains(&name) || realtime("RTMIN+", 15) || realtime("RTMAX-", 14) {
-        Ok(())
-    } else {
-        Err(format!("STOPSIGNAL {signal}: unknown signal"))
+    if name.starts_with("RTMIN") || name.starts_with("RTMAX") {
+        return Err(format!("STOPSIGNAL {signal}: realtime signals are not supported"));
     }
+    if SIGNALS.contains(&name) { Ok(()) } else { Err(format!("STOPSIGNAL {signal}: unknown signal")) }
 }
 
 fn healthcheck(check: &Healthcheck) -> Result<Option<HealthcheckOp>, String> {

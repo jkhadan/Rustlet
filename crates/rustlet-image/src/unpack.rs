@@ -53,8 +53,10 @@
 //! an entry (PAX records, GNU long names), which this module reads itself
 //! (`extensions`: the tar crate loses PAX records whose values hold a
 //! newline). Attributes come from PAX `SCHILY.xattr.*`
-//! records, except overlay's own (`trusted.overlay.*`, `user.overlay.*`):
-//! from an image they could forge an opaque directory or a redirect.
+//! records, except the active overlay namespace (`trusted.overlay.*`
+//! for the daemon, `user.overlay.*` for an unprivileged unpack): from an
+//! image those could forge an opaque directory or a redirect. Attributes
+//! in the inactive namespace remain ordinary data.
 //!
 //! Unprivileged callers (the unit tests, rootless mode one day) keep their
 //! own uid as owner and mark opaque directories with `user.overlay.opaque`,
@@ -68,6 +70,7 @@
 //! digests cover every byte. The caller compares them with the manifest's
 //! blob digest and the config's diff ID before using the directory.
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, BufReader, Read};
@@ -98,9 +101,6 @@ const WHITEOUT_PREFIX: &[u8] = b".wh.";
 const OPAQUE_MARKER: &[u8] = b".wh..wh..opq";
 /// `.wh..wh.*` other than the opaque marker: AUFS bookkeeping (`.wh..wh.plnk`).
 const META_PREFIX: &[u8] = b".wh..wh.";
-/// Attribute namespaces overlayfs keeps for itself.
-const OVERLAY_XATTRS: [&str; 2] = ["trusted.overlay.", "user.overlay."];
-
 /// How every path inside the layer is resolved (see the module docs).
 const RESOLVE: ResolveFlags = ResolveFlags::IN_ROOT.union(ResolveFlags::NO_MAGICLINKS).union(ResolveFlags::NO_XDEV);
 
@@ -136,13 +136,19 @@ pub struct UnpackOptions {
     /// It is an image layer: `.wh.<name>` entries become overlay whiteouts
     /// and `.wh..wh..opq` an opaque directory (the default). Off for an
     /// archive that is only files (a build context, an `ADD`ed tarball),
-    /// where such names are ordinary entries.
+    /// where such names are ordinary entries and the archive's own root
+    /// entry (`./`) is skipped, as Docker's go-archive skips it: the
+    /// directory it is extracted into keeps its own metadata.
     pub whiteouts: bool,
+    /// Every entry made gets this owner (`ADD --chown`), not the archive's
+    /// own (`None`, the default). Hard links share their target's; the
+    /// parent directories an archive doesn't list are root's either way.
+    pub owner: Option<(u32, u32)>,
 }
 
 impl Default for UnpackOptions {
     fn default() -> UnpackOptions {
-        UnpackOptions { whiteouts: true }
+        UnpackOptions { whiteouts: true, owner: None }
     }
 }
 
@@ -172,6 +178,7 @@ pub fn unpack_with(
         let mut tar_stream = HashingReader::new(decompressed);
         let mut unpacker = Unpacker::new(dest)?;
         unpacker.whiteouts = options.whiteouts;
+        unpacker.owner = options.owner;
         {
             // Raw: the extension headers come as entries, read here.
             let mut archive = tar::Archive::new(&mut tar_stream);
@@ -251,10 +258,13 @@ impl Meta {
         let secs = field(&old.mtime, header.mtime(), "mtime")?;
         let mut mtime = TimeSpec::new(i64::try_from(secs).unwrap_or(i64::MAX), 0);
         let mut atime = None;
-        let mut xattrs = Vec::new();
+        let mut xattrs = BTreeMap::new();
         for (key, raw) in extensions.records() {
             let Ok(key) = std::str::from_utf8(key) else { continue };
             let value = || std::str::from_utf8(raw).unwrap_or("");
+            if raw.is_empty() && matches!(key, "uid" | "gid") {
+                continue; // An empty PAX value keeps the USTAR field.
+            }
             match key {
                 "uid" => {
                     uid = value().parse().map_err(|_| Error::invalid(format!("layer entry {shown:?}: PAX uid")))?
@@ -267,8 +277,7 @@ impl Meta {
                 k => {
                     if let Some(name) = k.strip_prefix("SCHILY.xattr.") {
                         // A later record for the same attribute wins.
-                        xattrs.retain(|(n, _): &(String, Vec<u8>)| n != name);
-                        xattrs.push((name.to_owned(), raw.clone()));
+                        xattrs.insert(name.to_owned(), raw.clone());
                     }
                 }
             }
@@ -280,7 +289,14 @@ impl Meta {
                 .filter(|&v| v != u32::MAX)
                 .ok_or_else(|| Error::invalid(format!("layer entry {shown:?}: {what} {v} is out of range")))
         };
-        Ok(Meta { uid: id(uid, "uid")?, gid: id(gid, "gid")?, mode, atime: atime.unwrap_or(mtime), mtime, xattrs })
+        Ok(Meta {
+            uid: id(uid, "uid")?,
+            gid: id(gid, "gid")?,
+            mode,
+            atime: atime.unwrap_or(mtime),
+            mtime,
+            xattrs: xattrs.into_iter().collect(),
+        })
     }
 }
 
@@ -292,6 +308,9 @@ fn pax_time(s: &str) -> Option<TimeSpec> {
         None => (false, s),
     };
     let (secs, frac) = s.split_once('.').unwrap_or((s, ""));
+    if secs.is_empty() || !secs.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     let secs: i64 = secs.parse().ok()?;
     if !frac.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -316,6 +335,8 @@ struct Unpacker<'a> {
     dir_times: Vec<(PathBuf, TimeSpec, TimeSpec)>,
     /// `.wh.` names are overlay markers ([`UnpackOptions::whiteouts`]).
     whiteouts: bool,
+    /// [`UnpackOptions::owner`].
+    owner: Option<(u32, u32)>,
 }
 
 impl<'a> Unpacker<'a> {
@@ -330,6 +351,7 @@ impl<'a> Unpacker<'a> {
             report: UnpackReport::default(),
             dir_times: Vec::new(),
             whiteouts: true,
+            owner: None,
         })
     }
 
@@ -354,7 +376,7 @@ impl<'a> Unpacker<'a> {
         if kind == EntryType::GNUSparse || extensions.records().iter().any(|(k, _)| k.starts_with(b"GNU.sparse.")) {
             return Err(Error::unsupported(format!("layer entry {shown:?}: sparse files are not supported")));
         }
-        if let Some(size) = extensions.get("size") {
+        if let Some(size) = extensions.get("size").filter(|s| !s.is_empty()) {
             let header = entry.header().entry_size().ok();
             if std::str::from_utf8(size).ok().and_then(|s| s.parse::<u64>().ok()) != header {
                 return Err(Error::unsupported(format!(
@@ -373,8 +395,18 @@ impl<'a> Unpacker<'a> {
             return Ok(());
         }
         let path = clean(&raw).map_err(|why| Error::invalid(format!("layer entry {shown:?}: {why}")))?;
-        let meta = Meta::read(entry.header(), &extensions, &shown)?;
+        let mut meta = Meta::read(entry.header(), &extensions, &shown)?;
+        if let Some((uid, gid)) = self.owner {
+            (meta.uid, meta.gid) = (uid, gid);
+        }
         let Some(path) = path else {
+            if !self.whiteouts {
+                // `./` of a plain archive: skipped, as Docker skips it (an
+                // `ADD`ed tarball made with `tar -C dir .` carries its
+                // packer's mode and owner for it).
+                self.report.skipped_other.push(shown);
+                return Ok(());
+            }
             // `./`: the layer's own root directory.
             if kind != EntryType::Directory {
                 return Err(Error::invalid(format!("layer entry {shown:?}: the root must be a directory")));
@@ -735,7 +767,8 @@ impl<'a> Unpacker<'a> {
         mut set: impl FnMut(&str, &[u8]) -> rustlet_sys::Result<()>,
     ) -> Result<()> {
         for (name, value) in &meta.xattrs {
-            if OVERLAY_XATTRS.iter().any(|p| name.starts_with(p)) {
+            let private = if self.privileged { "trusted.overlay." } else { "user.overlay." };
+            if name.starts_with(private) {
                 self.report.dropped_xattrs.push(format!("{shown}: {name}"));
                 continue;
             }
@@ -777,7 +810,7 @@ impl<'a> Unpacker<'a> {
     }
 }
 
-mod extensions;
+pub(crate) mod extensions;
 
 #[cfg(test)]
 mod tests;

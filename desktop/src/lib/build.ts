@@ -12,6 +12,9 @@ import { failPull, initialPull, pullReducer, type PullState } from "./pull";
 
 /** Lines of output a step keeps; earlier ones are dropped, and counted. */
 export const MAX_STEP_LINES = 2000;
+/** Character limits include output without any newline. */
+export const MAX_STEP_LINE_CHARS = 16 * 1024;
+export const MAX_STEP_OUTPUT_CHARS = 2 * 1024 * 1024;
 
 /** `stopped`: the build was stopped, or failed, while it ran. */
 export type StepState = "running" | "cached" | "done" | "failed" | "stopped";
@@ -40,6 +43,8 @@ export interface BuildStep {
   partial?: OutputLine;
   /** Lines dropped from the start of `output`. */
   dropped: number;
+  /** Characters discarded from oversized lines (separate from dropped lines). */
+  droppedChars: number;
   /** A `FROM` step's pull of its base image. */
   pull?: PullState;
 }
@@ -91,12 +96,21 @@ function appendOutput(st: BuildStep, stream: LogStream, text: string): BuildStep
   const pieces = text.split("\n");
   const lines: OutputLine[] = [];
   let partial = st.partial;
+  let droppedChars = st.droppedChars;
   pieces.forEach((piece, i) => {
     if (partial && partial.stream !== stream) {
       lines.push(partial);
       partial = undefined;
     }
-    const joined = (partial?.text ?? "") + piece;
+    let joined = (partial?.text ?? "") + piece;
+    if (joined.length > MAX_STEP_LINE_CHARS) {
+      const start = joined.length - MAX_STEP_LINE_CHARS;
+      // Keep the tail, without starting in the middle of a UTF-16 pair.
+      const low = joined.charCodeAt(start);
+      const cut = start + (low >= 0xdc00 && low <= 0xdfff ? 1 : 0);
+      droppedChars += cut;
+      joined = joined.slice(cut);
+    }
     partial = undefined;
     if (i < pieces.length - 1) lines.push({ stream, text: joined });
     else if (joined) partial = { stream, text: joined };
@@ -107,7 +121,16 @@ function appendOutput(st: BuildStep, stream: LogStream, text: string): BuildStep
     dropped += output.length - MAX_STEP_LINES;
     output = output.slice(output.length - MAX_STEP_LINES);
   }
-  return { ...st, output, partial, dropped };
+  let chars = output.reduce((sum, line) => sum + line.text.length, partial?.text.length ?? 0);
+  let remove = 0;
+  while (chars > MAX_STEP_OUTPUT_CHARS && remove < output.length) {
+    chars -= output[remove++].text.length;
+  }
+  if (remove) {
+    dropped += remove;
+    output = output.slice(remove);
+  }
+  return { ...st, output, partial, dropped, droppedChars };
 }
 
 export function buildReducer(s: BuildState, e: BuildEvent): BuildState {
@@ -125,6 +148,7 @@ export function buildReducer(s: BuildState, e: BuildEvent): BuildState {
         state: "running",
         output: [],
         dropped: 0,
+        droppedChars: 0,
       };
       // A step starts when the one before is done, whatever said so.
       return { ...s, phase: "building", steps: [...settle(s.steps, "done"), step] };

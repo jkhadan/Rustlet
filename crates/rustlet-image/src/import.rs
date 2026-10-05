@@ -102,6 +102,10 @@ pub fn write_image(content: &ContentStore, config: &[u8], layers: &[Descriptor])
         .layers(layers.to_vec())
         .build()
         .map_err(|e| Error::invalid(format!("manifest: {e}")))?;
+    // OCI descriptors hold annotations in HashMaps. Order their keys before
+    // hashing so reparsing an annotated base cannot change the image ID.
+    let mut manifest = serde_json::to_value(&manifest).context("serialize the manifest")?;
+    manifest.sort_all_objects();
     let manifest_json = serde_json::to_vec(&manifest).context("serialize the manifest")?;
     let manifest_digest = content.write_blob(&manifest_json)?;
     Ok(manifest_descriptor(media::OCI_MANIFEST, &manifest_digest, manifest_json.len() as u64))

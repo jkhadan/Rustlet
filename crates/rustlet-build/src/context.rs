@@ -12,12 +12,10 @@
 //! - owners 0:0 and no user or group names (`COPY` sets its own owners;
 //!   the client's ids mean nothing in an image); modes and modification
 //!   times kept;
-//! - the Containerfile and the ignore file are always included, even if a
-//!   pattern excludes them (the daemon needs the first; Docker does the
-//!   same);
-//! - a Containerfile outside the context (`-f ../Containerfile`) is added
-//!   as `.rustlet-containerfile` ([`dockerfile_name`] says which name the
-//!   build's options should give);
+//! - an excluded ignore file is left out (only the client needs it);
+//! - a Containerfile outside the context (`-f ../Containerfile`), or one
+//!   excluded by the ignore rules, is sent as `.rustlet-containerfile`.
+//!   The daemon removes this transport file before COPY or ADD;
 //! - a symlink or a path that can't be read is an error naming it, except
 //!   what is excluded (never looked at, unless an exception needs the walk
 //!   to enter it: then a directory that can't be read is left out);
@@ -35,22 +33,23 @@ use std::path::{Path, PathBuf};
 
 use crate::ignore::{IgnoreRules, ignore_file};
 
-/// What a Containerfile from outside the context is called inside it.
+/// The daemon-only name for an outside or excluded Containerfile.
 const OUTSIDE_NAME: &str = ".rustlet-containerfile";
 
 /// The default Containerfile of `context`: `Containerfile`, else
-/// `Dockerfile`, if one is there.
+/// `Dockerfile`, else `dockerfile`, if one is there.
 pub fn default_containerfile(context: &Path) -> Option<PathBuf> {
-    ["Containerfile", "Dockerfile"].into_iter().map(|name| context.join(name)).find(|path| path.is_file())
+    ["Containerfile", "Dockerfile", "dockerfile"].into_iter().map(|name| context.join(name)).find(|path| path.is_file())
 }
 
 /// The name the Containerfile `containerfile` has inside the packed
 /// context (its path relative to `context`, `/`-separated, or
-/// `.rustlet-containerfile` when it is outside): what
+/// `.rustlet-containerfile` when it is outside or ignored): what
 /// `BuildOptions::dockerfile` should say.
 pub fn dockerfile_name(context: &Path, containerfile: &Path) -> Result<String, ContextError> {
     let root = context.canonicalize().map_err(|source| io_error(context, source))?;
-    Ok(match locate(&root, containerfile)? {
+    let rules = load_rules(context, containerfile)?;
+    Ok(match locate_for_transport(&root, containerfile, &rules)? {
         Location::Inside(name) => name,
         Location::Outside(_) => OUTSIDE_NAME.to_owned(),
     })
@@ -75,6 +74,23 @@ fn locate(root: &Path, containerfile: &Path) -> Result<Location, ContextError> {
     match file.strip_prefix(root).ok().and_then(Path::to_str) {
         Some(name) if !name.is_empty() => Ok(Location::Inside(name.to_owned())),
         _ => Ok(Location::Outside(file)),
+    }
+}
+
+fn locate_for_transport(root: &Path, containerfile: &Path, rules: &IgnoreRules) -> Result<Location, ContextError> {
+    Ok(match locate(root, containerfile)? {
+        Location::Inside(name) if rules.excludes(&name) => Location::Outside(root.join(name)),
+        location => location,
+    })
+}
+
+fn load_rules(context: &Path, containerfile: &Path) -> Result<IgnoreRules, ContextError> {
+    match ignore_file(context, containerfile) {
+        Some(path) => {
+            let text = fs::read_to_string(&path).map_err(|source| io_error(&path, source))?;
+            IgnoreRules::parse(&text).map_err(|e| ContextError::Invalid(format!("{}: {e}", path.display())))
+        }
+        None => Ok(IgnoreRules::default()),
     }
 }
 
@@ -116,15 +132,8 @@ pub fn pack(context: &Path, containerfile: &Path, out: &mut dyn Write) -> Result
         return Err(ContextError::Invalid(format!("{}: the build context isn't a directory", context.display())));
     }
     let root = context.canonicalize().map_err(|source| io_error(context, source))?;
-    let location = locate(&root, containerfile)?;
-    let ignore = ignore_file(context, containerfile);
-    let rules = match &ignore {
-        Some(path) => {
-            let text = fs::read_to_string(path).map_err(|source| io_error(path, source))?;
-            IgnoreRules::parse(&text).map_err(|e| ContextError::Invalid(format!("{}: {e}", path.display())))?
-        }
-        None => IgnoreRules::default(),
-    };
+    let rules = load_rules(context, containerfile)?;
+    let location = locate_for_transport(&root, containerfile, &rules)?;
     // What the daemon needs whatever the patterns say.
     let mut always = Vec::new();
     let (dockerfile, outside) = match location {
@@ -134,12 +143,6 @@ pub fn pack(context: &Path, containerfile: &Path, out: &mut dyn Write) -> Result
         }
         Location::Outside(file) => (OUTSIDE_NAME.to_owned(), Some(file)),
     };
-    if let Some(path) = &ignore
-        && let Ok(path) = path.canonicalize()
-        && let Some(name) = path.strip_prefix(&root).ok().and_then(Path::to_str)
-    {
-        always.push(name.to_owned());
-    }
     let mut packer = Packer {
         out: tar::Builder::new(out),
         rules,
@@ -157,8 +160,7 @@ pub fn pack(context: &Path, containerfile: &Path, out: &mut dyn Write) -> Result
 struct Packer<'w> {
     out: tar::Builder<&'w mut dyn Write>,
     rules: IgnoreRules,
-    /// Context paths included whatever the patterns say: the Containerfile
-    /// and the ignore file.
+    /// The included Containerfile's context path: its parents must be walked.
     always: Vec<String>,
     /// A Containerfile from outside the context, for [`OUTSIDE_NAME`].
     outside: Option<PathBuf>,

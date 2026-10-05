@@ -63,6 +63,7 @@ impl Daemon {
         let image_config = image.config.config();
         let options = rustlet_image::runspec::RunOptions {
             args: config.cmd.clone(),
+            clear_cmd: config.clear_cmd,
             entrypoint: config.entrypoint.clone(),
             ..Default::default()
         };
@@ -71,11 +72,10 @@ impl Daemon {
             image_config.and_then(|c| c.cmd().as_deref()),
             &options,
         )?;
-        let stop_signal = config
-            .stop_signal
-            .clone()
-            .or_else(|| spec::image_stop_signal(&image))
-            .unwrap_or_else(|| "SIGTERM".to_owned());
+        let stop_signal = match &config.stop_signal {
+            Some(signal) => signal.clone(),
+            None => spec::image_stop_signal(&image)?.unwrap_or_else(|| "SIGTERM".to_owned()),
+        };
         let (id, name) = {
             let all = self.containers.read().unwrap_or_else(|e| e.into_inner());
             let id = crate::names::new_id(|short| all.keys().any(|k| rustlet_spec::short_id(k) == short));
@@ -730,26 +730,31 @@ impl Daemon {
         }
         c.mark_removed();
         self.emit(c, "destroy", &[]);
-        self.collect_orphaned_image(&c.record.image_id);
+        // A build's step container ran from an image only the build knew:
+        // collected as any, but nobody saw it, so nothing is announced.
+        let announce = !c.record.config.labels.contains_key(crate::build::BUILD_LABEL);
+        self.collect_orphaned_image(&c.record.image_id, announce);
         Ok(())
     }
 
     /// An image whose names were all removed while containers used it
     /// (`rmi --force`) has nothing to keep it once the last of them is
     /// gone: collect it then (there is no `image prune` yet), in the
-    /// background (a pull may have to finish first).
-    fn collect_orphaned_image(self: &Arc<Self>, image_id: &str) {
+    /// background (a pull may have to finish first). `announce`: one image
+    /// `delete` event per blob and snapshot the collection removed.
+    fn collect_orphaned_image(self: &Arc<Self>, image_id: &str, announce: bool) {
         if self.image_users().contains_key(image_id) || self.images.is_named(image_id).unwrap_or(true) {
             return;
         }
         let (d, image_id) = (self.clone(), image_id.to_owned());
         tokio::spawn(async move {
             match d.images.collect_garbage(|| d.image_users().into_keys().collect()).await {
-                Ok(deleted) => {
+                Ok(deleted) if announce => {
                     for gone in deleted {
                         d.events.emit(EventKind::Image, "delete", &gone, Default::default());
                     }
                 }
+                Ok(_) => {}
                 Err(e) => tracing::warn!("collect image {image_id}: {e}"),
             }
         });

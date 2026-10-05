@@ -13,6 +13,7 @@
 
 use std::io::{self, Read, Write};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -31,6 +32,27 @@ const IN_FLIGHT: usize = 8;
 /// A request body sent as it is produced. An `Err` item fails the request.
 pub struct RequestBody {
     pub(crate) stream: BoxStream<'static, io::Result<Bytes>>,
+    failure: ReadFailure,
+}
+
+/// Why the reader behind a [`RequestBody::from_reader`] body failed, if a
+/// read of it did: not a write that failed because the request had ended.
+/// The body then fails the request, and what the connection says of that
+/// ("connection error") names no cause; whoever sends the body asks this
+/// once the request has failed, to tell the user what went wrong instead.
+#[derive(Debug, Clone, Default)]
+pub struct ReadFailure(Arc<Mutex<Option<(io::ErrorKind, String)>>>);
+
+impl ReadFailure {
+    /// The failed read's error, if one failed.
+    pub fn error(&self) -> Option<io::Error> {
+        let failed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        failed.as_ref().map(|(kind, message)| io::Error::new(*kind, message.clone()))
+    }
+
+    fn note(&self, error: &io::Error) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some((error.kind(), error.to_string()));
+    }
 }
 
 impl std::fmt::Debug for RequestBody {
@@ -42,7 +64,14 @@ impl std::fmt::Debug for RequestBody {
 impl RequestBody {
     /// The bytes of `stream`, as they come.
     pub fn from_stream(stream: impl Stream<Item = io::Result<Bytes>> + Send + 'static) -> RequestBody {
-        RequestBody { stream: stream.boxed() }
+        RequestBody { stream: stream.boxed(), failure: ReadFailure::default() }
+    }
+
+    /// What went wrong reading, for a body made by
+    /// [`from_reader`](Self::from_reader); nothing for any other. Taken
+    /// before the body is sent, asked after the request has failed.
+    pub fn read_failure(&self) -> ReadFailure {
+        self.failure.clone()
     }
 
     /// `bytes`, all at once.
@@ -52,15 +81,35 @@ impl RequestBody {
     }
 
     /// Everything `reader` reads, read on a blocking thread (a file, the
-    /// process's stdin).
+    /// process's stdin). A read that fails fails the request, and is noted
+    /// in [`read_failure`](Self::read_failure); a write that fails means
+    /// the request has ended, which is its own failure to report.
     pub fn from_reader(mut reader: impl Read + Send + 'static) -> RequestBody {
-        let (body, mut writer) = RequestBody::pipe();
-        tokio::task::spawn_blocking(move || match io::copy(&mut reader, &mut writer) {
-            Ok(_) => {
-                // A failure here is the request's, which reports it.
-                let _ = writer.finish();
+        let (mut body, mut writer) = RequestBody::pipe();
+        let failure = ReadFailure::default();
+        body.failure = failure.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0; CHUNK];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => {
+                        // A failure here is the request's, which reports it.
+                        let _ = writer.finish();
+                        return;
+                    }
+                    Ok(n) => {
+                        if writer.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => {
+                        failure.note(&e);
+                        writer.abort(e);
+                        return;
+                    }
+                }
             }
-            Err(e) => writer.abort(e),
         });
         body
     }
@@ -238,6 +287,87 @@ mod tests {
         let items: Vec<io::Result<Bytes>> = body.stream.collect().await;
         assert_eq!(items.len(), 2);
         assert_eq!(items[1].as_ref().unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A reader that hands out `data` bytes, then fails.
+    struct FailsAfter {
+        data: usize,
+    }
+
+    impl Read for FailsAfter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.data == 0 {
+                return Err(io::Error::other("Input/output error"));
+            }
+            let n = buf.len().min(self.data);
+            buf[..n].fill(1);
+            self.data -= n;
+            Ok(n)
+        }
+    }
+
+    /// Expected (the docs of `from_reader`: "a read that fails fails the
+    /// request, and is noted in `read_failure`"): the body ends with the
+    /// reader's error, which is noted before the request can see it.
+    #[tokio::test]
+    async fn a_reader_that_fails_fails_the_body_and_is_noted() {
+        let body = RequestBody::from_reader(FailsAfter { data: 100 });
+        let failure = body.read_failure();
+        assert!(failure.error().is_none(), "nothing failed yet");
+        let items: Vec<io::Result<Bytes>> = body.stream.collect().await;
+        assert_eq!(items.last().unwrap().as_ref().unwrap_err().to_string(), "Input/output error");
+        let noted = failure.error().expect("the failure is noted");
+        assert_eq!((noted.kind(), noted.to_string()), (io::ErrorKind::Other, "Input/output error".to_owned()));
+    }
+
+    /// Expected: a write that fails because the request has ended is the
+    /// request's failure, not the reader's: nothing is noted.
+    #[tokio::test]
+    async fn a_request_that_ended_is_not_the_readers_failure() {
+        struct Endless(std::sync::mpsc::Sender<()>);
+        impl Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                buf.fill(7);
+                Ok(buf.len())
+            }
+        }
+        impl Drop for Endless {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let (stopped, wait) = std::sync::mpsc::channel();
+        let body = RequestBody::from_reader(Endless(stopped));
+        let failure = body.read_failure();
+        drop(body);
+        let waited = tokio::task::spawn_blocking(move || wait.recv_timeout(std::time::Duration::from_secs(5))).await;
+        waited.unwrap().expect("the reader's thread stops once the request is gone");
+        assert!(failure.error().is_none(), "{:?}", failure.error());
+    }
+
+    /// Expected (`io::copy` and every reader loop retry `Interrupted`): a
+    /// read that was interrupted is read again, and is no failure.
+    #[tokio::test]
+    async fn an_interrupted_read_is_tried_again_and_is_no_failure() {
+        struct Flaky {
+            interrupted: bool,
+            left: usize,
+        }
+        impl Read for Flaky {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if !std::mem::replace(&mut self.interrupted, true) {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let n = buf.len().min(self.left);
+                self.left -= n;
+                Ok(n)
+            }
+        }
+        let body = RequestBody::from_reader(Flaky { interrupted: false, left: 10 });
+        let failure = body.read_failure();
+        let all: Vec<u8> = body.stream.map(|c| c.unwrap()).collect::<Vec<_>>().await.concat();
+        assert_eq!(all.len(), 10);
+        assert!(failure.error().is_none());
     }
 
     #[tokio::test]

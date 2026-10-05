@@ -312,6 +312,9 @@ fn heredocs_are_refused() {
     for text in [
         "RUN <<EOF",
         "RUN cat <<EOF > /etc/x",
+        "RUN cat << EOF",
+        "COPY << EOF /etc/x",
+        "RUN cat 3<<- EOF",
         "RUN <<-EOF",
         "RUN <<\"EOF\"",
         "RUN <<'EOF'",
@@ -335,7 +338,6 @@ fn shifts_here_strings_and_quoted_angles_are_not_heredocs() {
         "RUN echo '<<EOF'",
         "RUN echo \\<<EOF",
         "RUN echo $((1 << 2))",
-        "RUN cat << EOF",
         "RUN a<<b",
         "RUN [\"sh\", \"-c\", \"cat <<EOF\"]",
     ] {
@@ -608,6 +610,12 @@ fn onbuild_refuses_what_docker_refuses() {
     assert!(refused("ONBUILD maintainer x").contains("MAINTAINER isn't allowed as an ONBUILD trigger"));
     assert!(refused("ONBUILD COPPY a b").contains("ONBUILD: unknown instruction: COPPY"));
     assert!(refused("ONBUILD").contains("ONBUILD requires at least one argument"));
+    for trigger in ["CMD [1, 2]", "ENTRYPOINT [null]", "VOLUME [true]", "SHELL [{}]", "COPY [1, 2]"] {
+        assert!(
+            refused(&format!("ONBUILD {trigger}")).contains("arrays must be comprised of strings only"),
+            "{trigger}"
+        );
+    }
 }
 
 #[test]
@@ -680,9 +688,40 @@ fn words_keep_quotes_and_escapes() {
 
 #[test]
 fn flags_are_the_leading_double_dash_words() {
-    assert_eq!(extract_flags("--a=1 --b='x y' rest --c"), (strings(&["--a=1", "--b=x y"]), "rest --c"));
-    assert_eq!(extract_flags("-x --a"), (Vec::new(), "-x --a"));
-    assert_eq!(extract_flags("--a=\\\"q"), (strings(&["--a=\"q"]), ""));
-    assert_eq!(extract_flags("--a --"), (strings(&["--a"]), ""));
-    assert_eq!(extract_flags(""), (Vec::new(), ""));
+    assert_eq!(extract_flags("--a=1 --b='x y' rest --c", '\\'), (strings(&["--a=1", "--b=x y"]), "rest --c"));
+    assert_eq!(extract_flags("-x --a", '\\'), (Vec::new(), "-x --a"));
+    assert_eq!(extract_flags("--a=\\\"q", '\\'), (strings(&["--a=\"q"]), ""));
+    assert_eq!(extract_flags("--a --", '\\'), (strings(&["--a"]), ""));
+    assert_eq!(extract_flags("", '\\'), (Vec::new(), ""));
+}
+
+#[test]
+fn flags_use_the_files_escape_character() {
+    let file = ok("# escape=`\nFROM a\nCOPY --from=a\\b x y\nCOPY --c`hown=1 x y\n");
+    let InstructionKind::Copy(copy) = &file.stages[0].instructions[0].kind else { panic!() };
+    assert_eq!(copy.from.as_deref(), Some("a\\b"));
+    let InstructionKind::Copy(copy) = &file.stages[0].instructions[1].kind else { panic!() };
+    assert_eq!(copy.chown.as_deref(), Some("1"));
+    assert_eq!(extract_flags("--chown=\"a` b\" x y", '`'), (strings(&["--chown=a b"]), "x y"));
+}
+
+#[test]
+fn an_escaped_final_escape_does_not_consume_the_next_instruction() {
+    let file = ok("FROM alpine\nRUN printf '%s\\n' C:\\\\\nRUN echo next\n");
+    let originals: Vec<_> = file.stages[0].instructions.iter().map(|i| i.original.as_str()).collect();
+    assert_eq!(originals, ["RUN printf '%s\\n' C:\\\\", "RUN echo next"]);
+    let file = ok("# escape=`\nFROM a\nRUN echo ``\nRUN next\n");
+    assert_eq!(file.stages[0].instructions.len(), 2);
+}
+
+#[test]
+fn spaced_heredoc_bodies_cannot_be_misinterpreted_as_instructions() {
+    for text in [
+        "FROM alpine\nRUN cat << EOF > /etc/motd\nhello\nEOF\n",
+        "FROM alpine\nRUN cat << CMD\nCMD echo from-heredoc\nCMD\n",
+    ] {
+        let error = parse(text).unwrap_err();
+        assert_eq!(error.line, 2);
+        assert!(error.message.contains("heredoc"), "{error}");
+    }
 }

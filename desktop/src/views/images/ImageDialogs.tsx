@@ -112,7 +112,10 @@ export function SaveDialog({ names, open, onOpenChange }: { names: string[]; ope
     setError(null);
     try {
       const size = await api.images.save(list, file);
-      toast.success(`Saved ${plural(list.length, "image")} (${bytes(size)}) to ${file}`);
+      // What was asked for, not a count of images: two names of one image
+      // are one image in the archive.
+      const asked = list.length === 1 ? (list[0].startsWith("sha256:") ? shortId(list[0]) : imageName(list[0])) : plural(list.length, "name");
+      toast.success(`Saved ${asked} (${bytes(size)}) to ${file}`);
       if (opening.current === mine) close();
     } catch (e) {
       if (opening.current === mine) {

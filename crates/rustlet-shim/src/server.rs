@@ -668,8 +668,8 @@ async fn exec(shim: Rc<Shim>, req: ExecRequest, mut r: OwnedReadHalf, mut w: Own
     let exited = shim.reaper.watch(pid);
     tracing::info!(id = %shim.id, exec = %req.exec_id, pid, "exec started");
     let (frames_tx, mut frames_rx) = mpsc::channel::<Frame>(64);
-    if write_frame(&mut w, &respond(Response::Started { pid })).await.is_err() {
-        // Keep draining its output anyway, below.
+    if write_frame(&mut w, &respond(Response::Started { pid })).await.is_err() && req.kill_on_disconnect {
+        shim.reaper.signal(pid, 9);
     }
     // Output: the pumps forward frames; the writer sends them on, and once
     // the connection is gone, keeps reading so the process never blocks on
@@ -771,8 +771,11 @@ async fn exec(shim: Rc<Shim>, req: ExecRequest, mut r: OwnedReadHalf, mut w: Own
         }
     }
     drop(stdin);
-    // The writer finishes with the exit (the process keeps running, and its
-    // output is drained, if the daemon hung up first).
+    if req.kill_on_disconnect {
+        shim.reaper.signal(pid, 9);
+    }
+    // The writer finishes with the exit. User execs keep running with their
+    // output drained after disconnect; internal healthchecks have been killed.
     let _ = writer.await;
 }
 

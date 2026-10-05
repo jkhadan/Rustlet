@@ -77,6 +77,9 @@ pub fn check(c: &ContainerConfig) -> ApiResult<Checked> {
     if let Some(sig) = &c.stop_signal {
         parse_signal(sig)?;
     }
+    if c.unset_env.iter().any(|name| name.is_empty() || name.contains(['=', '\0'])) {
+        return Err(ApiError::invalid("unset environment names must be nonempty and contain neither = nor NUL"));
+    }
     let caps = capabilities(&c.cap_add, &c.cap_drop)?;
     let mut seccomp = true;
     let mut no_new_privileges = None;
@@ -128,6 +131,12 @@ fn check_healthcheck(h: &rustlet_spec::container::HealthConfig) -> ApiResult<()>
             && ns < 1_000_000
         {
             return Err(ApiError::invalid(format!("the healthcheck's {what} must be at least 1ms")));
+        }
+        // Go's `time.Duration` is an int64 of nanoseconds, as Docker's API and an
+        // image config (read back as signed) have it: a longer one would make a
+        // committed image's config unreadable, and the image vanish from `images`.
+        if value.is_some_and(|ns| ns > i64::MAX as u64) {
+            return Err(ApiError::invalid(format!("the healthcheck's {what} is longer than 292 years")));
         }
     }
     Ok(())
@@ -192,10 +201,13 @@ pub fn parse_signal(s: &str) -> ApiResult<i32> {
         .map_err(|_| ApiError::invalid(format!("unknown signal {s:?}")))
 }
 
-/// The image's `StopSignal`, if it says one that exists.
-pub fn image_stop_signal(image: &Image) -> Option<String> {
-    let s = image.config.config()?.stop_signal().clone()?;
-    parse_signal(&s).ok().map(|_| s)
+/// The image's `StopSignal`, validated before a container is created.
+pub fn image_stop_signal(image: &Image) -> ApiResult<Option<String>> {
+    let signal = image.config.config().and_then(|c| c.stop_signal().clone());
+    if let Some(s) = &signal {
+        parse_signal(s).map_err(|e| e.context("the image's StopSignal"))?;
+    }
+    Ok(signal)
 }
 
 /// What a start adds to the spec besides the container's options.
@@ -218,8 +230,10 @@ pub fn build(image: &Image, rootfs: &Path, c: &ContainerConfig, plan: &RunPlan, 
     let checked = check(c)?;
     let options = RunOptions {
         args: c.cmd.clone(),
+        clear_cmd: c.clear_cmd,
         entrypoint: c.entrypoint.clone(),
         env: c.env.clone(),
+        unset_env: c.unset_env.clone(),
         user: c.user.clone(),
         workdir: c.workdir.clone(),
         tty: c.tty,
@@ -484,6 +498,8 @@ mod tests {
             assert!(check(&with(test(bad))).is_err(), "{bad:?}");
         }
         assert!(check(&with(HealthConfig { interval: Some(999_999), ..Default::default() })).is_err());
+        assert!(check(&with(HealthConfig { timeout: Some(i64::MAX as u64 + 1), ..Default::default() })).is_err());
+        assert!(check(&with(HealthConfig { timeout: Some(i64::MAX as u64), ..Default::default() })).is_ok());
         assert!(
             check(&with(HealthConfig { timeout: Some(0), interval: Some(1_000_000), ..Default::default() })).is_ok()
         );

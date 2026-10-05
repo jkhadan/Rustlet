@@ -14,8 +14,8 @@ use futures::StreamExt;
 use rustlet_compose::run::{Action, BuildPolicy, ComposeEvent, DownOptions, ResourceKind, UpOptions};
 use rustlet_compose::{
     Compose, Condition, Error, LABEL_CONFIG_FILES, LABEL_CONFIG_HASH, LABEL_DEPENDS_ON, LABEL_NETWORK, LABEL_NUMBER,
-    LABEL_PROJECT, LABEL_SERVICE, LABEL_VOLUME, LABEL_WORKING_DIR, LoadOptions, Project, down_project, load, load_str,
-    stacks,
+    LABEL_PROJECT, LABEL_SERVICE, LABEL_VOLUME, LABEL_WORKING_DIR, LoadOptions, Project, down_project, load,
+    load_selected, load_str, stacks,
 };
 use rustlet_spec::container::ContainerStatus;
 use rustlet_spec::logs::{LogEntry, LogStream, LogsQuery};
@@ -786,4 +786,342 @@ fn resource_events_name_their_kind_and_action() {
     let event =
         ComposeEvent::Resource { kind: ResourceKind::Container, name: "shop-web-1".into(), action: Action::Healthy };
     assert_eq!(resources(&[event]), ["Container shop-web-1 Healthy"]);
+}
+
+// ── what a change recreates ────────────────────────────────────────────────
+
+/// A service that joins another's network namespace: web is in db's.
+const SIDECAR: &str = "name: shop\nservices:\n  web:\n    image: nginx\n    network_mode: service:db\n  db:\n    image: postgres\n    environment: [V=1]\n";
+
+fn calls_of(fake: &Fake, prefix: &str) -> Vec<String> {
+    fake.calls().into_iter().filter(|c| c.starts_with(prefix)).collect()
+}
+
+// `network_mode: service:db` puts web in db's network namespace. When `up`
+// recreates db, Compose recreates web too: it resolves `service:db` to
+// `container:<db's id>` before it hashes web, so a new db makes a new hash
+// (docker/compose v2.29.7 pkg/compose/convergence.go `ensureService`:
+// `resolveServiceReferences` → `resolveSharedNamespaces` before
+// `mustRecreate`; main: reconcile.go `parentNamespaceRecreated`, "so the
+// cascade fires only when a stale container:<id> reference would otherwise
+// be left behind"). rustletd ties web to the namespace by db's id at create
+// (lifecycle.rs `network_container`), tears the namespace's interfaces down
+// when db goes, and refuses to start web again once the container it joined
+// is gone (network.rs `attach_network`). And without a change, neither is
+// touched: the id in the hash is the same until db is recreated.
+#[tokio::test]
+async fn a_service_joining_a_namespace_is_recreated_with_its_target() {
+    let fake = Fake::start(&["nginx", "postgres"]);
+    up(&compose(&fake, SIDECAR)).await;
+    assert_eq!(
+        fake.calls(),
+        ["network create shop_default", "create shop-db-1", "start shop-db-1", "create shop-web-1", "start shop-web-1"]
+    );
+    // web's label is the hash with db's id in it, not the file's alone.
+    let web_hash = |fake: &Fake| fake.lock().container("shop-web-1").config.labels[LABEL_CONFIG_HASH].clone();
+    let db_id = |fake: &Fake| fake.lock().container("shop-db-1").id.clone();
+    let shop = project(SIDECAR);
+    let web = shop.service("web").unwrap();
+    assert_eq!(web_hash(&fake), web.effective_hash(Some(&db_id(&fake))));
+    assert_ne!(web_hash(&fake), web.config_hash());
+    // db's own hash is the file's: only what joins a namespace has the id in it.
+    let db_hash = fake.lock().container("shop-db-1").config.labels[LABEL_CONFIG_HASH].clone();
+    assert_eq!(db_hash, shop.service("db").unwrap().config_hash());
+
+    // Nothing changed: nothing is recreated, however often `up` is run.
+    for _ in 0..2 {
+        up(&compose(&fake, SIDECAR)).await;
+        assert!(fake.calls().is_empty());
+    }
+
+    // db changed: it is recreated, and web after it, into the new container.
+    let old_db = db_id(&fake);
+    let changed = SIDECAR.replace("V=1", "V=2");
+    up(&compose(&fake, &changed)).await;
+    assert_eq!(
+        fake.calls(),
+        [
+            "stop shop-db-1",
+            "rm shop-db-1",
+            "create shop-db-1",
+            "start shop-db-1",
+            "stop shop-web-1",
+            "rm shop-web-1",
+            "create shop-web-1",
+            "start shop-web-1",
+        ]
+    );
+    assert_ne!(db_id(&fake), old_db);
+    assert_eq!(web_hash(&fake), project(&changed).service("web").unwrap().effective_hash(Some(&db_id(&fake))));
+    up(&compose(&fake, &changed)).await;
+    assert!(fake.calls().is_empty(), "and then it is stable again");
+
+    // The same when db is recreated for another reason: its image changed, or it is forced as a dependency.
+    fake.lock().images.insert("postgres".into(), "sha256:rebuilt".into());
+    up(&compose(&fake, &changed)).await;
+    assert_eq!(calls_of(&fake, "create"), ["create shop-db-1", "create shop-web-1"]);
+    let forced_dependency =
+        UpOptions { services: vec!["web".into()], always_recreate_deps: true, ..UpOptions::default() };
+    up_with(&compose(&fake, &changed), &forced_dependency).await.0.unwrap();
+    assert_eq!(calls_of(&fake, "create"), ["create shop-db-1", "create shop-web-1"]);
+    // `up db` brings web along no more than Compose's does (it is not what db depends on): web is left
+    // as it was until the next `up` that has it, which puts it in the new namespace.
+    let force_db = UpOptions { services: vec!["db".into()], force_recreate: true, ..UpOptions::default() };
+    up_with(&compose(&fake, &changed), &force_db).await.0.unwrap();
+    assert_eq!(calls_of(&fake, "create"), ["create shop-db-1"]);
+    up(&compose(&fake, &changed)).await;
+    assert_eq!(calls_of(&fake, "create"), ["create shop-web-1"]);
+
+    // `--no-recreate` leaves both, whatever happened to db.
+    let keep = UpOptions { no_recreate: true, ..UpOptions::default() };
+    up_with(&compose(&fake, SIDECAR), &keep).await.0.unwrap();
+    assert!(fake.calls().is_empty());
+}
+
+// Compose refuses to share a namespace with a service that has no container
+// ("cannot share network namespace with service %s: container missing"); so
+// does `up`, before it creates the service that would join it.
+#[tokio::test]
+async fn a_service_cannot_join_the_namespace_of_a_service_with_no_container() {
+    let fake = Fake::start(&["nginx", "postgres"]);
+    let yaml = SIDECAR.replace("    environment: [V=1]\n", "    scale: 0\n");
+    let (result, _) = up_with(&compose(&fake, &yaml), &UpOptions::default()).await;
+    match result {
+        Err(Error::Dependency(m)) => {
+            assert_eq!(m, "cannot share the network namespace of service \"db\" with \"web\": it has no container")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!fake.lock().has_container("shop-web-1"));
+}
+
+// `--force-recreate` is for the services named on the command line (all of
+// them when none is); what they depend on gets the dependencies' strategy,
+// "diverged": recreated only if it changed, unless `--always-recreate-deps`
+// (docker/compose cmd/compose/create.go `recreateStrategy` and
+// `dependenciesRecreateStrategy`; pkg/compose/convergence.go `apply`, v2.29.7:
+// `strategy := options.RecreateDependencies; if contains(options.Services,
+// name) { strategy = options.Recreate }`; main: reconcile.go
+// `reconcileService`). Recreating a database that wasn't asked for orphans its
+// anonymous volumes; and with no service named, all are named
+// (`options.Services = project.ServiceNames()`), so `--always-recreate-deps`
+// adds nothing then.
+#[tokio::test]
+async fn force_recreate_is_for_the_services_named_and_their_dependencies_have_a_flag_of_their_own() {
+    let fake = Fake::start(&["nginx", "postgres"]);
+    let shop = compose(&fake, SHOP);
+    up(&shop).await;
+    fake.calls();
+    let up_removing = |options: UpOptions| {
+        let shop = shop.clone();
+        let fake = &fake;
+        async move {
+            up_with(&shop, &options).await.0.unwrap();
+            calls_of(fake, "rm ")
+        }
+    };
+    let named = vec!["web".to_owned()];
+
+    // web is named: forced; its unchanged dependency db stays.
+    let forced = UpOptions { services: named.clone(), force_recreate: true, ..UpOptions::default() };
+    assert_eq!(up_removing(forced).await, ["rm shop-web-1"]);
+    // None named: all are.
+    let forced = UpOptions { force_recreate: true, ..UpOptions::default() };
+    assert_eq!(up_removing(forced).await, ["rm shop-db-1", "rm shop-web-1"]);
+    // The dependencies' flag: what web brings along, not web.
+    let deps = UpOptions { services: named.clone(), always_recreate_deps: true, ..UpOptions::default() };
+    assert_eq!(up_removing(deps).await, ["rm shop-db-1"]);
+    // Both: everything.
+    let both =
+        UpOptions { services: named.clone(), force_recreate: true, always_recreate_deps: true, ..UpOptions::default() };
+    assert_eq!(up_removing(both).await, ["rm shop-db-1", "rm shop-web-1"]);
+    // With nothing named, every service is named, and there is nothing else to bring along.
+    let deps = UpOptions { always_recreate_deps: true, ..UpOptions::default() };
+    assert!(up_removing(deps).await.is_empty());
+    // Named: db, which web doesn't bring along, as it depends on db and not the other way round.
+    let forced = UpOptions { services: vec!["db".into()], force_recreate: true, ..UpOptions::default() };
+    assert_eq!(up_removing(forced).await, ["rm shop-db-1"]);
+
+    // Neither goes with `--no-recreate`.
+    let both = UpOptions { no_recreate: true, always_recreate_deps: true, ..UpOptions::default() };
+    assert!(up_with(&shop, &both).await.0.unwrap_err().to_string().contains("can't go together"));
+}
+
+// Known limitation: a container is recreated by removing the old one and
+// then creating the new, where Compose creates the new one first, under a
+// temporary name, and renames it (docker/compose v2.29.7
+// pkg/compose/convergence.go `recreateContainer`). rustletd has no rename,
+// and checks a container's options only at create (lifecycle.rs
+// `spec::check`: an unknown capability, a bad signal or device…): so a
+// replacement it refuses leaves the service without a container, which the
+// next `up` creates once the file is right. (The fake refuses a create whose
+// image isn't there, which stands for any refusal.) See `Compose::recreate`.
+#[tokio::test]
+async fn a_recreate_the_daemon_refuses_leaves_the_service_without_a_container() {
+    let yaml = "name: shop\nservices:\n  web:\n    image: nginx\n";
+    let fake = Fake::start(&["nginx"]);
+    up(&compose(&fake, yaml)).await;
+    fake.calls();
+
+    let mut refused = project("name: shop\nservices:\n  web:\n    image: nginx\n    environment: [V=2]\n");
+    refused.services[0].config.image = "refused".into();
+    let (result, _) = up_with(&Compose::new(fake.client.clone(), refused), &UpOptions::default()).await;
+    assert!(result.is_err(), "the daemon refuses the new container");
+    assert_eq!(fake.calls(), ["stop shop-web-1", "rm shop-web-1"]);
+    assert!(!fake.lock().has_container("shop-web-1"));
+
+    up(&compose(&fake, "name: shop\nservices:\n  web:\n    image: nginx\n    environment: [V=3]\n")).await;
+    assert_eq!(fake.calls(), ["create shop-web-1", "start shop-web-1"]);
+}
+
+// ── services named on the command line, and profiles ───────────────────────
+
+// A service named on the command line is enabled together with its profiles:
+// `docker compose up debug`, `logs debug`, `stop debug`, `ps debug` work with
+// `debug` in a profile nobody asked for (docker/compose cmd/compose/compose.go
+// v2.29.7 `project.WithServicesEnabled(services...)`; main:
+// pkg/compose/loader.go; the Compose docs, "Auto-enabling profiles and
+// dependency resolution"). `load_selected` is how a command says which.
+#[tokio::test]
+async fn a_service_in_an_inactive_profile_is_up_when_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = "name: shop\nservices:\n  web:\n    image: nginx\n  debug:\n    image: nginx\n    profiles: [debug]\n    depends_on: [web]\n";
+    std::fs::write(dir.path().join("compose.yaml"), yaml).unwrap();
+    let options = LoadOptions { files: vec![dir.path().join("compose.yaml")], ..LoadOptions::default() };
+    let fake = Fake::start(&["nginx"]);
+    let named = vec!["debug".to_owned()];
+    let debug = Compose::new(fake.client.clone(), load_selected(&options, &named).unwrap());
+
+    let up_debug = UpOptions { services: named.clone(), ..UpOptions::default() };
+    up_with(&debug, &up_debug).await.0.unwrap();
+    assert_eq!(
+        fake.calls(),
+        [
+            "network create shop_default",
+            "create shop-web-1",
+            "start shop-web-1",
+            "create shop-debug-1",
+            "start shop-debug-1"
+        ],
+        "debug, and web, which it depends on"
+    );
+    // `ps`, `stop`, `start` and `logs` find it by name too.
+    let names = |c: Vec<rustlet_compose::ServiceContainer>| c.into_iter().map(|c| c.summary.name).collect::<Vec<_>>();
+    assert_eq!(names(within(debug.ps(false)).await.unwrap()), ["shop-web-1", "shop-debug-1"]);
+    within(debug.stop(&named, None, &|_: ComposeEvent| {})).await.unwrap();
+    assert_eq!(fake.calls(), ["stop shop-debug-1"]);
+    within(debug.start(&named, &|_: ComposeEvent| {})).await.unwrap();
+    assert_eq!(fake.calls(), ["start shop-debug-1"]);
+    assert!(within(debug.logs(&named, &LogsQuery::default())).await.is_ok());
+
+    // Without the name, the project doesn't have it, and what is left of it is no orphan.
+    let plain = Compose::new(fake.client.clone(), load(&options).unwrap());
+    let (result, events) = up_with(&plain, &UpOptions { remove_orphans: true, ..UpOptions::default() }).await;
+    result.unwrap();
+    assert!(fake.calls().is_empty() && warnings(&events).is_empty(), "debug is a service the file has");
+    let e = within(plain.logs(&named, &LogsQuery::default())).await.err().unwrap();
+    assert_eq!(e.to_string(), "no such service: debug");
+}
+
+// ── down: what the file says is external ───────────────────────────────────
+
+// `down -v` removes "the named volumes the file declares (not external
+// ones)" (`DownOptions::volumes`; docker/compose pkg/compose/down.go
+// `ensureVolumesDown` goes over the project's volumes and skips the
+// external). A volume an earlier `up` made, which the file now declares
+// external so as to keep it, survives, label or not.
+#[tokio::test]
+async fn down_v_keeps_a_volume_the_file_declares_external() {
+    let fake = Fake::start(&["nginx", "postgres"]);
+    up(&compose(&fake, SHOP)).await;
+    assert!(fake.lock().volume("shop_data").is_some());
+
+    let keep = SHOP.replace("volumes:\n  data:\n", "volumes:\n  data:\n    external: true\n    name: shop_data\n");
+    assert!(project(&keep).volumes["data"].external);
+    down_with(&compose(&fake, &keep), &DownOptions { volumes: true, ..DownOptions::default() }).await;
+    assert!(fake.lock().volume("shop_data").is_some(), "an external volume is never the project's to remove");
+    // Without the file, a volume with the project's label is the project's.
+    up(&compose(&fake, SHOP)).await;
+    within(down_project(&fake.client, "shop", &DownOptions { volumes: true, ..DownOptions::default() }, &|_| {}))
+        .await
+        .unwrap();
+    assert!(fake.lock().volume("shop_data").is_none());
+}
+
+// `down` removes the project's networks, "not external ones" (`Compose::down`;
+// docker/compose down.go `ensureNetworksDown` skips the external): a network
+// an earlier `up` made, which the file now declares external, stays, and the
+// next `up` finds it.
+#[tokio::test]
+async fn down_keeps_a_network_the_file_declares_external() {
+    let fake = Fake::start(&["nginx", "postgres"]);
+    up(&compose(&fake, SHOP)).await;
+
+    let external = format!("{SHOP}networks:\n  default:\n    external: true\n    name: shop_default\n");
+    let shop = compose(&fake, &external);
+    down_with(&shop, &DownOptions::default()).await;
+    assert!(fake.lock().networks.iter().any(|n| n.name == "shop_default"), "an external network stays");
+    let (result, _) = up_with(&shop, &UpOptions::default()).await;
+    assert!(result.is_ok(), "up after down: {result:?}");
+}
+
+#[tokio::test]
+async fn down_v_preserves_external_resources_after_their_attachments_are_removed() {
+    let fake = Fake::start(&["nginx"]);
+    let yaml = "name: shop\nservices:\n  app:\n    image: nginx\n    volumes: [data:/data]\n    networks: [legacy]\nvolumes:\n  data:\nnetworks:\n  legacy:\n";
+    up(&compose(&fake, yaml)).await;
+    fake.calls();
+    let changed = "name: shop\nservices:\n  app:\n    image: nginx\nvolumes:\n  data:\n    external: true\n    name: shop_data\nnetworks:\n  legacy:\n    external: true\n    name: shop_legacy\n";
+    down_with(&compose(&fake, changed), &DownOptions { volumes: true, ..DownOptions::default() }).await;
+    let d = fake.lock();
+    assert!(d.volume("shop_data").is_some());
+    assert!(d.networks.iter().any(|n| n.name == "shop_legacy"));
+    assert_eq!(d.calls, ["stop shop-app-1", "rm shop-app-1 -v"]);
+}
+
+#[tokio::test]
+async fn up_does_not_create_or_require_unused_declared_resources() {
+    let fake = Fake::start(&["nginx"]);
+    let yaml = "name: shop\nservices:\n  app:\n    image: nginx\nvolumes:\n  unused:\n    external: true\n  internal:\nnetworks:\n  unused:\n    external: true\n  internal:\n";
+    up(&compose(&fake, yaml)).await;
+    assert_eq!(fake.calls(), ["network create shop_default", "create shop-app-1", "start shop-app-1"]);
+}
+
+#[tokio::test]
+async fn a_service_using_a_shared_image_does_not_suppress_its_build() {
+    let fake = Fake::start(&["custom"]);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Containerfile"), "FROM scratch\n").unwrap();
+    let yaml = "name: shop\nservices:\n  app:\n    image: custom\n  worker:\n    image: custom\n    build: .\n  other:\n    image: custom\n";
+    let project = load_str(yaml, dir.path(), &LoadOptions::default()).unwrap();
+    let compose = Compose::new(fake.client.clone(), project);
+    let options = UpOptions { build: BuildPolicy::Always, ..UpOptions::default() };
+    let (result, events) = up_with(&compose, &options).await;
+    result.unwrap();
+    assert_eq!(
+        fake.calls().iter().filter(|c| c.starts_with("build ")).collect::<Vec<_>>(),
+        [&"build custom".to_owned()]
+    );
+    assert!(events.iter().any(|e| matches!(e, ComposeEvent::Build { service, event: rustlet_spec::build::BuildEvent::Done { .. } } if service == "worker")));
+}
+
+#[tokio::test]
+async fn a_build_stream_without_done_cannot_start_a_stale_image() {
+    let fake = Fake::start(&["custom"]);
+    fake.lock().build_events =
+        Some(vec![rustlet_spec::build::BuildEvent::Step { step: 1, total: 1, instruction: "FROM scratch".into() }]);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Containerfile"), "FROM scratch\n").unwrap();
+    let project = load_str(
+        "name: shop\nservices:\n  worker:\n    image: custom\n    build: .\n",
+        dir.path(),
+        &LoadOptions::default(),
+    )
+    .unwrap();
+    let compose = Compose::new(fake.client.clone(), project);
+    let options = UpOptions { build: BuildPolicy::Always, ..UpOptions::default() };
+    let (result, events) = up_with(&compose, &options).await;
+    assert!(result.unwrap_err().to_string().contains("ended without storing an image"));
+    assert!(!fake.lock().has_container("shop-worker-1"));
+    assert!(!events.iter().any(|e| matches!(e, ComposeEvent::Resource { action: Action::Built, .. })));
 }

@@ -27,6 +27,15 @@
 //!    (started if it isn't running); one that differs is recreated (stopped,
 //!    removed, created again under its name); a missing one is created and
 //!    started; those numbered above the replicas are removed, highest first.
+//!    A service that joins another's network namespace (`network_mode:
+//!    service:x`) has the id of the container it joins in its hash, so it is
+//!    recreated whenever that container is: without a network left, it
+//!    couldn't be started again either.
+//!
+//! `--force-recreate` is for the services named (all, when none is): what
+//! they depend on is recreated only if it changed, unless
+//! `--always-recreate-deps` says otherwise (Compose's `Recreate` and
+//! `RecreateDependencies`).
 //!
 //! A container is created on its first network, with its aliases and
 //! addresses there; each further network is connected before the start,
@@ -36,7 +45,12 @@
 //! independent services in parallel); a recreated container gets new
 //! anonymous volumes (Compose hands it the old one's); a service with
 //! `build:` is pulled only when its image is missing and building isn't
-//! allowed (`--no-build`), never to look for a newer one first.
+//! allowed (`--no-build`), never to look for a newer one first; a container
+//! is recreated by removing the old one and then creating the new, where
+//! Compose creates the new one under a temporary name first and renames it
+//! (rustletd has no rename), so a replacement the daemon refuses leaves the
+//! service without a container until the cause is fixed and `up` is run
+//! again.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -137,8 +151,16 @@ pub struct UpOptions {
     /// Only these services (and what they depend on); empty: all.
     pub services: Vec<String>,
     pub build: BuildPolicy,
-    /// Recreate containers even if their config hash matches.
+    /// Recreate containers even if their config hash matches: those of the
+    /// services named in `services` (of all services, when none is). What
+    /// `services` brings along is recreated only if it changed, or with
+    /// `always_recreate_deps`.
     pub force_recreate: bool,
+    /// Recreate the services `services` brings along (their dependencies,
+    /// not those named) even if they didn't change: Compose's
+    /// `--always-recreate-deps`. Without `services`, all are named, and this
+    /// does nothing.
+    pub always_recreate_deps: bool,
     /// Never recreate: a container that exists is started as it is.
     pub no_recreate: bool,
     /// Remove containers of services no longer in the file.
@@ -228,6 +250,9 @@ impl Compose {
         if options.force_recreate && options.no_recreate {
             return Err(Error::Invalid("--force-recreate and --no-recreate can't go together".into()));
         }
+        if options.always_recreate_deps && options.no_recreate {
+            return Err(Error::Invalid("--always-recreate-deps and --no-recreate can't go together".into()));
+        }
         let order = self.project.startup_order(&options.services)?;
         self.ensure_networks(&order, events).await?;
         self.ensure_volumes(&order, events).await?;
@@ -250,7 +275,13 @@ impl Compose {
 
     /// Stops and removes the project's containers (dependents first), then
     /// its networks (not external ones), and as `options` say its volumes
-    /// and images.
+    /// (not external ones) and images.
+    ///
+    /// What the file declares `external` is never removed, as Compose has it
+    /// (`ensureNetworksDown` and `ensureVolumesDown` skip them), even if it
+    /// carries the project's label because an earlier `up` made it before
+    /// the file said `external`, including declarations no enabled service
+    /// currently uses.
     pub async fn down(&self, options: &DownOptions, events: Events<'_>) -> Result<()> {
         let containers = self.containers(true).await?;
         let orphans = self.orphans(&containers);
@@ -266,9 +297,13 @@ impl Compose {
                 stop_and_remove(&self.client, &c.summary, options.timeout, options.volumes, events).await?;
             }
         }
-        remove_networks(&self.client, &self.project.name, events).await?;
+        let external_networks: BTreeSet<&str> =
+            self.project.networks.values().filter(|n| n.external).map(|n| n.name.as_str()).collect();
+        remove_networks(&self.client, &self.project.name, &external_networks, events).await?;
         if options.volumes {
-            remove_volumes(&self.client, &self.project.name, events).await?;
+            let external_volumes: BTreeSet<&str> =
+                self.project.volumes.values().filter(|v| v.external).map(|v| v.name.as_str()).collect();
+            remove_volumes(&self.client, &self.project.name, &external_volumes, events).await?;
         }
         if let Some(which) = options.images {
             let images = self
@@ -519,6 +554,22 @@ impl Compose {
             if !seen.insert(service.image.as_str()) {
                 continue;
             }
+            // A service that merely uses this image must not suppress a
+            // later service's build. Prefer an always-build declaration if
+            // several services name the same image.
+            let mut builders =
+                services.iter().copied().filter(|s| s.replicas > 0 && s.image == service.image && s.build.is_some());
+            let builder = builders
+                .clone()
+                .find(|s| s.build.as_ref().is_some_and(|build| build.always))
+                .or_else(|| builders.next());
+            let service = builder.unwrap_or_else(|| {
+                services
+                    .iter()
+                    .copied()
+                    .find(|s| s.replicas > 0 && s.image == service.image && s.pull_policy == PullPolicy::Always)
+                    .unwrap_or(service)
+            });
             let present = image_exists(&self.client, &service.image).await?;
             if let Some(build) = &service.build {
                 let must_build = match policy {
@@ -608,8 +659,16 @@ impl Compose {
         });
         let sent = async {
             let mut progress = self.client.build(&options, body).await?;
+            let mut done = false;
             while let Some(event) = progress.next().await {
-                events(ComposeEvent::Build { service: service.name.clone(), event: event? });
+                let event = event?;
+                done |= matches!(event, BuildEvent::Done { .. });
+                events(ComposeEvent::Build { service: service.name.clone(), event });
+            }
+            if !done {
+                return Err(Error::Client(rustlet_client::Error::Stream(
+                    "the build ended without storing an image (did rustletd stop?)".into(),
+                )));
             }
             Ok::<_, Error>(())
         }
@@ -788,17 +847,20 @@ impl Compose {
     /// and started, the ones it no longer has removed.
     async fn converge(&self, service: &Service, options: &UpOptions, events: Events<'_>) -> Result<()> {
         let existing = self.containers_of(service, true).await?;
-        let hash = service.config_hash();
+        let hash = self.effective_hash(service).await?;
         let image_id = match service.replicas {
             0 => String::new(),
             _ => self.client.inspect_image(&service.image).await?.summary.id,
         };
+        // The services named get `--force-recreate`; what they brought along, `--always-recreate-deps`.
+        let named = options.services.is_empty() || options.services.contains(&service.name);
+        let force = if named { options.force_recreate } else { options.always_recreate_deps };
         let mut kept = BTreeSet::new();
         for n in 1..=service.replicas {
             let Some(c) = existing.iter().find(|c| c.number == n) else {
                 let name = service.container_name(&self.project.name, n);
                 resource(events, ResourceKind::Container, &name, Action::Creating);
-                let id = self.create(service, n, events).await?;
+                let id = self.create(service, n, &hash, events).await?;
                 resource(events, ResourceKind::Container, &name, Action::Created);
                 start(&self.client, &id, &name, events).await?;
                 continue;
@@ -806,10 +868,10 @@ impl Compose {
             kept.insert(c.summary.id.as_str());
             let current = c.summary.labels.get(LABEL_CONFIG_HASH) == Some(&hash) && c.summary.image_id == image_id;
             let usable = !matches!(c.summary.state.status, ContainerStatus::Dead | ContainerStatus::Removing);
-            if usable && (options.no_recreate || (current && !options.force_recreate)) {
+            if usable && (options.no_recreate || (current && !force)) {
                 ensure_started(&self.client, &c.summary, events).await?;
             } else {
-                self.recreate(service, n, &c.summary, options.timeout, events).await?;
+                self.recreate(service, n, &c.summary, options.timeout, &hash, events).await?;
             }
         }
         // Scaled down (or a number given twice): the highest go first.
@@ -819,14 +881,42 @@ impl Compose {
         Ok(())
     }
 
+    /// The hash `service`'s containers are labelled with and compared by
+    /// ([`Service::effective_hash`]): for one that joins another service's
+    /// network namespace, with the id of the first container of that service
+    /// (the one `network_mode: service:x` names), which `up` has just brought
+    /// to what the file says, as it came first.
+    async fn effective_hash(&self, service: &Service) -> Result<String> {
+        let Some(owner) = &service.shares_network_with else { return Ok(service.effective_hash(None)) };
+        let first = match self.project.service(owner) {
+            Some(owner) => self.containers_of(owner, true).await?.into_iter().find(|c| c.number == 1),
+            None => None,
+        };
+        match first {
+            Some(c) => Ok(service.effective_hash(Some(&c.summary.id))),
+            None => Err(Error::Dependency(format!(
+                "cannot share the network namespace of service {owner:?} with {:?}: it has no container",
+                service.name
+            ))),
+        }
+    }
+
     /// Container `n` of `service` again: the old one stopped and removed
     /// (its anonymous volumes kept), a new one created and started.
+    ///
+    /// Known limitation: the old container goes before the new one is
+    /// created, so a replacement the daemon refuses at create (an unknown
+    /// capability, say) leaves the service without a container. Compose
+    /// creates the new one first, under a temporary name, and renames it;
+    /// rustletd has no rename, nor a way to ask whether a config would be
+    /// accepted. What this side can know beforehand, it checks at load.
     async fn recreate(
         &self,
         service: &Service,
         n: u32,
         old: &ContainerSummary,
         timeout: Option<u32>,
+        hash: &str,
         events: Events<'_>,
     ) -> Result<()> {
         resource(events, ResourceKind::Container, &old.name, Action::Recreating);
@@ -835,17 +925,17 @@ impl Compose {
         }
         ignore_gone(self.client.remove_container_with(&old.id, &RemoveQuery { force: true, volumes: false }).await)?;
         let name = service.container_name(&self.project.name, n);
-        let id = self.create(service, n, events).await?;
+        let id = self.create(service, n, hash, events).await?;
         resource(events, ResourceKind::Container, &name, Action::Recreated);
         start(&self.client, &id, &name, events).await
     }
 
     /// Creates container `n` of `service`, on all its networks, without
-    /// starting it; returns its id.
-    async fn create(&self, service: &Service, n: u32, events: Events<'_>) -> Result<String> {
+    /// starting it; returns its id. `hash` is what it is labelled with.
+    async fn create(&self, service: &Service, n: u32, hash: &str, events: Events<'_>) -> Result<String> {
         let mut config = service.config.clone();
         config.name = Some(service.container_name(&self.project.name, n));
-        config.labels = self.labels(service, n);
+        config.labels = self.labels(service, n, hash);
         // The first network comes with the create; the others, each with
         // its aliases and addresses, by `network connect` before the start.
         config.extra_networks.clear();
@@ -866,8 +956,8 @@ impl Compose {
     }
 
     /// The labels of container `n` of `service`: the service's own, and
-    /// the project's over them.
-    fn labels(&self, service: &Service, n: u32) -> BTreeMap<String, String> {
+    /// the project's over them (`hash`: its config hash).
+    fn labels(&self, service: &Service, n: u32, hash: &str) -> BTreeMap<String, String> {
         let files: Vec<String> = self.project.files.iter().map(|f| f.display().to_string()).collect();
         let depends_on: Vec<String> = service
             .depends_on
@@ -879,7 +969,7 @@ impl Compose {
             (LABEL_PROJECT, self.project.name.clone()),
             (LABEL_SERVICE, service.name.clone()),
             (LABEL_NUMBER, n.to_string()),
-            (LABEL_CONFIG_HASH, service.config_hash()),
+            (LABEL_CONFIG_HASH, hash.to_owned()),
             (LABEL_WORKING_DIR, self.project.dir.display().to_string()),
             (LABEL_CONFIG_FILES, files.join(",")),
             (LABEL_DEPENDS_ON, depends_on.join(",")),
@@ -932,9 +1022,10 @@ pub async fn down_project(client: &Client, project: &str, options: &DownOptions,
     for c in shutdown_order(&containers) {
         stop_and_remove(client, &c.summary, options.timeout, options.volumes, events).await?;
     }
-    remove_networks(client, project, events).await?;
+    // Without the file, nothing says what is external: the labels do (external resources never get them).
+    remove_networks(client, project, &BTreeSet::new(), events).await?;
     if options.volumes {
-        remove_volumes(client, project, events).await?;
+        remove_volumes(client, project, &BTreeSet::new(), events).await?;
     }
     if let Some(which) = options.images {
         let images = containers
@@ -1076,11 +1167,12 @@ fn ignore_gone(result: rustlet_client::Result<()>) -> Result<()> {
     }
 }
 
-/// The networks labelled as `project`'s (external ones never are). One
-/// still in use (another project's container on it) stays, with a warning.
-async fn remove_networks(client: &Client, project: &str, events: Events<'_>) -> Result<()> {
+/// The networks labelled as `project`'s, but those in `external`, which the
+/// file declares so and which stay whatever their labels. One still in use
+/// (another project's container on it) stays, with a warning.
+async fn remove_networks(client: &Client, project: &str, external: &BTreeSet<&str>, events: Events<'_>) -> Result<()> {
     for network in client.list_networks().await? {
-        if network.labels.get(LABEL_PROJECT).is_none_or(|p| p != project) {
+        if network.labels.get(LABEL_PROJECT).is_none_or(|p| p != project) || external.contains(network.name.as_str()) {
             continue;
         }
         resource(events, ResourceKind::Network, &network.name, Action::Removing);
@@ -1097,10 +1189,11 @@ async fn remove_networks(client: &Client, project: &str, events: Events<'_>) -> 
     Ok(())
 }
 
-/// The volumes labelled as `project`'s (external ones never are).
-async fn remove_volumes(client: &Client, project: &str, events: Events<'_>) -> Result<()> {
+/// The volumes labelled as `project`'s, but those in `external`, which the
+/// file declares so and which stay whatever their labels.
+async fn remove_volumes(client: &Client, project: &str, external: &BTreeSet<&str>, events: Events<'_>) -> Result<()> {
     for volume in client.list_volumes().await? {
-        if volume.labels.get(LABEL_PROJECT).is_none_or(|p| p != project) {
+        if volume.labels.get(LABEL_PROJECT).is_none_or(|p| p != project) || external.contains(volume.name.as_str()) {
             continue;
         }
         resource(events, ResourceKind::Volume, &volume.name, Action::Removing);

@@ -224,8 +224,10 @@ impl CreateFlags {
             image,
             name: self.name.clone(),
             cmd,
+            clear_cmd: false,
             entrypoint: self.entrypoint.as_ref().map(|e| if e.is_empty() { Vec::new() } else { vec![e.clone()] }),
             env: resolve_env(&self.env, lookup)?,
+            unset_env: Vec::new(),
             user: self.user.clone(),
             workdir: self.workdir.clone(),
             hostname: self.hostname.clone(),
@@ -266,19 +268,21 @@ impl CreateFlags {
         })
     }
 
-    /// `--health-*` and `--no-healthcheck`, as Docker's CLI reads them:
-    /// none of them leaves the image's `HEALTHCHECK` as it is (`None`);
-    /// `--no-healthcheck` turns it off (`["NONE"]`), and can't go with
-    /// options for it; options without `--health-cmd` keep the image's
-    /// command and replace its options (an empty `test`).
+    /// `--health-*` and `--no-healthcheck`, as Docker's CLI reads them: a
+    /// `--health-*` flag counts as given only when it isn't zero or empty
+    /// (Docker's `haveHealthSettings`; `0` means the image's value anyway),
+    /// and none of them given leaves the image's `HEALTHCHECK` as it is
+    /// (`None`); `--no-healthcheck` turns it off (`["NONE"]`), and can't go
+    /// with one that is given; options without `--health-cmd` keep the
+    /// image's command and replace its options (an empty `test`).
     fn healthcheck(&self) -> anyhow::Result<Option<HealthConfig>> {
         let given = [
-            ("--health-cmd", self.health_cmd.is_some()),
-            ("--health-interval", self.health_interval.is_some()),
-            ("--health-timeout", self.health_timeout.is_some()),
-            ("--health-start-period", self.health_start_period.is_some()),
-            ("--health-start-interval", self.health_start_interval.is_some()),
-            ("--health-retries", self.health_retries.is_some()),
+            ("--health-cmd", self.health_cmd.as_deref().is_some_and(|command| !command.is_empty())),
+            ("--health-interval", self.health_interval.is_some_and(|nanos| nanos != 0)),
+            ("--health-timeout", self.health_timeout.is_some_and(|nanos| nanos != 0)),
+            ("--health-start-period", self.health_start_period.is_some_and(|nanos| nanos != 0)),
+            ("--health-start-interval", self.health_start_interval.is_some_and(|nanos| nanos != 0)),
+            ("--health-retries", self.health_retries.is_some_and(|retries| retries != 0)),
         ];
         let first = given.iter().find(|(_, given)| *given).map(|(flag, _)| *flag);
         if self.no_healthcheck {
@@ -499,11 +503,19 @@ pub fn resolve_env(values: &[String], lookup: &dyn Fn(&str) -> Option<String>) -
     Ok(env)
 }
 
+/// The longest duration Go's `time.Duration` (an int64 of nanoseconds)
+/// holds, as it writes it.
+const LONGEST_DURATION: &str = "2562047h47m16.854775807s";
+
 /// A Go duration (`30s`, `1m30s`, `500ms`) as `--health-*` take one, in
-/// the nanoseconds the API carries.
+/// the nanoseconds the API carries: as with Go's parser, at most an int64
+/// of them, which is also all an image's config can hold.
 fn parse_nanos(s: &str) -> Result<u64, String> {
     let duration = rustlet_build::config::parse_duration(s)?;
-    u64::try_from(duration.as_nanos()).map_err(|_| format!("duration {s:?} is too long"))
+    u64::try_from(duration.as_nanos())
+        .ok()
+        .filter(|&nanos| i64::try_from(nanos).is_ok())
+        .ok_or_else(|| format!("duration {s:?} is too long (at most {LONGEST_DURATION})"))
 }
 
 /// `-l KEY=VALUE` (or a bare `KEY`, with an empty value); `--label` of
@@ -660,8 +672,10 @@ mod tests {
             image: "alpine".into(),
             name: Some("web".into()),
             cmd: vec!["sh".into(), "-c".into(), "echo hi".into()],
+            clear_cmd: false,
             entrypoint: Some(vec!["/bin/sh".into()]),
             env: vec!["A=1".into(), "HOME=/home/me".into(), "EMPTY=".into()],
+            unset_env: Vec::new(),
             user: Some("1000:1000".into()),
             workdir: Some("/srv".into()),
             hostname: Some("box".into()),
@@ -897,12 +911,19 @@ mod tests {
             health(&["--health-interval", "5s", "--health-retries", "1"]),
             Some(HealthConfig { interval: Some(5_000_000_000), retries: Some(1), ..HealthConfig::default() })
         );
+        // A zero or an empty value is not given, as Docker's CLI reads it
+        // (its `haveHealthSettings`): the image's HEALTHCHECK stands. Next to
+        // one that is given it stays as it was typed, which the daemon takes
+        // for the image's value.
+        for none in
+            [&["--health-timeout", "0"][..], &["--health-cmd", ""], &["--health-retries=0", "--health-interval=0s"]]
+        {
+            assert_eq!(health(none), None, "{none:?}");
+        }
         assert_eq!(
-            health(&["--health-timeout", "0"]),
-            Some(HealthConfig { timeout: Some(0), ..HealthConfig::default() })
+            health(&["--health-timeout", "0", "--health-retries", "2"]),
+            Some(HealthConfig { timeout: Some(0), retries: Some(2), ..HealthConfig::default() })
         );
-        // An empty command is none, as Docker's CLI reads it.
-        assert_eq!(health(&["--health-cmd", ""]), Some(HealthConfig::default()));
         // Off, the image's too.
         let off = health(&["--no-healthcheck"]).unwrap();
         assert_eq!(off.test, ["NONE"]);
@@ -924,6 +945,56 @@ mod tests {
                 e,
                 format!("conflicting options: --no-healthcheck and {} (no healthcheck runs to take options)", args[0])
             );
+        }
+    }
+
+    /// Expected (Docker's CLI, cli/command/container/opts.go:
+    /// `haveHealthSettings := healthCmd != "" || healthInterval != 0 || ... ||
+    /// healthRetries != 0`, and only then "--no-healthcheck conflicts with
+    /// --health-* options"): a `--health-*` flag that is zero or empty is not
+    /// one of them, so `--no-healthcheck --health-retries 0` is a plain
+    /// `--no-healthcheck`; one that is given still conflicts, whatever the
+    /// zero ones before it.
+    #[test]
+    fn no_healthcheck_with_zero_or_empty_health_options_is_no_conflict() {
+        let off = HealthConfig { test: vec!["NONE".into()], ..HealthConfig::default() };
+        for zero in [
+            &["--health-cmd", ""][..],
+            &["--health-interval", "0s"],
+            &["--health-timeout", "0"],
+            &["--health-start-period", "0"],
+            &["--health-start-interval", "0ms"],
+            &["--health-retries", "0"],
+            &["--health-cmd=", "--health-interval=0", "--health-retries=0"],
+        ] {
+            let healthcheck = config(&[&["--no-healthcheck"][..], zero].concat()).unwrap().healthcheck;
+            assert_eq!(healthcheck, Some(off.clone()), "{zero:?}");
+        }
+        let e = config(&["--no-healthcheck", "--health-retries", "0", "--health-timeout", "1s"]).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "conflicting options: --no-healthcheck and --health-timeout (no healthcheck runs to take options)"
+        );
+    }
+
+    /// Expected (Go's `time.ParseDuration`, which Docker's `--health-*` flags
+    /// use, rejects a duration that overflows int64 nanoseconds, about 292
+    /// years, as "invalid duration"; `HEALTHCHECK --interval` is refused above
+    /// i64::MAX in rustlet-build/src/op.rs because image configs hold int64
+    /// nanoseconds): `--health-interval 3000000h` is refused before any
+    /// request, and the longest duration Go has is the longest here.
+    #[test]
+    fn health_durations_stop_at_gos_int64_limit() {
+        assert_eq!(parse_nanos(LONGEST_DURATION).unwrap(), i64::MAX as u64);
+        for too_long in ["2562047h47m16.854775808s", "3000000h", "9223372036854775808ns"] {
+            let e = parse_nanos(too_long).unwrap_err();
+            assert_eq!(e, format!("duration {too_long:?} is too long (at most 2562047h47m16.854775807s)"));
+        }
+        let parses = |args: &[&str]| Probe::try_parse_from(std::iter::once("probe").chain(args.iter().copied()));
+        for flag in ["--health-interval", "--health-timeout", "--health-start-period", "--health-start-interval"] {
+            let e = parses(&[flag, "3000000h"]).err().unwrap_or_else(|| panic!("{flag} took 3000000h"));
+            assert_eq!(e.kind(), clap::error::ErrorKind::ValueValidation, "{flag}");
+            assert!(e.to_string().contains("is too long"), "{e}");
         }
     }
 

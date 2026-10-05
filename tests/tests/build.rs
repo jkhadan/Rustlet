@@ -162,7 +162,7 @@ fn bd_a_build_and_its_image() {
         assert_eq!(run(&c, "app", &["stat", "-c", "%a %u:%g", "/app/hello.txt"]).await.0, "600 0:0\n");
         let i = c.inspect_image("app").await.unwrap();
         assert_eq!(i.summary.id, b.id());
-        assert_eq!(i.summary.layers, 3, "alpine, COPY, RUN");
+        assert_eq!(i.summary.layers, 4, "alpine, WORKDIR, COPY, RUN");
         let config = &i.config["config"];
         assert_eq!(config["WorkingDir"], "/app");
         assert!(config["Env"].as_array().unwrap().iter().any(|e| e == "WHO=world"));
@@ -197,7 +197,7 @@ fn bd_the_cache_runs_nothing_twice() {
         let second =
             build(&c, tagged("app"), &[("Containerfile", file, 0o644), ("hello.txt", b"hello\n", 0o644)]).await;
         second.id();
-        assert_eq!((second.cached(), second.containers()), (2, 0), "{:#?}", second.events);
+        assert_eq!((second.cached(), second.containers()), (3, 0), "{:#?}", second.events);
         assert_eq!(second.output(), "");
         let layers = |id: &str| {
             let c = c.clone();
@@ -209,7 +209,7 @@ fn bd_the_cache_runs_nothing_twice() {
         // A file's mtime alone doesn't count; its content does.
         let changed =
             build(&c, tagged("app"), &[("Containerfile", file, 0o644), ("hello.txt", b"hello again\n", 0o644)]).await;
-        assert_eq!((changed.cached(), changed.containers()), (0, 1));
+        assert_eq!((changed.cached(), changed.containers()), (1, 1));
         assert_eq!(changed.output(), "hello again\n");
         let again = build(
             &c,
@@ -471,9 +471,20 @@ fn cm_commit_keeps_changes_and_options() {
             (last["created_by"].as_str(), last["comment"].as_str()),
             (Some("rustlet commit"), Some("by a test"))
         );
-        // The runtime's mount points (/etc/hosts…) aren't the container's changes.
-        let (out, _) = run(&c, "committed", &["sh", "-c", "cat /etc/hostname 2>/dev/null; echo end"]).await;
-        assert!(!out.contains(&id[..12]), "the container's hostname file was committed: {out}");
+        // The runtime's mount points (/etc/hosts…) aren't the container's
+        // changes. (A container of the new image can't tell: its own mounts
+        // cover them.) The layer itself:
+        let layer = i.layer_details.last().unwrap().digest.trim_start_matches("sha256:").to_owned();
+        let blob = std::fs::File::open(d.data.join("content/blobs/sha256").join(layer)).unwrap();
+        let names: Vec<String> = tar::Archive::new(flate2::read::GzDecoder::new(blob))
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|n| n == "new") && names.iter().any(|n| n == "etc/.wh.motd"), "{names:?}");
+        for mount_point in ["etc/hostname", "etc/hosts", "etc/resolv.conf"] {
+            assert!(!names.iter().any(|n| n == mount_point), "{mount_point} committed: {names:?}");
+        }
         c.remove_container(&id, true).await.unwrap();
         // Without a name: kept, listed as <none>, removed by its id.
         let id = c

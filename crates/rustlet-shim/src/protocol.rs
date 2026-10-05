@@ -175,6 +175,9 @@ pub struct ExecRequest {
     pub stdin: bool,
     /// With `tty`: the terminal's size from the start, `[rows, columns]`.
     pub console_size: Option<[u16; 2]>,
+    /// Internal checks end when their daemon connection is lost. User execs
+    /// keep running across disconnects by default.
+    pub kill_on_disconnect: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

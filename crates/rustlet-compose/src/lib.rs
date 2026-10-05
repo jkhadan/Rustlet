@@ -12,13 +12,14 @@
 //! containers [`LABEL_SERVICE`], [`LABEL_NUMBER`], [`LABEL_CONFIG_HASH`]),
 //! and `ps`, `down` and the desktop app's stacks find them by those. A
 //! container whose config hash still matches its service is left running
-//! by the next `up`; one whose service changed is recreated.
+//! by the next `up`; one whose service changed is recreated (and so is one
+//! that shares the network namespace of a container that was).
 //!
 //! | module | what |
 //! |---|---|
 //! | `model` | the compose file as written (the supported subset of the Compose Specification) |
 //! | `interpolate` | `${VAR}`, `${VAR:-default}`, … from the environment and `.env` |
-//! | `load` | files → [`project::Project`]: defaults, overrides, names, paths |
+//! | `load` | files (`-f`, `COMPOSE_FILE`, the default ones) → [`project::Project`]: defaults, overrides, names, paths |
 //! | `project` | the normalized project: each service's `ContainerConfig`, networks, volumes, dependencies |
 //! | `run` | `up`, `down`, `ps`, `logs`, `build`, `stop`, `start` against rustletd |
 //!
@@ -34,7 +35,7 @@ pub mod model;
 pub mod project;
 pub mod run;
 
-pub use load::{LoadOptions, load, load_str};
+pub use load::{LoadOptions, given_project_name, has_config_file, load, load_selected, load_str};
 pub use project::{Condition, Dependency, Project, Service};
 pub use run::{
     Action, BuildPolicy, Compose, ComposeEvent, DownOptions, Events, LogLine, RemoveImages, ResourceKind,
@@ -47,7 +48,8 @@ pub const LABEL_PROJECT: &str = "io.rustlet.compose.project";
 pub const LABEL_SERVICE: &str = "io.rustlet.compose.service";
 /// A container's number within its service, from 1.
 pub const LABEL_NUMBER: &str = "io.rustlet.compose.container-number";
-/// A hash of what the container was created from ([`project::Service::config_hash`]).
+/// A hash of what the container was created from
+/// ([`project::Service::effective_hash`]).
 pub const LABEL_CONFIG_HASH: &str = "io.rustlet.compose.config-hash";
 /// The project's directory, on containers: for the desktop app.
 pub const LABEL_WORKING_DIR: &str = "io.rustlet.compose.project.working-dir";

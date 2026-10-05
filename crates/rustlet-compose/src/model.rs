@@ -11,7 +11,10 @@
 //!   `KEY=VALUE` items or a mapping, short or long syntax) are each read in
 //!   one place, and so are the strings interpolation leaves where a number or
 //!   a boolean belongs (`replicas: ${N}`, `tty: ${TTY:-false}`): Compose
-//!   converts those back by the field's type, and so does this.
+//!   converts those back by the field's type, and so does this. A boolean
+//!   may be written with YAML 1.1's other words too (`yes`, `no`, `on`,
+//!   `off`, `y`, `n`: compose-go's `toBoolean`), with a warning
+//!   ([`ComposeFile::warnings`]).
 //!
 //! A key whose value is empty (`image:` alone) counts as not given.
 //! Extension fields (`x-…`) are accepted and ignored wherever Compose takes
@@ -24,9 +27,11 @@
 //! names, relative paths, `env_file` contents, the value a bare
 //! `environment` key takes) is left to [`crate::load`].
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::rc::Rc;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -48,6 +53,8 @@ pub struct ComposeFile {
     pub services: Vec<ServiceDef>,
     pub networks: BTreeMap<String, NetworkDef>,
     pub volumes: BTreeMap<String, VolumeDef>,
+    /// What reading it noticed and accepted: a boolean written `yes`.
+    pub warnings: Vec<String>,
 }
 
 /// A service as written.
@@ -90,7 +97,7 @@ pub struct ServiceDef {
     pub extra_hosts: Vec<String>,
     pub stop_signal: Option<String>,
     pub stop_grace_period: Option<Duration>,
-    /// Bytes.
+    /// Bytes; `None` for 0 (no limit).
     pub mem_limit: Option<u64>,
     /// `None` for 0 (no limit).
     pub cpus: Option<f64>,
@@ -162,8 +169,9 @@ pub struct DependsOnDef {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeployDef {
     pub replicas: Option<u32>,
-    /// `resources.limits`.
+    /// `resources.limits`: `None` for 0 (no limit).
     pub cpus: Option<f64>,
+    /// Bytes; `None` for 0 (no limit).
     pub memory: Option<u64>,
     pub pids: Option<i64>,
 }
@@ -236,6 +244,7 @@ pub fn parse(doc: &Value) -> Result<ComposeFile> {
             _ => other_key(key, &at)?,
         }
     }
+    file.warnings = root.take_warnings();
     Ok(file)
 }
 
@@ -279,7 +288,7 @@ fn service(name: &str, def: &Value, at: &At) -> Result<ServiceDef> {
             "extra_hosts" => s.extra_hosts = extra_hosts(value, at)?,
             "stop_signal" => s.stop_signal = opt_text(value, at)?,
             "stop_grace_period" => s.stop_grace_period = opt_duration(value, at)?,
-            "mem_limit" => s.mem_limit = opt_size(value, at)?,
+            "mem_limit" => s.mem_limit = opt_size(value, at)?.filter(|&bytes| bytes > 0),
             "cpus" => s.cpus = opt_cpus(value, at)?,
             "pids_limit" => s.pids_limit = opt_number(value, at, "a process count")?,
             "deploy" => s.deploy = deploy(value, at)?,
@@ -430,13 +439,21 @@ fn env_files(v: &Value, at: &At) -> Result<Vec<EnvFileDef>> {
 /// host_ip, protocol}`; a range is one mapping per port.
 fn ports(v: &Value, at: &At) -> Result<Vec<PortMapping>> {
     let mut mappings = Vec::new();
+    let mut seen = BTreeSet::new();
     for (i, item) in list(v, at)?.iter().enumerate() {
         let at = &at.index(i);
         let spec = match item {
             Value::Mapping(_) => long_port(item, at)?,
             other => text(other, at)?,
         };
-        mappings.extend(PortMapping::parse(&spec).map_err(|e| at.bad(e))?);
+        for mapping in PortMapping::parse(&spec).map_err(|e| at.bad(e))? {
+            // Short and long syntax share Compose's normalized uniqueness
+            // key, including implicit tcp and the default host address.
+            let host = mapping.host_ip.unwrap_or(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+            if seen.insert((host, mapping.container_port, mapping.host_port, mapping.protocol)) {
+                mappings.push(mapping);
+            }
+        }
     }
     Ok(mappings)
 }
@@ -716,7 +733,10 @@ fn restart(v: &Value, at: &At) -> Result<Option<RestartPolicy>> {
 }
 
 /// `healthcheck:` as the daemon takes it: durations in nanoseconds, a
-/// string test as `CMD-SHELL`, `disable: true` as `["NONE"]`.
+/// string test as `CMD-SHELL`, `disable: true` as `["NONE"]` whatever else
+/// it says: a file that merges over another's `test` turns the check off
+/// with `disable: true` alone, and Compose makes it `NONE` too
+/// (`ToMobyHealthCheck`: `if check.Disable { test = []string{"NONE"} }`).
 fn healthcheck(v: &Value, at: &At) -> Result<Option<HealthConfig>> {
     if v.is_null() {
         return Ok(None);
@@ -737,9 +757,6 @@ fn healthcheck(v: &Value, at: &At) -> Result<Option<HealthConfig>> {
         }
     }
     if disable {
-        if !h.test.is_empty() && !h.is_none() {
-            return Err(at.invalid("disable: true and a test can't go together"));
-        }
         return Ok(Some(HealthConfig { test: vec!["NONE".into()], ..HealthConfig::default() }));
     }
     Ok(Some(h))
@@ -782,7 +799,7 @@ fn deploy(v: &Value, at: &At) -> Result<DeployDef> {
                                 let at = &at.key(key);
                                 match key {
                                     "cpus" => d.cpus = opt_cpus(value, at)?,
-                                    "memory" => d.memory = opt_size(value, at)?,
+                                    "memory" => d.memory = opt_size(value, at)?.filter(|&bytes| bytes > 0),
                                     "pids" => d.pids = opt_number(value, at, "a process count")?,
                                     _ => other_key(key, at)?,
                                 }
@@ -984,17 +1001,32 @@ fn check_name(name: &str, what: &str, at: &At) -> Result<()> {
     Ok(())
 }
 
-/// Where a value is in the document, for errors: `services.web.ports[1]`.
+/// Where a value is in the document, for errors: `services.web.ports[1]`;
+/// and, shared by every place derived from it, where to put the warnings
+/// reading finds on the way.
 #[derive(Debug, Clone, Default)]
-struct At(String);
+struct At {
+    path: String,
+    warnings: Rc<RefCell<Vec<String>>>,
+}
 
 impl At {
     fn key(&self, key: &str) -> At {
-        if self.0.is_empty() { At(key.to_owned()) } else { At(format!("{}.{key}", self.0)) }
+        let path = if self.path.is_empty() { key.to_owned() } else { format!("{}.{key}", self.path) };
+        At { path, warnings: self.warnings.clone() }
     }
 
     fn index(&self, i: usize) -> At {
-        At(format!("{}[{i}]", self.0))
+        At { path: format!("{}[{i}]", self.path), warnings: self.warnings.clone() }
+    }
+
+    /// Notes something accepted that Compose would too, but would say so.
+    fn warn(&self, message: impl fmt::Display) {
+        self.warnings.borrow_mut().push(format!("{self}: {message}"));
+    }
+
+    fn take_warnings(&self) -> Vec<String> {
+        std::mem::take(&mut self.warnings.borrow_mut())
     }
 
     /// The value here isn't what the file format allows.
@@ -1010,7 +1042,7 @@ impl At {
 
 impl fmt::Display for At {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(if self.0.is_empty() { "the file" } else { &self.0 })
+        f.write_str(if self.path.is_empty() { "the file" } else { &self.path })
     }
 }
 
@@ -1107,8 +1139,9 @@ fn labels(v: &Value, at: &At) -> Result<BTreeMap<String, String>> {
     Ok(key_values(v, at)?.into_iter().map(|(k, v)| (k, v.unwrap_or_default())).collect())
 }
 
-/// A boolean (`true`, `false`, or those words as strings); nothing is
-/// false.
+/// A boolean (`true`, `false`, or those words as strings; `yes`, `no`, `on`,
+/// `off`, `y` and `n` too, with a warning that YAML 1.2 wants `true` or
+/// `false`, as compose-go's `toBoolean` has it); nothing is false.
 fn flag(v: &Value, at: &At) -> Result<bool> {
     Ok(opt_flag(v, at)?.unwrap_or(false))
 }
@@ -1117,8 +1150,19 @@ fn opt_flag(v: &Value, at: &At) -> Result<Option<bool>> {
     match v {
         Value::Null => Ok(None),
         Value::Bool(b) => Ok(Some(*b)),
-        Value::String(s) if s.eq_ignore_ascii_case("true") => Ok(Some(true)),
-        Value::String(s) if s.eq_ignore_ascii_case("false") => Ok(Some(false)),
+        Value::String(s) => match s.to_ascii_lowercase().as_str() {
+            "true" => Ok(Some(true)),
+            "false" => Ok(Some(false)),
+            "y" | "yes" | "on" => {
+                at.warn(format!("{s:?} for boolean is not supported by YAML 1.2, please use `true`"));
+                Ok(Some(true))
+            }
+            "n" | "no" | "off" => {
+                at.warn(format!("{s:?} for boolean is not supported by YAML 1.2, please use `false`"));
+                Ok(Some(false))
+            }
+            _ => Err(at.bad(format!("expected true or false, found the string {s:?}"))),
+        },
         other => Err(at.bad(format!("expected true or false, found {}", kind(other)))),
     }
 }
@@ -1517,6 +1561,12 @@ mod tests {
             ["CMD-SHELL", "exit 0"]
         );
         assert!(one("healthcheck:\n  disable: true\n").healthcheck.unwrap().is_none());
+        // `disable: true` wins over a test that another file merged in (compose's
+        // `ToMobyHealthCheck`), and `disable: false` leaves the check as it is.
+        assert!(
+            one("healthcheck:\n  disable: true\n  test: [CMD, x]\n  interval: 5s\n").healthcheck.unwrap().is_none()
+        );
+        assert_eq!(one("healthcheck:\n  disable: false\n  test: [CMD, x]\n").healthcheck.unwrap().test, ["CMD", "x"]);
         assert!(one("healthcheck:\n  test: [NONE]\n").healthcheck.unwrap().is_none());
         let options_only = one("healthcheck:\n  interval: 2s\n").healthcheck.unwrap();
         assert!(options_only.test.is_empty(), "the image's test, with these options");
@@ -1526,7 +1576,6 @@ mod tests {
             ("test: [RUN, x]", "services.web.healthcheck.test: starts with \"RUN\": expected CMD, CMD-SHELL or NONE"),
             ("test: []", "services.web.healthcheck.test: the test is empty"),
             ("interval: 10", "services.web.healthcheck.interval: invalid duration \"10\""),
-            ("disable: true\n  test: [CMD, x]", "services.web.healthcheck: disable: true and a test can't go together"),
             ("retries: many", "services.web.healthcheck.retries: \"many\" is not a number of retries"),
         ] {
             let e = service_error(&format!("healthcheck:\n  {bad}\n"));
@@ -1665,8 +1714,12 @@ mod tests {
             "services.web.ports: expected a list, found the number 80"
         );
         assert_eq!(
-            error("services:\n  web:\n    tty: yes\n"),
-            "services.web.tty: expected true or false, found the string \"yes\""
+            error("services:\n  web:\n    tty: maybe\n"),
+            "services.web.tty: expected true or false, found the string \"maybe\""
+        );
+        assert_eq!(
+            error("services:\n  web:\n    tty: 1\n"),
+            "services.web.tty: expected true or false, found the number 1"
         );
         assert_eq!(
             error("services:\n  web:\n    cap_add: [[a]]\n"),
@@ -1681,6 +1734,42 @@ mod tests {
             "services.web.environment: a key must be a string, not the number 1"
         );
         assert_eq!(parse(&Value::Null).unwrap(), ComposeFile::default(), "an empty file");
+    }
+
+    /// compose-go's `toBoolean` (loader/interpolate.go): `y`, `yes`, `on` and
+    /// `n`, `no`, `off` are booleans too, in any case, with a warning that
+    /// names the field; `true` and `false` need none.
+    #[test]
+    fn booleans_may_be_written_with_yaml_1_1_words_and_warn() {
+        let f = file(
+            "services:\n  web:\n    image: a\n    tty: yes\n    stdin_open: \"On\"\n    read_only: n\n    privileged: \"FALSE\"\n    depends_on:\n      db:\n        required: off\n  db:\n    image: b\n    volumes:\n      - {type: volume, target: /d, read_only: Y}\nvolumes: {}\nnetworks:\n  n:\n    internal: yes\n",
+        );
+        let web = &f.services[0];
+        assert!(web.tty && web.stdin_open && !web.read_only && !web.privileged);
+        assert!(!web.depends_on[0].required);
+        assert!(f.services[1].volumes[0].read_only && f.networks["n"].internal);
+        assert_eq!(
+            f.warnings,
+            [
+                "services.web.tty: \"yes\" for boolean is not supported by YAML 1.2, please use `true`",
+                "services.web.stdin_open: \"On\" for boolean is not supported by YAML 1.2, please use `true`",
+                "services.web.read_only: \"n\" for boolean is not supported by YAML 1.2, please use `false`",
+                "services.web.depends_on.db.required: \"off\" for boolean is not supported by YAML 1.2, please use `false`",
+                "services.db.volumes[0].read_only: \"Y\" for boolean is not supported by YAML 1.2, please use `true`",
+                "networks.n.internal: \"yes\" for boolean is not supported by YAML 1.2, please use `true`",
+            ]
+        );
+        assert!(file("services:\n  web:\n    image: a\n    tty: true\n    read_only: \"false\"\n").warnings.is_empty());
+    }
+
+    /// `mem_limit: 0` is no limit (Docker: 0 is the engine's "unlimited"),
+    /// as `cpus: 0` is: rustletd refuses `--memory 0`.
+    #[test]
+    fn a_limit_of_zero_is_no_limit() {
+        let s = one("mem_limit: 0\ndeploy:\n  resources:\n    limits:\n      memory: 0b\n      cpus: 0\n");
+        assert_eq!((s.mem_limit, s.deploy.memory, s.deploy.cpus), (None, None, None));
+        assert_eq!(one("mem_limit: 0m\n").mem_limit, None);
+        assert_eq!(one("mem_limit: 1m\n").mem_limit, Some(1 << 20));
     }
 
     #[test]

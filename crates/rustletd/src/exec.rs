@@ -144,6 +144,7 @@ impl Daemon {
             tty: s.config.tty,
             stdin: s.config.stdin,
             console_size: s.config.console_size,
+            kill_on_disconnect: false,
         });
         let socket = self.paths.shim(c.id()).socket();
         let client =

@@ -311,7 +311,7 @@ fn an_unreadable_directory_that_is_not_excluded_is_an_error_naming_it() {
 }
 
 #[test]
-fn the_containerfile_and_ignore_file_are_always_included() {
+fn excluded_build_metadata_is_not_part_of_the_copy_context() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "build/Containerfile", "FROM a\n", 0o644);
@@ -321,13 +321,14 @@ fn the_containerfile_and_ignore_file_are_always_included() {
     mkdir(root, "build", 0o750);
 
     let (packed, entries) = packed(root, &root.join("build/Containerfile"));
-    assert_eq!(paths(&entries), [".dockerignore", "build/", "build/Containerfile"]);
-    assert_eq!(packed.dockerfile, "build/Containerfile");
-    assert_eq!(entry(&entries, "build/").mode, 0o750);
+    assert_eq!(paths(&entries), [".rustlet-containerfile"]);
+    assert_eq!(packed.dockerfile, ".rustlet-containerfile");
+    assert_eq!(dockerfile_name(root, &root.join("build/Containerfile")).unwrap(), packed.dockerfile);
+    assert_eq!(entry(&entries, ".rustlet-containerfile").data, b"FROM a\n");
 }
 
 #[test]
-fn an_ignore_file_beside_the_containerfile_is_used_and_always_included() {
+fn an_ignore_file_beside_the_containerfile_is_used_and_can_exclude_itself() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "docker/app.Containerfile", "FROM a\n", 0o644);
@@ -336,18 +337,8 @@ fn an_ignore_file_beside_the_containerfile_is_used_and_always_included() {
     write(root, "src/lib.rs", "", 0o644);
     write(root, "notes.md", "", 0o644);
     let (packed, entries) = packed(root, &root.join("docker/app.Containerfile"));
-    assert_eq!(
-        paths(&entries),
-        [
-            ".dockerignore",
-            "docker/",
-            "docker/app.Containerfile",
-            "docker/app.Containerfile.dockerignore",
-            "src/",
-            "src/lib.rs"
-        ]
-    );
-    assert_eq!(packed.excluded, 1, "notes.md; .dockerignore doesn't apply");
+    assert_eq!(paths(&entries), [".dockerignore", ".rustlet-containerfile", "src/", "src/lib.rs"]);
+    assert_eq!(packed.excluded, 2, "notes.md and docker/; .dockerignore doesn't apply");
 }
 
 #[test]

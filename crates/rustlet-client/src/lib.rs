@@ -63,9 +63,16 @@ mod ndjson;
 mod session;
 
 use std::borrow::Cow;
+use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Poll;
 
 use bytes::Bytes;
+use futures::StreamExt as _;
+use futures::stream::BoxStream;
 use http::header::{CONTENT_TYPE, HOST, USER_AGENT};
 use http::{HeaderValue, Method, Request, Response};
 use http_body_util::combinators::UnsyncBoxBody;
@@ -352,7 +359,7 @@ impl Client {
     pub async fn load_images(&self, archive: RequestBody) -> Result<JsonStream<LoadEvent>> {
         let payload = Payload::Stream(archive, "application/x-tar");
         let response = self.send_payload(Method::POST, routes::image_load(), payload).await?;
-        Ok(JsonStream::new(response.into_body(), |event| match event {
+        Ok(JsonStream::upload(response, |event| match event {
             LoadEvent::Error { message } => Err(Error::Stream(message)),
             event => Ok(event),
         }))
@@ -366,10 +373,23 @@ impl Client {
     /// [`BuildEvent::Done`], one that failed with
     /// `Err(Error::Stream(message))` (the stream never yields
     /// [`BuildEvent::Error`]).
+    ///
+    /// **A limit.** The options travel URL-encoded in the request's URI,
+    /// which the `http` crate holds to 65,534 bytes ([`MAX_TARGET`]): a
+    /// build whose options take more (a build arg or label of tens of
+    /// kilobytes, above all) fails here with [`Error::Request`] before
+    /// anything is sent, naming the largest. [`check_build_options`] asks
+    /// the same beforehand.
+    ///
+    /// **A context that is refused while it is being sent.** A daemon that
+    /// hangs up before the whole body is in (it refused or failed the
+    /// request) gives [`Error::Io`] saying so, rather than hyper's account
+    /// of the write that failed. Failures from the body's own source (its
+    /// writer aborted, its reader failed) remain [`Error::Http`].
     pub async fn build(&self, options: &BuildOptions, context: RequestBody) -> Result<JsonStream<BuildEvent>> {
-        let path = with_query(routes::build(), &BuildQuery::new(options))?;
+        let path = build_target(options)?;
         let response = self.send_payload(Method::POST, path, Payload::Stream(context, "application/x-tar")).await?;
-        Ok(JsonStream::new(response.into_body(), |event| match event {
+        Ok(JsonStream::upload(response, |event| match event {
             BuildEvent::Error { message } => Err(Error::Stream(message)),
             event => Ok(event),
         }))
@@ -487,21 +507,43 @@ impl Client {
             .uri(path)
             .header(HOST, "localhost")
             .header(USER_AGENT, HeaderValue::from_static(AGENT));
+        // For a streamed body: whether it has all been handed to the
+        // connection, to tell a request that failed before its body was in
+        // from one that failed after.
+        let mut upload = None;
         let request = match payload {
             Payload::Empty => builder.body(full(Bytes::new()))?,
             Payload::Json(body) => builder.header(CONTENT_TYPE, "application/json").body(full(Bytes::from(body)))?,
             Payload::Stream(body, content_type) => {
-                let frames = futures::StreamExt::map(body.stream, |chunk| chunk.map(hyper::body::Frame::data));
+                let (stream, progress) = noting_the_end(body.stream);
+                upload = Some(progress);
+                let frames = futures::StreamExt::map(stream, |chunk| chunk.map(hyper::body::Frame::data));
                 builder.header(CONTENT_TYPE, content_type).body(StreamBody::new(frames).boxed_unsync())?
             }
         };
-        let response = sender.send_request(request).await?;
+        let mut response = match sender.send_request(request).await {
+            Ok(response) => response,
+            Err(e) => return Err(upload_error(e, upload.as_ref())),
+        };
         if response.status().is_success() {
+            if let Some(progress) = upload {
+                response.extensions_mut().insert(progress);
+            }
             return Ok(response);
         }
         let status = response.status();
-        let body = Limited::new(response.into_body(), MAX_ERROR_BODY).collect().await;
-        let body = body.map(|b| b.to_bytes()).unwrap_or_default();
+        let body = match Limited::new(response.into_body(), MAX_ERROR_BODY).collect().await {
+            Ok(body) => body.to_bytes(),
+            Err(cause) => {
+                if let Ok(cause) = cause.downcast::<hyper::Error>() {
+                    let error = upload_error(*cause, upload.as_ref());
+                    if matches!(error, Error::Io(_)) {
+                        return Err(error);
+                    }
+                }
+                Bytes::new()
+            }
+        };
         Err(api_error(status.as_u16(), status.canonical_reason(), &body))
     }
 
@@ -543,6 +585,131 @@ impl Client {
             }
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+/// The longest request target (`path?query`) the `http` crate takes: its
+/// `Uri`'s own limit, `u16::MAX - 1` bytes. A build's options travel in it
+/// ([`BuildQuery`]), so they have to fit.
+pub const MAX_TARGET: usize = 65_534;
+
+/// The request target of a build with `options`, which must fit
+/// [`MAX_TARGET`].
+fn build_target(options: &BuildOptions) -> Result<String> {
+    let target = with_query(routes::build(), &BuildQuery::new(options))?;
+    if target.len() > MAX_TARGET {
+        return Err(Error::Request(options_too_large(options, target.len())));
+    }
+    Ok(target)
+}
+
+/// Whether `options`, encoded as [`Client::build`] sends them, fit in a
+/// request: what `build` checks before it sends anything. The error names
+/// the largest build arg or label.
+pub fn check_build_options(options: &BuildOptions) -> Result<()> {
+    build_target(options).map(drop)
+}
+
+/// Why `options` don't fit, and what to shorten.
+fn options_too_large(options: &BuildOptions, encoded: usize) -> String {
+    let args = options.build_args.iter().map(|(name, value)| ("build arg", name, name.len() + value.len()));
+    let labels = options.labels.iter().map(|(name, value)| ("label", name, name.len() + value.len()));
+    let largest = match args.chain(labels).max_by_key(|&(_, _, size)| size) {
+        Some((kind, name, size)) => format!("; the largest is {kind} {name:?} ({size} bytes)"),
+        None => String::new(),
+    };
+    format!("the build's options take {encoded} bytes in the request's URI, which holds at most {MAX_TARGET}{largest}")
+}
+
+/// Whether a streamed request ended or its own source failed. The latter
+/// must not be reported as a daemon that closed the connection.
+#[derive(Clone, Default)]
+struct UploadProgress {
+    sent: Arc<AtomicBool>,
+    failed: Arc<AtomicBool>,
+}
+
+/// `stream`, and its progress, shared with the response's reader.
+fn noting_the_end(
+    stream: BoxStream<'static, io::Result<Bytes>>,
+) -> (BoxStream<'static, io::Result<Bytes>>, UploadProgress) {
+    let progress = UploadProgress::default();
+    let failed = progress.failed.clone();
+    let stream = stream.inspect(move |chunk| {
+        if chunk.is_err() {
+            failed.store(true, Ordering::Release);
+        }
+    });
+    let flag = progress.sent.clone();
+    let end = futures::stream::poll_fn(move |_| {
+        flag.store(true, Ordering::Release);
+        Poll::Ready(None::<io::Result<Bytes>>)
+    });
+    (stream.chain(end).boxed(), progress)
+}
+
+/// A connection failure while an upload is still in progress, whether it
+/// happens before response headers or while reading the response's body.
+fn upload_error(e: hyper::Error, upload: Option<&UploadProgress>) -> Error {
+    let sending = upload
+        .is_some_and(|progress| !progress.sent.load(Ordering::Acquire) && !progress.failed.load(Ordering::Acquire));
+    if sending && connection_went(&e) { Error::Io(closed_while_sending(e)) } else { e.into() }
+}
+
+/// Is `e` the connection going (a write that met a closed socket, a reset,
+/// a hang-up before any answer), rather than something about the request
+/// itself? The failure of the body's own source is not: hyper calls it a
+/// user error, and its message names the cause.
+fn connection_went(e: &hyper::Error) -> bool {
+    if e.is_user() {
+        return false;
+    }
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(c) = cause {
+        if let Some(io) = c.downcast_ref::<io::Error>()
+            && matches!(
+                io.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::UnexpectedEof
+            )
+        {
+            return true;
+        }
+        // Once response headers were delivered, hyper's HTTP/1 dispatcher
+        // replaces the connection's error with this body-error cause.
+        if c.to_string() == "connection error" {
+            return true;
+        }
+        cause = c.source();
+    }
+    e.is_incomplete_message()
+}
+
+/// What a client still sending its body is told when the daemon hangs up:
+/// that, and that the daemon refused or failed the request, as it does
+/// before it has read a context it won't take. Hyper's account is kept as
+/// the cause, for `--debug`.
+fn closed_while_sending(cause: hyper::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, ClosedWhileSending(cause))
+}
+
+#[derive(Debug)]
+struct ClosedWhileSending(hyper::Error);
+
+impl fmt::Display for ClosedWhileSending {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            "the daemon closed the connection while the request's body was still being sent \
+             (it refused or failed the request: see rustletd's log)",
+        )
+    }
+}
+
+impl std::error::Error for ClosedWhileSending {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
     }
 }
 
@@ -694,6 +861,62 @@ mod tests {
         assert_eq!(segment("a b?"), "a%20b%3F");
         assert_eq!(segment(""), "");
         assert_eq!(action("../images", "start"), "/v1/containers/%2E%2E%2Fimages/start");
+    }
+
+    /// Expected (the `http` crate's `Uri`: at most `u16::MAX - 1` bytes):
+    /// [`MAX_TARGET`] is what a request target may hold, to the byte, so
+    /// that `build` can refuse options that don't fit before it sends.
+    #[test]
+    fn the_target_limit_is_the_http_crates() {
+        let target = |n: usize| format!("/{}", "a".repeat(n - 1));
+        assert!(http::Uri::try_from(target(MAX_TARGET)).is_ok());
+        assert!(http::Uri::try_from(target(MAX_TARGET + 1)).is_err());
+    }
+
+    fn with_arg(value_len: usize) -> BuildOptions {
+        BuildOptions { build_args: [("CA".to_owned(), "x".repeat(value_len))].into(), ..BuildOptions::default() }
+    }
+
+    /// Expected (the `http` crate takes a target of 65,534 bytes, and `build`
+    /// says "an `Err(Error::Request)` before anything is sent" past that):
+    /// options that fill the request target exactly are taken, one byte more
+    /// are refused, and the error gives the size, the limit, and the build
+    /// arg that is largest.
+    #[test]
+    fn options_fit_up_to_the_last_byte_of_the_target() {
+        let room = MAX_TARGET - build_target(&with_arg(0)).unwrap().len();
+        assert_eq!(build_target(&with_arg(room)).unwrap().len(), MAX_TARGET);
+        assert!(check_build_options(&with_arg(room)).is_ok());
+
+        let e = check_build_options(&with_arg(room + 1)).unwrap_err();
+        assert!(matches!(e, Error::Request(_)), "{e:?}");
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "invalid request: the build's options take {} bytes in the request's URI, which holds at most \
+                 {MAX_TARGET}; the largest is build arg \"CA\" ({} bytes)",
+                MAX_TARGET + 1,
+                room + 1 + "CA".len()
+            )
+        );
+    }
+
+    /// The largest of the build args and labels is the one named, whichever
+    /// it is; with neither (options that are large some other way), none is.
+    #[test]
+    fn the_error_names_the_largest_build_arg_or_label() {
+        let big = "y".repeat(MAX_TARGET);
+        let options = BuildOptions {
+            build_args: [("SMALL".to_owned(), "1".to_owned()), ("MEDIUM".to_owned(), "z".repeat(1000))].into(),
+            labels: [("org.example.cert".to_owned(), big.clone())].into(),
+            ..BuildOptions::default()
+        };
+        let e = check_build_options(&options).unwrap_err().to_string();
+        assert!(e.ends_with(&format!("the largest is label \"org.example.cert\" ({} bytes)", 16 + big.len())), "{e}");
+
+        let options = BuildOptions { tags: vec!["a".repeat(MAX_TARGET)], ..BuildOptions::default() };
+        let e = check_build_options(&options).unwrap_err().to_string();
+        assert!(e.ends_with(&format!("which holds at most {MAX_TARGET}")), "{e}");
     }
 
     #[test]

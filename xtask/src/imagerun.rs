@@ -156,6 +156,8 @@ fn run_container(args: &ImageRunArgs, image: &Image, rootfs: &ContainerRootfs, i
     let short = &id[..12];
     let tty = args.tty || (!args.no_tty && std::io::stdin().is_terminal());
     let options = RunOptions {
+        clear_cmd: false,
+        unset_env: Vec::new(),
         args: args.args.clone(),
         entrypoint: args.entrypoint.as_ref().map(|e| if e.is_empty() { Vec::new() } else { vec![e.clone()] }),
         env: args.env.clone(),

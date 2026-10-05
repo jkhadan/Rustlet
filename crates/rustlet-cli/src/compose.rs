@@ -136,6 +136,9 @@ pub struct UpArgs {
     /// Recreate the containers even if their configuration hasn't changed
     #[arg(long, conflicts_with = "no_recreate")]
     pub force_recreate: bool,
+    /// Recreate dependencies of the named services even if they have not changed
+    #[arg(long, conflicts_with = "no_recreate")]
+    pub always_recreate_deps: bool,
     /// Never recreate a container that exists, even if its configuration changed
     #[arg(long)]
     pub no_recreate: bool,
@@ -195,9 +198,6 @@ pub struct LogsArgs {
     pub services: Vec<String>,
 }
 
-/// The files Compose looks for when none is given, in order.
-const DEFAULT_FILES: [&str; 4] = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"];
-
 pub async fn compose(ctx: &mut Ctx, args: ComposeArgs) -> anyhow::Result<i32> {
     let options = LoadOptions {
         files: args.files,
@@ -206,14 +206,28 @@ pub async fn compose(ctx: &mut Ctx, args: ComposeArgs) -> anyhow::Result<i32> {
         env: environment(),
         profiles: args.profile,
     };
-    match args.command {
+    compose_with_options(ctx, options, args.command).await
+}
+
+async fn compose_with_options(ctx: &mut Ctx, options: LoadOptions, command: ComposeCommand) -> anyhow::Result<i32> {
+    match command {
         ComposeCommand::Ls { all } => ls(ctx, all).await,
-        ComposeCommand::Down(down) if !has_file(&options) && options.project_name.is_some() => {
-            let name = options.project_name.as_deref().unwrap_or_default();
-            down_project(ctx, name, &down).await
+        ComposeCommand::Down(down) if options.project_name.is_some() && !has_file(&options)? => {
+            let name = rustlet_compose::given_project_name(options.project_name.as_deref().unwrap_or_default(), "-p")
+                .map_err(compose_error)?;
+            down_project(ctx, &name, &down).await
         }
         command => {
-            let project = rustlet_compose::load(&options).map_err(compose_error)?;
+            let services = match &command {
+                ComposeCommand::Up(args) => args.services.as_slice(),
+                ComposeCommand::Logs(args) => args.services.as_slice(),
+                ComposeCommand::Ps { services, .. }
+                | ComposeCommand::Build { services, .. }
+                | ComposeCommand::Stop { services, .. }
+                | ComposeCommand::Start { services } => services.as_slice(),
+                _ => &[],
+            };
+            let project = rustlet_compose::load_selected(&options, services).map_err(compose_error)?;
             // What the file asked for that isn't done (an unset variable,
             // `expose`), as Compose's WARN lines.
             for warning in &project.warnings {
@@ -274,6 +288,7 @@ async fn up(ctx: &mut Ctx, compose: &Compose, args: UpArgs) -> anyhow::Result<i3
             BuildPolicy::Missing
         },
         force_recreate: args.force_recreate,
+        always_recreate_deps: args.always_recreate_deps,
         no_recreate: args.no_recreate,
         remove_orphans: args.remove_orphans,
         timeout: args.timeout,
@@ -449,9 +464,8 @@ fn config(ctx: &mut Ctx, project: &Project, services: bool) -> anyhow::Result<i3
 
 /// Is there a file to load: one given, or one of the default ones where
 /// they are looked for?
-fn has_file(options: &LoadOptions) -> bool {
-    let dir = options.project_dir.clone().unwrap_or_else(|| PathBuf::from("."));
-    !options.files.is_empty() || DEFAULT_FILES.iter().any(|name| dir.join(name).exists())
+fn has_file(options: &LoadOptions) -> anyhow::Result<bool> {
+    rustlet_compose::has_config_file(options).map_err(compose_error)
 }
 
 /// Services named on the command line must be the project's.
@@ -1145,10 +1159,168 @@ mod tests {
             project_dir: Some(dir.path().to_owned()),
             ..LoadOptions::default()
         };
-        assert!(!has_file(&options(vec![])));
-        assert!(has_file(&options(vec!["elsewhere.yaml".into()])));
+        assert!(!has_file(&options(vec![])).unwrap());
+        assert!(has_file(&options(vec!["elsewhere.yaml".into()])).unwrap());
         std::fs::write(dir.path().join("docker-compose.yml"), "services: {}\n").unwrap();
-        assert!(has_file(&options(vec![])));
+        assert!(has_file(&options(vec![])).unwrap());
         assert_eq!(unix_time(DateTime::from_timestamp(1_727_780_000, 5).unwrap()), "1727780000.000000005");
+    }
+
+    fn test_ctx(socket: PathBuf) -> Ctx {
+        let (console, _, _) = crate::console::testing::console(b"");
+        Ctx { client: rustlet_client::Client::new(socket), console, debug: false, packer: crate::build::Packer::real() }
+    }
+
+    async fn serve_test(app: axum::Router, dir: &std::path::Path) -> Ctx {
+        let socket = dir.join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        test_ctx(socket)
+    }
+
+    fn down_args() -> DownArgs {
+        DownArgs { volumes: true, rmi: None, remove_orphans: false, timeout: None }
+    }
+
+    #[tokio::test]
+    async fn compose_file_environment_and_dotenv_keep_external_volumes_during_down() {
+        use axum::{
+            Json, Router,
+            extract::State,
+            routing::{delete, get},
+        };
+        use rustlet_spec::{routes::pattern, volume::Volume};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        async fn volumes() -> Json<Vec<Volume>> {
+            Json(vec![Volume {
+                name: "shop_data".into(),
+                labels: [(rustlet_compose::LABEL_PROJECT.into(), "shop".into())].into(),
+                ..Volume::default()
+            }])
+        }
+        async fn remove(State(count): State<Arc<AtomicUsize>>) -> axum::http::StatusCode {
+            count.fetch_add(1, Ordering::SeqCst);
+            axum::http::StatusCode::NO_CONTENT
+        }
+        let selected = tempfile::tempdir().unwrap();
+        let file = selected.path().join("prod.yaml");
+        std::fs::write(&file, "name: shop\nservices: {}\nvolumes:\n  data:\n    external: true\n    name: shop_data\n")
+            .unwrap();
+        for dotenv in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let count = Arc::new(AtomicUsize::new(0));
+            let app = Router::new()
+                .route(pattern::CONTAINERS, get(|| async { Json(Vec::<ContainerSummary>::new()) }))
+                .route(pattern::NETWORKS, get(|| async { Json(Vec::<rustlet_spec::network::Network>::new()) }))
+                .route(pattern::VOLUMES, get(volumes))
+                .route(pattern::VOLUME, delete(remove))
+                .with_state(count.clone());
+            let mut ctx = serve_test(app, dir.path()).await;
+            let mut options = LoadOptions {
+                project_dir: Some(dir.path().to_owned()),
+                project_name: Some("shop".into()),
+                ..LoadOptions::default()
+            };
+            if dotenv {
+                std::fs::write(dir.path().join(".env"), format!("COMPOSE_FILE={}\n", file.display())).unwrap();
+            } else {
+                options.env.insert("COMPOSE_FILE".into(), file.display().to_string());
+            }
+            assert_eq!(compose_with_options(&mut ctx, options, ComposeCommand::Down(down_args())).await.unwrap(), 0);
+            assert_eq!(count.load(Ordering::SeqCst), 0, "COMPOSE_FILE must prevent fileless removal");
+        }
+    }
+
+    #[tokio::test]
+    async fn fileless_down_normalizes_and_validates_the_given_project_name() {
+        use axum::{
+            Json, Router,
+            extract::State,
+            routing::{delete, get},
+        };
+        use rustlet_spec::routes::pattern;
+        use std::sync::Arc;
+        async fn list() -> Json<Vec<ContainerSummary>> {
+            Json(vec![ContainerSummary {
+                id: "container-id".into(),
+                name: "shop-app-1".into(),
+                labels: [
+                    (rustlet_compose::LABEL_PROJECT.into(), "shop".into()),
+                    (rustlet_compose::LABEL_SERVICE.into(), "app".into()),
+                ]
+                .into(),
+                ..ContainerSummary::default()
+            }])
+        }
+        async fn remove(
+            State(removed): State<Arc<Mutex<Vec<String>>>>,
+            axum::extract::Path(id): axum::extract::Path<String>,
+        ) -> axum::http::StatusCode {
+            removed.lock().unwrap().push(id);
+            axum::http::StatusCode::NO_CONTENT
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let removed = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route(pattern::CONTAINERS, get(list))
+            .route(pattern::CONTAINER, delete(remove))
+            .route(pattern::NETWORKS, get(|| async { Json(Vec::<rustlet_spec::network::Network>::new()) }))
+            .route(pattern::VOLUMES, get(|| async { Json(Vec::<rustlet_spec::volume::Volume>::new()) }))
+            .with_state(removed.clone());
+        let mut ctx = serve_test(app, dir.path()).await;
+        let options = LoadOptions {
+            project_dir: Some(dir.path().to_owned()),
+            project_name: Some("SHOP".into()),
+            ..LoadOptions::default()
+        };
+        assert_eq!(
+            compose_with_options(&mut ctx, options.clone(), ComposeCommand::Down(down_args())).await.unwrap(),
+            0
+        );
+        assert_eq!(*removed.lock().unwrap(), ["container-id"]);
+        let invalid = LoadOptions { project_name: Some("invalid name".into()), ..options };
+        assert!(
+            compose_with_options(&mut ctx, invalid, ComposeCommand::Down(down_args()))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("invalid project name")
+        );
+        assert_eq!(removed.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cli_named_service_enables_its_inactive_profile() {
+        use axum::{Json, Router, routing::get};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("compose.yaml"),
+            "name: shop\nservices:\n  debug:\n    image: a\n    profiles: [debug]\n",
+        )
+        .unwrap();
+        let app = Router::new()
+            .route(rustlet_spec::routes::pattern::CONTAINERS, get(|| async { Json(Vec::<ContainerSummary>::new()) }));
+        let mut ctx = serve_test(app, dir.path()).await;
+        let options = LoadOptions { project_dir: Some(dir.path().to_owned()), ..LoadOptions::default() };
+        let command = ComposeCommand::Ps { all: true, quiet: true, services: vec!["debug".into()] };
+        assert_eq!(compose_with_options(&mut ctx, options, command).await.unwrap(), 0);
+    }
+
+    #[test]
+    fn always_recreate_dependencies_is_parsed_and_conflicts_with_no_recreate() {
+        use clap::Parser;
+        let cli =
+            crate::Cli::try_parse_from(["rustlet", "compose", "up", "-d", "--always-recreate-deps", "web"]).unwrap();
+        let crate::Command::Compose(args) = cli.command else { panic!("compose") };
+        let ComposeCommand::Up(args) = args.command else { panic!("up") };
+        assert!(args.always_recreate_deps);
+        assert_eq!(args.services, ["web"]);
+        assert!(
+            crate::Cli::try_parse_from(["rustlet", "compose", "up", "--always-recreate-deps", "--no-recreate"])
+                .is_err()
+        );
     }
 }

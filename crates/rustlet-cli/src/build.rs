@@ -184,6 +184,8 @@ pub async fn build(ctx: &mut Ctx, args: BuildArgs) -> anyhow::Result<i32> {
     let dockerfile = (packer.dockerfile_name)(&args.context, &containerfile).map_err(|e| anyhow!("{e}"))?;
     let options = args.to_options(dockerfile, &from_environment)?;
     ctx.debug(format_args!("building with {}", serde_json::to_string(&options)?));
+    // Before the context is packed, or anything sent: the options have to fit in a request.
+    rustlet_client::check_build_options(&options)?;
 
     let (body, writer) = RequestBody::pipe();
     let context = args.context.clone();

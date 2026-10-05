@@ -162,6 +162,16 @@ fn platform_args_are_defined_without_an_arg() {
 }
 
 #[test]
+fn automatic_platform_args_take_explicit_build_overrides() {
+    let plan = planned("FROM busybox-$TARGETARCH\n", None, &[("TARGETARCH", "arm64")]);
+    assert_eq!(plan.bases[0], Base::Image("busybox-arm64".into()));
+    assert_eq!(plan.global_args["TARGETARCH"].as_deref(), Some("arm64"));
+    assert!(plan.unused_args.is_empty());
+    let error = plan_error("FROM --platform=$BUILDPLATFORM alpine\n", None, &[("BUILDPLATFORM", "linux/arm64")]);
+    assert!(error.contains("builds linux/amd64 images only"), "{error}");
+}
+
+#[test]
 fn a_platform_variable_must_come_to_linux_amd64() {
     let text = "ARG P=linux/arm64\nFROM --platform=$P alpine\n";
     let e = plan_error(text, None, &[]);
@@ -170,13 +180,13 @@ fn a_platform_variable_must_come_to_linux_amd64() {
 }
 
 #[test]
-fn copy_from_is_expanded_with_the_global_args() {
-    let text = "ARG SRC=assets\nFROM alpine AS assets\nFROM alpine AS other\nFROM alpine\nCOPY --from=$SRC /a /a\n";
-    assert_eq!(planned(text, None, &[]).stages, [0, 2]);
-    assert_eq!(planned(text, None, &[("SRC", "other")]).stages, [1, 2]);
-    assert_eq!(planned(text, None, &[("SRC", "nginx")]).stages, [2], "an image is no stage");
-    let e = plan_error("FROM alpine\nCOPY --from=${X:?} /a /a\n", None, &[]);
-    assert!(e.starts_with("line 2: COPY --from=${X:?}"), "{e}");
+fn copy_from_does_not_accept_variable_expansion() {
+    for from in ["$SRC", "${SRC}", "${SRC:?required}"] {
+        let text = format!("ARG SRC=assets\nFROM alpine AS assets\nFROM alpine\nCOPY --from={from} /a /a\n");
+        let error = parse(&text).unwrap_err();
+        assert_eq!(error.line, 4);
+        assert!(error.message.contains("variable expansion is not supported for --from"), "{error}");
+    }
 }
 
 #[test]

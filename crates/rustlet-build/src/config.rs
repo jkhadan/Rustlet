@@ -390,7 +390,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         for digit in fraction.chars() {
             let d = digit.to_digit(10).ok_or_else(bad)? as u128;
             scale /= 10;
-            part += d * scale;
+            part = part.checked_add(d * scale).ok_or_else(bad)?;
         }
         total = total.checked_add(part).ok_or_else(bad)?;
         rest = next;

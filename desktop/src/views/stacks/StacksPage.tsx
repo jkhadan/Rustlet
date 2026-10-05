@@ -7,6 +7,7 @@
 import { ArrowUpFromLine, Blocks, FileUp, Power } from "lucide-react";
 import { useState } from "react";
 import { Link } from "react-router";
+import { toast } from "sonner";
 
 import { attempt, ErrorState, HealthBadge, PageHeader, StatusBadge, useConfirm } from "@/components/common";
 import { Badge, type Tone } from "@/components/ui/badge";
@@ -106,7 +107,13 @@ function StackCard({ stack, onUp }: { stack: Stack; onUp: (files: string[]) => v
     setBusy(true);
     try {
       // The card goes with the stack's last container, from the events.
-      await attempt(`Taking ${stack.name} down failed`, () => api.compose.down(stack.name, volumes));
+      let stayed: string[] = [];
+      const done = await attempt(`Taking ${stack.name} down failed`, async () => {
+        stayed = (await api.compose.down(stack.name, volumes)) ?? [];
+      });
+      // A network or volume something else still uses stays: no failure,
+      // but not to go unsaid ("Down and its volumes" with one left behind).
+      if (done && stayed.length) toast.warning(`${stack.name} is down, but not all of it`, { description: stayed.join("\n") });
     } finally {
       setBusy(false);
     }

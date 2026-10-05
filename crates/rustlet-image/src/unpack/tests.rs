@@ -347,7 +347,7 @@ fn without_whiteouts_their_names_are_ordinary_files() {
     std::fs::create_dir_all(dir.path().join("layer/share/doc")).unwrap();
     std::fs::write(dir.path().join("layer/share/doc/kept"), b"k").unwrap();
     let fd = nix::fcntl::open(&dir.path().join("layer"), OFlag::O_RDONLY | OFlag::O_DIRECTORY, Mode::empty()).unwrap();
-    let options = UnpackOptions { whiteouts: false };
+    let options = UnpackOptions { whiteouts: false, ..UnpackOptions::default() };
     let u = Unpacked { result: super::unpack_with(&tar[..], Compression::None, fd.as_fd(), &options), dir };
     let r = u.report();
     assert_eq!((r.whiteouts, r.opaque_dirs), (0, 0));
@@ -575,4 +575,112 @@ fn sparse_files_and_sizes_only_in_pax_are_refused() {
     // A size record that agrees with the header is fine.
     let tar = Archive::new().pax_file("f", b"x", &[("size", b"1")]).tar();
     assert_eq!(unpack_tar(&tar).read("f"), "x");
+}
+
+/// A plain archive (an `ADD`ed tarball) unpacked into a `layer/` directory
+/// of mode 0755 that already holds `kept`.
+fn unpack_plain(tar: &[u8], owner: Option<(u32, u32)>) -> Unpacked {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("layer")).unwrap();
+    std::fs::set_permissions(dir.path().join("layer"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.path().join("layer/kept"), b"k").unwrap();
+    let fd = nix::fcntl::open(&dir.path().join("layer"), OFlag::O_RDONLY | OFlag::O_DIRECTORY, Mode::empty()).unwrap();
+    let options = UnpackOptions { whiteouts: false, owner };
+    Unpacked { result: super::unpack_with(tar, Compression::None, fd.as_fd(), &options), dir }
+}
+
+// Docker's go-archive `Unpack` skips an entry for the extraction root
+// (`name := path.Clean(...); if name == "." { continue }`, "Skip entries
+// referring to the extraction root"): an `ADD`ed tarball made with `tar -C
+// dir .` starts with `./`, carrying its packer's mode and owner, and the
+// directory it is extracted into keeps its own. A layer's root entry is
+// applied, as before. The skipped entry isn't one of the entries made.
+#[test]
+fn a_plain_archives_root_entry_is_skipped_and_a_layers_is_applied() {
+    let tar = Archive::new().dir("./", 0o700).file("./f", b"x", 0o644).tar();
+    let u = unpack_plain(&tar, None);
+    let r = u.report();
+    assert_eq!(u.read("f"), "x");
+    assert_eq!(std::fs::metadata(u.path("")).unwrap().mode() & 0o7777, 0o755, "the root entry's mode was applied");
+    assert_ne!(std::fs::metadata(u.path("")).unwrap().mtime(), MTIME as i64, "the root entry's time was applied");
+    assert_eq!((r.entries, r.skipped_other.as_slice()), (2, ["./".to_owned()].as_slice()));
+    assert_eq!(u.read("kept"), "k");
+    // As a layer: its own directory gets what the entry says.
+    let u = unpack_tar(&tar);
+    u.report();
+    assert_eq!(std::fs::metadata(u.path("")).unwrap().mode() & 0o7777, 0o700);
+    assert_eq!(std::fs::metadata(u.path("")).unwrap().mtime(), MTIME as i64);
+}
+
+/// The caller's other group, which any user may give their own files.
+fn other_group() -> Option<u32> {
+    let primary = nix::unistd::getegid();
+    nix::unistd::getgroups().ok()?.into_iter().find(|&g| g != primary).map(Gid::as_raw)
+}
+
+/// `tar` unpacked into `layer/` the way [`unpack_with`](super::unpack_with)
+/// does it, by an `Unpacker` made privileged by hand: an ordinary user can
+/// chown to its own uid and any group of its own, which is all these tests
+/// give.
+fn unpack_as_root(tar: &[u8], owner: Option<(u32, u32)>) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("layer")).unwrap();
+    let fd = nix::fcntl::open(&dir.path().join("layer"), OFlag::O_RDONLY | OFlag::O_DIRECTORY, Mode::empty()).unwrap();
+    let mut unpacker = Unpacker::new(fd.as_fd()).unwrap();
+    unpacker.privileged = true;
+    unpacker.whiteouts = false;
+    unpacker.owner = owner;
+    let mut archive = tar::Archive::new(tar);
+    let mut extensions = Extensions::default();
+    for entry in archive.entries().unwrap().raw(true) {
+        let mut entry = entry.unwrap();
+        if extensions.absorb(&mut entry).unwrap() {
+            continue;
+        }
+        unpacker.entry(entry, std::mem::take(&mut extensions)).unwrap();
+    }
+    unpacker.finish().unwrap();
+    dir
+}
+
+// `ADD --chown`: BuildKit's `unpack` gives every extracted entry the owner
+// (`ChownOpts`), where the archive's own stay without one. Files, directories
+// and symlinks are chowned, a hard link shares its target's.
+#[test]
+fn an_owner_replaces_the_archives_owners() {
+    let (uid, gid) = (nix::unistd::geteuid().as_raw(), nix::unistd::getegid().as_raw());
+    let Some(other) = other_group() else {
+        eprintln!("skipped: the caller has no group besides its primary one");
+        return;
+    };
+    // `Archive::header` gives every entry the caller's uid and primary gid.
+    let tar = Archive::new()
+        .dir("d/", 0o755)
+        .file("d/f", b"x", 0o644)
+        .link(EntryType::Symlink, "d/l", "f")
+        .link(EntryType::Link, "d/h", "d/f")
+        .tar();
+    let paths = ["d", "d/f", "d/l", "d/h"];
+    let owners = |dir: &tempfile::TempDir| -> Vec<(u32, u32)> {
+        paths
+            .iter()
+            .map(|p| {
+                let m = std::fs::symlink_metadata(dir.path().join("layer").join(p)).unwrap();
+                (m.uid(), m.gid())
+            })
+            .collect()
+    };
+    assert_eq!(owners(&unpack_as_root(&tar, None)), [(uid, gid); 4], "without an owner: the archive's");
+    assert_eq!(owners(&unpack_as_root(&tar, Some((uid, other)))), [(uid, other); 4], "with one: that");
+}
+
+// What the option is for, end to end where an ordinary user can see it: the
+// default is the archive's own, and a plain archive without an owner still
+// unpacks as it did (`unpack_with` is `UnpackOptions::default()` for layers).
+#[test]
+fn the_default_options_are_a_layers_with_the_archives_owners() {
+    assert_eq!(UnpackOptions::default(), UnpackOptions { whiteouts: true, owner: None });
+    let tar = Archive::new().file("f", b"x", 0o644).tar();
+    let u = unpack_plain(&tar, Some((nix::unistd::geteuid().as_raw(), nix::unistd::getegid().as_raw())));
+    assert_eq!(u.read("f"), "x");
 }

@@ -26,63 +26,82 @@ use std::io::{self, Read};
 use tar::EntryType;
 
 /// A PAX record: its key and value.
-pub(super) type Record = (Vec<u8>, Vec<u8>);
+pub(crate) type Record = (Vec<u8>, Vec<u8>);
 
 /// The largest extension header read, as Go's `maxSpecialFileSize`.
-pub(super) const MAX_HEADER: u64 = 1 << 20;
+pub(crate) const MAX_HEADER: u64 = 1 << 20;
 
 /// What the extension headers before an entry said about it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(super) struct Extensions {
+pub(crate) struct Extensions {
     /// A GNU long name (`L`).
     gnu_path: Option<Vec<u8>>,
     /// A GNU long link name (`K`).
     gnu_linkpath: Option<Vec<u8>>,
-    /// Every PAX record, in order (a later one for the same key wins).
+    /// The last PAX header's records (a later record for a key wins).
     records: Vec<Record>,
 }
 
 impl Extensions {
-    pub(super) fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         *self == Extensions::default()
     }
 
     /// The last value of the PAX record `key`.
-    pub(super) fn get(&self, key: &str) -> Option<&[u8]> {
+    pub(crate) fn get(&self, key: &str) -> Option<&[u8]> {
         self.records.iter().rev().find(|(k, _)| k == key.as_bytes()).map(|(_, v)| v.as_slice())
     }
 
     /// Every PAX record, in order.
-    pub(super) fn records(&self) -> &[Record] {
+    pub(crate) fn records(&self) -> &[Record] {
         &self.records
     }
 
     /// The entry's path, if a header gave one: a GNU long name, else the
     /// PAX `path` (Go's order).
-    pub(super) fn path(&self) -> Option<&[u8]> {
-        self.gnu_path.as_deref().or_else(|| self.get("path"))
+    pub(crate) fn path(&self) -> Option<&[u8]> {
+        self.gnu_path.as_deref().filter(|p| !p.is_empty()).or_else(|| self.get("path").filter(|p| !p.is_empty()))
     }
 
     /// The entry's link target, likewise.
-    pub(super) fn linkpath(&self) -> Option<&[u8]> {
-        self.gnu_linkpath.as_deref().or_else(|| self.get("linkpath"))
+    pub(crate) fn linkpath(&self) -> Option<&[u8]> {
+        self.gnu_linkpath
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .or_else(|| self.get("linkpath").filter(|p| !p.is_empty()))
     }
 
     /// Takes in `entry` if it is an extension header (`x`, `L`, `K`);
     /// false for any other entry, which is the one these headers describe.
-    pub(super) fn absorb<R: Read>(&mut self, entry: &mut tar::Entry<'_, R>) -> io::Result<bool> {
-        match entry.header().entry_type() {
+    pub(crate) fn absorb<R: Read>(&mut self, entry: &mut tar::Entry<'_, R>) -> io::Result<bool> {
+        let kind = entry.header().entry_type();
+        if !matches!(kind, EntryType::XHeader | EntryType::GNULongName | EntryType::GNULongLink) {
+            return Ok(false);
+        }
+        let size = entry.header().entry_size()?;
+        self.absorb_data(kind, size, entry)
+    }
+
+    /// [`absorb`](Self::absorb) for an entry that isn't a `tar::Entry`
+    /// (`archive::load` reads its own): the entry's type, the size its
+    /// header gives, and a reader of its data, of which at most
+    /// [`MAX_HEADER`] bytes are ever taken.
+    pub(crate) fn absorb_data(&mut self, kind: EntryType, size: u64, data: &mut dyn Read) -> io::Result<bool> {
+        match kind {
             EntryType::XHeader => {
-                let data = read_header(entry)?;
-                self.records.extend(parse_records(&data).map_err(invalid)?);
+                let data = read_header(size, data)?;
+                // Each local PAX header replaces the preceding one, as Go
+                // reads it. Appending would retain obsolete paths and let
+                // arbitrarily many capped headers accumulate in memory.
+                self.records = parse_records(&data).map_err(invalid)?;
                 Ok(true)
             }
             EntryType::GNULongName => {
-                self.gnu_path = Some(without_nuls(read_header(entry)?));
+                self.gnu_path = Some(without_nuls(read_header(size, data)?));
                 Ok(true)
             }
             EntryType::GNULongLink => {
-                self.gnu_linkpath = Some(without_nuls(read_header(entry)?));
+                self.gnu_linkpath = Some(without_nuls(read_header(size, data)?));
                 Ok(true)
             }
             _ => Ok(false),
@@ -90,15 +109,18 @@ impl Extensions {
     }
 }
 
-/// An extension header's data, refused over [`MAX_HEADER`].
-fn read_header<R: Read>(entry: &mut tar::Entry<'_, R>) -> io::Result<Vec<u8>> {
-    let size = entry.header().entry_size()?;
+/// An extension header's data of `size` bytes, refused over [`MAX_HEADER`]
+/// before any of it is read.
+fn read_header(size: u64, data: &mut dyn Read) -> io::Result<Vec<u8>> {
     if size > MAX_HEADER {
         return Err(invalid(format!("an extension header of {size} bytes (at most {MAX_HEADER})")));
     }
-    let mut data = Vec::with_capacity(size as usize);
-    entry.take(MAX_HEADER + 1).read_to_end(&mut data)?;
-    Ok(data)
+    let mut bytes = Vec::with_capacity(size as usize);
+    data.take(size).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != size {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "an extension header cut short"));
+    }
+    Ok(bytes)
 }
 
 /// A GNU long name ends with a NUL (or several).
@@ -112,7 +134,7 @@ fn without_nuls(mut name: Vec<u8>) -> Vec<u8> {
 /// PAX records, each `<length> <key>=<value>\n` where the length counts the
 /// whole record, newline included: the value is whatever lies between `=`
 /// and that newline, newlines and all.
-pub(super) fn parse_records(mut data: &[u8]) -> Result<Vec<Record>, String> {
+pub(crate) fn parse_records(mut data: &[u8]) -> Result<Vec<Record>, String> {
     let mut out = Vec::new();
     while !data.is_empty() {
         let space = data.iter().position(|&b| b == b' ').ok_or("a PAX record without a length")?;
@@ -164,5 +186,18 @@ mod tests {
         for bad in [&b"x"[..], b"5 a=b\n", b"6 a=b", b"6 ab\n\n", b"5 =b\n", b"-6 a=b\n", b"0006a=b\n"] {
             assert!(parse_records(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn repeated_local_headers_replace_state_instead_of_accumulating_it() {
+        let mut headers = Extensions::default();
+        let first = record("path", b"obsolete");
+        headers.absorb_data(EntryType::XHeader, first.len() as u64, &mut &first[..]).unwrap();
+        let last = record("mtime", b"1600000000");
+        for _ in 0..128 {
+            headers.absorb_data(EntryType::XHeader, last.len() as u64, &mut &last[..]).unwrap();
+        }
+        assert_eq!(headers.path(), None);
+        assert_eq!(headers.records(), &parse_records(&last).unwrap());
     }
 }

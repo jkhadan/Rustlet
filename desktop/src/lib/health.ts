@@ -3,7 +3,7 @@
 // the last five checks): what the lists show beside its status, and what
 // the Overview tab details.
 
-import type { ContainerState, Health, HealthConfig, HealthResult, HealthStatus } from "@/bindings";
+import type { ContainerInspect, ContainerState, Health, HealthConfig, HealthResult, HealthStatus } from "@/bindings";
 
 import { commandText, goDuration, parseTime } from "./format";
 
@@ -15,6 +15,23 @@ import { commandText, goDuration, parseTime } from "./format";
 export function shownHealth(state: Pick<ContainerState, "status" | "health">): HealthStatus | null {
   if (state.status !== "running" && state.status !== "paused") return null;
   return state.health?.status ?? null;
+}
+
+/** How often to ask for a container again while it is being checked, in
+ * milliseconds; false when it isn't (not running, or no healthcheck).
+ * rustletd saves every check but announces only a change of verdict (a
+ * check every few seconds as an event would flood every client), so a page
+ * showing the checks would go stale between two verdicts: the one place
+ * that polls. About as often as the container is checked, not oftener than
+ * every second nor rarer than every five (the image's interval isn't in
+ * the container's config, and the first checks come every `start_interval`,
+ * 5 s by default); `refetchInterval` waits while the window isn't in
+ * front, and a paused container isn't checked. */
+export function healthPollMs(c: Pick<ContainerInspect, "state" | "config"> | undefined): number | false {
+  if (!c || c.state.status !== "running" || !c.state.health) return false;
+  const every = c.config.healthcheck?.interval;
+  const ms = every != null && every > 0 ? every / 1e6 : 5_000;
+  return Math.min(Math.max(ms, 1_000), 5_000);
 }
 
 /** The checks, newest first (the daemon keeps the last five, oldest

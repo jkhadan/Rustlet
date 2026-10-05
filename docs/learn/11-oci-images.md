@@ -418,8 +418,10 @@ with them, and §9 shows overlay making one.
 4. **Hard links stay in the layer:** the target, resolved the same way
    and opened `O_PATH|O_NOFOLLOW`, is linked from that fd with
    `linkat(AT_EMPTY_PATH)`, never a directory or whiteout.
-5. **Overlay's own attributes** (`trusted.overlay.*`, `user.overlay.*`)
-   are dropped; from an image they could forge opaque directories.
+5. **Overlay's active attribute namespace** is dropped; from an image it
+   could forge opaque directories. That is `trusted.overlay.*` for the
+   rootful daemon and `user.overlay.*` for unprivileged test layers. The
+   inactive namespace remains ordinary image data.
 
 **Metadata: owner, mode, attributes, times, in that order.**
 

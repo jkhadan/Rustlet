@@ -22,6 +22,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures::stream::{BoxStream, Stream, StreamExt};
+use http::Response;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use serde::de::DeserializeOwned;
@@ -47,7 +48,19 @@ impl<T: DeserializeOwned + Send + 'static> JsonStream<T> {
     /// Decodes `body`. `check` sees every item and may turn it into the
     /// error that ends the stream (a pull's `error` event).
     pub(crate) fn new(body: Incoming, check: fn(T) -> Result<T>) -> JsonStream<T> {
-        let state = State { body, lines: LineBuffer::default(), eof: false, done: false, check, item: PhantomData };
+        Self::with_upload(body, check, None)
+    }
+
+    /// The response to a streamed upload, which may still be in progress
+    /// when the daemon answers and closes the connection.
+    pub(crate) fn upload(mut response: Response<Incoming>, check: fn(T) -> Result<T>) -> JsonStream<T> {
+        let upload = response.extensions_mut().remove::<crate::UploadProgress>();
+        Self::with_upload(response.into_body(), check, upload)
+    }
+
+    fn with_upload(body: Incoming, check: fn(T) -> Result<T>, upload: Option<crate::UploadProgress>) -> JsonStream<T> {
+        let state =
+            State { body, lines: LineBuffer::default(), eof: false, done: false, check, upload, item: PhantomData };
         let inner = futures::stream::unfold(state, |mut state| async move {
             let item = state.next().await?;
             Some((item, state))
@@ -78,6 +91,7 @@ struct State<T> {
     /// An error was returned, or everything was: nothing more comes.
     done: bool,
     check: fn(T) -> Result<T>,
+    upload: Option<crate::UploadProgress>,
     item: PhantomData<fn() -> T>,
 }
 
@@ -112,7 +126,7 @@ impl<T: DeserializeOwned> State<T> {
                 }
                 Some(Err(e)) => {
                     self.done = true;
-                    return Some(Err(e.into()));
+                    return Some(Err(crate::upload_error(e, self.upload.as_ref())));
                 }
                 None => self.eof = true,
             }

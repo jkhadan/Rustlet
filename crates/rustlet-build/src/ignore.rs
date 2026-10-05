@@ -31,6 +31,8 @@
 
 use std::path::{Path, PathBuf};
 
+use regex::{Regex, RegexBuilder};
+
 use crate::path::clean;
 
 /// Parsed ignore patterns.
@@ -103,7 +105,7 @@ impl IgnoreRules {
 }
 
 /// One line of the file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct Pattern {
     /// The cleaned pattern, without its `!`.
     text: String,
@@ -112,52 +114,37 @@ struct Pattern {
     kind: Kind,
 }
 
-/// How a pattern matches, as `patternmatcher` compiles it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Kind {
-    /// No wildcard: the path itself.
-    Exact,
-    /// `text**`: paths starting with `text`.
-    Prefix(String),
-    /// `**text`, `text` without wildcards: paths ending with `text` (and,
-    /// for `**/text`, `text` itself).
-    Suffix(String),
-    /// Anything else: the tokens of `patternmatcher`'s regular expression.
-    Tokens(Vec<Token>),
+impl PartialEq for Pattern {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text && self.exclusion == other.exclusion
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Token {
-    Char(char),
-    /// `?`: a character but `/`.
-    Any,
-    /// `*`: characters but `/`.
-    Star,
-    /// `**/`, or `**` inside: any number of whole components, none
-    /// included (`(.*/)?`).
-    Dirs,
-    /// `**` at the end: anything (`.*`).
-    Rest,
-    /// `[…]`.
-    Class {
-        negated: bool,
-        ranges: Vec<(char, char)>,
-    },
+impl Eq for Pattern {}
+
+/// The same fast paths as patternmatcher, otherwise a compiled expression.
+#[derive(Debug, Clone)]
+enum Kind {
+    Exact,
+    Prefix(String),
+    Suffix(String),
+    Regex(Regex),
 }
 
 impl Pattern {
-    /// `patternmatcher`'s `compile`, with Go's `filepath.Match` syntax
-    /// checks.
+    /// Translate the glob the way patternmatcher's Linux compiler does.
+    /// In particular, a backslash is a regex escape, not always a literal
+    /// next character: `\d` matches digits and `\i` is an error.
     fn compile(text: String, exclusion: bool) -> Result<Pattern, String> {
         #[derive(PartialEq)]
         enum Type {
             Exact,
             Prefix,
             Suffix,
-            Regexp,
+            Regex,
         }
         let chars: Vec<char> = text.chars().collect();
-        let mut tokens = Vec::new();
+        let mut expression = String::from("^");
         let mut kind = Type::Exact;
         let mut i = 0;
         while i < chars.len() {
@@ -167,7 +154,6 @@ impl Pattern {
             match c {
                 '*' if chars.get(i) == Some(&'*') => {
                     i += 1;
-                    // `**/` is `**`.
                     if chars.get(i) == Some(&'/') {
                         i += 1;
                     }
@@ -175,47 +161,72 @@ impl Pattern {
                         if kind == Type::Exact {
                             kind = Type::Prefix;
                         } else {
-                            tokens.push(Token::Rest);
-                            kind = Type::Regexp;
+                            expression.push_str(".*");
+                            kind = Type::Regex;
                         }
                     } else {
-                        tokens.push(Token::Dirs);
-                        kind = Type::Regexp;
+                        expression.push_str("(.*/)?");
+                        kind = Type::Regex;
                     }
                     if first {
                         kind = Type::Suffix;
                     }
                 }
                 '*' => {
-                    tokens.push(Token::Star);
-                    kind = Type::Regexp;
+                    expression.push_str("[^/]*");
+                    kind = Type::Regex;
                 }
                 '?' => {
-                    tokens.push(Token::Any);
-                    kind = Type::Regexp;
+                    expression.push_str("[^/]");
+                    kind = Type::Regex;
                 }
-                '\\' => match chars.get(i) {
-                    Some(&next) => {
-                        tokens.push(Token::Char(next));
-                        i += 1;
-                        kind = Type::Regexp;
-                    }
-                    None => return Err("a pattern can't end with \\".to_owned()),
-                },
+                '\\' => {
+                    let next = chars.get(i).ok_or("a pattern can't end with \\")?;
+                    expression.push('\\');
+                    expression.push(*next);
+                    i += 1;
+                    kind = Type::Regex;
+                }
                 '[' => {
-                    let (class, next) = class(&chars, i)?;
-                    tokens.push(class);
+                    let next = class(&chars, i)?;
+                    expression.push('[');
+                    let mut content = chars[i..next - 1].iter();
+                    while let Some(&c) = content.next() {
+                        if c == '\\' {
+                            expression.push('\\');
+                            expression.push(*content.next().expect("validated class escape"));
+                        } else {
+                            // A nested `[` is literal in Go's class syntax.
+                            if "[.+()|{}$".contains(c) {
+                                expression.push('\\');
+                            }
+                            expression.push(c);
+                        }
+                    }
+                    expression.push(']');
                     i = next;
-                    kind = Type::Regexp;
+                    kind = Type::Regex;
                 }
-                c => tokens.push(Token::Char(c)),
+                c if ".+()|{}$".contains(c) => {
+                    expression.push('\\');
+                    expression.push(c);
+                }
+                c => expression.push(c),
             }
         }
         let kind = match kind {
             Type::Exact => Kind::Exact,
             Type::Prefix => Kind::Prefix(text[..text.len() - 2].to_owned()),
             Type::Suffix => Kind::Suffix(text[2..].to_owned()),
-            Type::Regexp => Kind::Tokens(tokens),
+            Type::Regex => {
+                expression.push('$');
+                let expression = go_regex_escapes(&expression)?;
+                let compiled = RegexBuilder::new(&expression)
+                    .octal(true)
+                    .build()
+                    .map_err(|e| format!("syntax error in pattern: {e}"))?;
+                Kind::Regex(compiled)
+            }
         };
         Ok(Pattern { text, exclusion, kind })
     }
@@ -227,10 +238,7 @@ impl Pattern {
             Kind::Suffix(suffix) => {
                 path.ends_with(suffix.as_str()) || suffix.strip_prefix('/').is_some_and(|bare| path == bare)
             }
-            Kind::Tokens(tokens) => {
-                let mut memo = vec![None; (tokens.len() + 1) * (path.len() + 1)];
-                match_tokens(tokens, path, 0, 0, &mut memo)
-            }
+            Kind::Regex(regex) => regex.is_match(path),
         }
     }
 
@@ -241,10 +249,63 @@ impl Pattern {
     }
 }
 
+/// Go's shorthand classes and word boundaries are ASCII, while Rust's
+/// regex defaults to Unicode. Go also has a literal-quoting escape.
+fn go_regex_escapes(raw: &str) -> Result<String, String> {
+    let mut out = String::new();
+    let mut chars = raw.chars().peekable();
+    let mut in_class = false;
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            if c == '[' {
+                in_class = true;
+            } else if c == ']' {
+                in_class = false;
+            }
+            out.push(c);
+            continue;
+        }
+        let next = chars.next().ok_or("trailing escape in pattern")?;
+        if in_class && matches!(next, 'A' | 'z' | 'b' | 'B' | 'Q') {
+            return Err(format!("syntax error in pattern: invalid class escape \\{next}"));
+        }
+        match next {
+            'd' => out.push_str("[0-9]"),
+            'D' => out.push_str("[^0-9]"),
+            's' => out.push_str("[\\t\\n\\f\\r ]"),
+            'S' => out.push_str("[^\\t\\n\\f\\r ]"),
+            'w' => out.push_str("[0-9A-Za-z_]"),
+            'W' => out.push_str("[^0-9A-Za-z_]"),
+            'b' | 'B' => out.push_str(&format!("(?-u:\\{next})")),
+            'a' => out.push_str("\\x07"),
+            'v' => out.push_str("\\x0B"),
+            'Q' => {
+                let mut literal = String::new();
+                while let Some(c) = chars.next() {
+                    if c == '\\' && chars.peek() == Some(&'E') {
+                        chars.next();
+                        break;
+                    }
+                    literal.push(c);
+                }
+                out.push_str(&regex::escape(&literal));
+            }
+            c if c.is_ascii_alphabetic() && !"fnrtAxzpP".contains(c) => {
+                return Err(format!("syntax error in pattern: invalid escape \\{c}"));
+            }
+            c => {
+                out.push('\\');
+                out.push(c);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// A character class whose `[` is just before `start`: Go's
 /// `filepath.Match` syntax (`[abc]`, `[a-z]`, `[^…]`, `\` escaping). Returns
-/// the token and where the class ends.
-fn class(chars: &[char], start: usize) -> Result<(Token, usize), String> {
+/// where the class ends, after checking filepath.Match's syntax.
+fn class(chars: &[char], start: usize) -> Result<usize, String> {
     let malformed = || "malformed character class ([…])".to_owned();
     let mut i = start;
     let negated = chars.get(i) == Some(&'^');
@@ -264,10 +325,10 @@ fn class(chars: &[char], start: usize) -> Result<(Token, usize), String> {
         *i += 1;
         Ok(c)
     };
-    let mut ranges = Vec::new();
+    let mut elements = 0;
     loop {
-        if chars.get(i) == Some(&']') && !ranges.is_empty() {
-            return Ok((Token::Class { negated, ranges }, i + 1));
+        if chars.get(i) == Some(&']') && elements > 0 {
+            return Ok(i + 1);
         }
         let low = one(&mut i)?;
         let high = if chars.get(i) == Some(&'-') {
@@ -276,43 +337,11 @@ fn class(chars: &[char], start: usize) -> Result<(Token, usize), String> {
         } else {
             low
         };
-        if i >= chars.len() {
+        if i >= chars.len() || low > high {
             return Err(malformed());
         }
-        ranges.push((low, high));
+        elements += 1;
     }
-}
-
-/// Do `tokens[t..]` match `path[at..]`? Memoized on `(t, at)`, so no
-/// pattern takes more than tokens × bytes steps.
-fn match_tokens(tokens: &[Token], path: &str, t: usize, at: usize, memo: &mut [Option<bool>]) -> bool {
-    let key = t * (path.len() + 1) + at;
-    if let Some(known) = memo[key] {
-        return known;
-    }
-    let rest = &path[at..];
-    let next = rest.chars().next();
-    let step = next.map_or(0, char::len_utf8);
-    let result = match tokens.get(t) {
-        None => rest.is_empty(),
-        Some(Token::Char(c)) => next == Some(*c) && match_tokens(tokens, path, t + 1, at + step, memo),
-        Some(Token::Any) => next.is_some_and(|c| c != '/') && match_tokens(tokens, path, t + 1, at + step, memo),
-        Some(Token::Class { negated, ranges }) => {
-            next.is_some_and(|c| ranges.iter().any(|(low, high)| (*low..=*high).contains(&c)) != *negated)
-                && match_tokens(tokens, path, t + 1, at + step, memo)
-        }
-        Some(Token::Star) => {
-            match_tokens(tokens, path, t + 1, at, memo)
-                || (next.is_some_and(|c| c != '/') && match_tokens(tokens, path, t, at + step, memo))
-        }
-        Some(Token::Dirs) => {
-            match_tokens(tokens, path, t + 1, at, memo)
-                || rest.match_indices('/').any(|(i, _)| match_tokens(tokens, path, t + 1, at + i + 1, memo))
-        }
-        Some(Token::Rest) => true,
-    };
-    memo[key] = Some(result);
-    result
 }
 
 /// The ignore file that applies to a build of `context` with `containerfile`
