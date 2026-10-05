@@ -950,7 +950,20 @@ impl Compose {
                 ipv4_address: network.ipv4_address,
                 ipv6_address: network.ipv6_address,
             };
-            self.client.connect_network(&network.network, &connect).await?;
+            if let Err(error) = self.client.connect_network(&network.network, &connect).await {
+                // Its hash already describes every requested network. A
+                // partial container kept here would be reused by the next
+                // up, skipping the connections that failed this time.
+                if let Err(cleanup) =
+                    self.client.remove_container_with(&created.id, &RemoveQuery { force: true, volumes: true }).await
+                {
+                    events(ComposeEvent::Warning(format!(
+                        "remove incompletely connected container {}: {cleanup}",
+                        created.name
+                    )));
+                }
+                return Err(error.into());
+            }
         }
         Ok(created.id)
     }

@@ -596,6 +596,26 @@ networks:
 }
 
 #[tokio::test]
+async fn a_failed_network_connection_does_not_leave_a_container_that_up_would_reuse() {
+    let yaml =
+        "name: shop\nservices:\n  web:\n    image: nginx\n    networks: [front, back]\nnetworks:\n  front:\n  back:\n";
+    let fake = Fake::start(&["nginx"]);
+    fake.lock().refused_connections.insert("shop_back".into());
+    let compose = compose(&fake, yaml);
+    let (result, _) = up_with(&compose, &UpOptions::default()).await;
+    assert!(result.unwrap_err().to_string().contains("refused the connection"));
+    assert!(!fake.lock().has_container("shop-web-1"), "an incompletely connected container must be removed");
+    assert_eq!(fake.calls().last().map(String::as_str), Some("rm shop-web-1 -v"));
+
+    fake.lock().refused_connections.clear();
+    up(&compose).await;
+    let d = fake.lock();
+    let web = d.container("shop-web-1");
+    assert_eq!(web.state.status, ContainerStatus::Running);
+    assert_eq!(web.endpoints.iter().map(|e| e.network.as_str()).collect::<Vec<_>>(), ["shop_front", "shop_back"]);
+}
+
+#[tokio::test]
 async fn missing_images_are_pulled_unless_the_policy_says_never() {
     let yaml = "name: shop\nservices:\n  web:\n    image: nginx\n";
     let fake = Fake::start(&[]);

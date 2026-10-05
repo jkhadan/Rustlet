@@ -79,6 +79,8 @@ pub struct Daemon {
     pub calls: Vec<String>,
     /// Scripted build response; absent means a successful build.
     pub build_events: Option<Vec<BuildEvent>>,
+    /// Connections refused by network name, to test interrupted creation.
+    pub refused_connections: BTreeSet<String>,
     serial: u64,
 }
 
@@ -425,6 +427,9 @@ async fn connect_network(
     let Some(network) = d.networks.iter().find(|n| n.id == id || n.name == id).map(|n| n.name.clone()) else {
         return error(ErrorKind::NoSuchNetwork, format!("no such network: {id}"));
     };
+    if d.refused_connections.contains(&network) {
+        return error(ErrorKind::Conflict, format!("network {network} refused the connection"));
+    }
     let Some(i) = d.find(&body.container) else {
         return error(ErrorKind::NoSuchContainer, format!("no such container: {}", body.container));
     };
