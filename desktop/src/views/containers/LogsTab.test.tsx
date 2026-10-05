@@ -118,6 +118,16 @@ describe("a line of output longer than 16 KiB", () => {
     await send({ type: "end" });
     expect(status()).toContain(" 2 lines");
   });
+
+  it("shows bounded output with a truncation notice and keeps a partial line on disconnection", async () => {
+    render(<LogsTab container={container} />);
+    await waitFor(() => expect(channels.length).toBe(1));
+    await send({ type: "items", items: Array.from({ length: 8 }, () => entry("x".repeat(16 * 1024))) });
+    await send({ type: "error", error: { kind: "failed", message: "connection closed" } });
+    await waitFor(() => expect(rows()[0]).toContain("[65536 characters not kept]"));
+    expect(rows()[0]!.length).toBeLessThan(66_000);
+    expect(status()).toContain(" 1 lines");
+  });
 });
 
 describe("rustletd restarting while the container runs", () => {

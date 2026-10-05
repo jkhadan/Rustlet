@@ -6,7 +6,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { ArrowDownToLine, Eraser, Search } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import type { ContainerInspect, LogEntry, LogStream } from "@/bindings";
+import type { ContainerInspect } from "@/bindings";
 import { Button } from "@/components/ui/button";
 import { Checkbox, Input, Select } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/misc";
@@ -14,9 +14,7 @@ import { parseAnsi, type Span, stripAnsi } from "@/lib/ansi";
 import { cn } from "@/lib/cn";
 import { useDaemon } from "@/lib/daemon";
 import { api, type StreamHandle } from "@/lib/ipc";
-
-/** Lines kept in memory at most; older ones are dropped. */
-const MAX_LINES = 50_000;
+import { type BufferedLogEntry, LogBuffer, retainLogLines } from "@/lib/logs";
 
 interface Line {
   n: number;
@@ -24,6 +22,7 @@ interface Line {
   stderr: boolean;
   spans: Span[];
   plain: string;
+  chars: number;
 }
 
 export function LogsTab({ container }: { container: ContainerInspect }) {
@@ -69,50 +68,37 @@ export function LogsTab({ container }: { container: ContainerInspect }) {
     // last has the newline; `rustlet logs` prints them back to back. The
     // pieces wait here, per stream, for the one that ends the line (or the
     // end of the log), and make one line with the first one's time.
-    const held = new Map<LogStream, LogEntry>();
-    const add = (entries: LogEntry[]) => {
+    const buffer = new LogBuffer();
+    const add = (entries: BufferedLogEntry[]) => {
       if (!entries.length) return;
       const more = entries.map((e): Line => {
-        const text = e.log.replace(/\r?\n$/, "");
+        const text = e.log + (e.droppedChars ? ` … [${e.droppedChars} characters not kept]` : "");
         return {
           n: counter.current++,
           ts: e.ts,
           stderr: e.stream === "stderr",
           spans: parseAnsi(text, style),
           plain: stripAnsi(text),
+          chars: text.length,
         };
       });
-      setLines((old) => {
-        const next = old.concat(more);
-        return next.length > MAX_LINES ? next.slice(next.length - MAX_LINES) : next;
-      });
+      setLines((old) => retainLogLines(old.concat(more)));
     };
     api.containers
       .logs(container.id, { follow: following, tail: tail === "all" ? null : Number(tail) }, (m) => {
         if (closed) return;
         if (m.type === "items") {
-          const whole: LogEntry[] = [];
-          for (const e of m.items) {
-            const before = held.get(e.stream);
-            const joined = before ? { ...before, log: before.log + e.log } : e;
-            if (e.log.endsWith("\n")) {
-              held.delete(e.stream);
-              whole.push(joined);
-            } else {
-              held.set(e.stream, joined);
-            }
-          }
-          add(whole);
+          add(buffer.push(m.items));
           setStatus(following ? "following" : "loading");
         } else if (m.type === "end") {
           // The last output before an exit may lack its newline.
-          add([...held.values()].sort((a, b) => (a.ts < b.ts ? -1 : 1)));
-          held.clear();
+          add(buffer.finish());
           // A follow ends by itself when the container exits, and `live`
           // changing opens the next stream; while it still runs, it was cut.
           cut.current = following;
           setStatus("ended");
         } else {
+          add(buffer.finish());
           cut.current = true;
           setStatus("error");
           setError(m.error.message);
