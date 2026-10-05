@@ -7,6 +7,18 @@ import { LogBuffer, MAX_LOG_CHARS, MAX_LOG_LINE_CHARS, MAX_LOG_LINES, retainLogL
 const entry = (log: string, stream: LogEntry["stream"] = "stdout", ts = "2026-10-05T00:00:00Z"): LogEntry => ({ log, stream, ts });
 
 describe("bounded container logs", () => {
+  it("strips CRLF split across fragments, including after truncated output", () => {
+    const buffer = new LogBuffer();
+    const text = "x".repeat(16 * 1024 - 1);
+    buffer.push([entry(`${text}\r`)]);
+    expect(buffer.push([entry("\n")])).toEqual([{ ...entry(text), droppedChars: 0 }]);
+    const oversized = "y".repeat(MAX_LOG_LINE_CHARS + 20);
+    buffer.push([entry(`${oversized}\r`)]);
+    expect(buffer.push([entry("\n")])).toEqual([
+      { ...entry(oversized.slice(0, MAX_LOG_LINE_CHARS)), droppedChars: 20 },
+    ]);
+  });
+
   it("bounds unfinished lines on both streams and counts discarded output", () => {
     const buffer = new LogBuffer();
     const piece = "x".repeat(16 * 1024);

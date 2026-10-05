@@ -11,35 +11,49 @@ export interface BufferedLogEntry extends LogEntry {
 
 /** Joins each stream's fragments while keeping incomplete lines bounded. */
 export class LogBuffer {
-  private held = new Map<LogStream, BufferedLogEntry>();
+  private held = new Map<LogStream, { entry: BufferedLogEntry; endsWithCR: boolean }>();
 
   get pendingChars(): number {
-    return [...this.held.values()].reduce((n, e) => n + e.log.length, 0);
+    return [...this.held.values()].reduce((n, e) => n + e.entry.log.length, 0);
   }
 
   push(entries: LogEntry[]): BufferedLogEntry[] {
     const whole: BufferedLogEntry[] = [];
     for (const entry of entries) {
-      const before = this.held.get(entry.stream);
-      const text = (before?.log ?? "") + entry.log.replace(/\r?\n$/, "");
+      const pending = this.held.get(entry.stream);
+      const before = pending?.entry;
+      const ended = entry.log.endsWith("\n");
+      let prefix = before?.log ?? "";
+      let droppedChars = before?.droppedChars ?? 0;
+      // CR and LF can straddle two shim fragments, including the point
+      // where the retained prefix was capped. Strip the logical line's
+      // terminator, and exclude a discarded terminator from its count.
+      if (entry.log === "\n" && pending?.endsWithCR) {
+        if (droppedChars) droppedChars--;
+        else prefix = prefix.slice(0, -1);
+      }
+      const text = prefix + entry.log.replace(/\r?\n$/, "");
       const joined = {
         ...entry,
         ts: before?.ts ?? entry.ts,
         log: text.slice(0, MAX_LOG_LINE_CHARS),
-        droppedChars: (before?.droppedChars ?? 0) + Math.max(0, text.length - MAX_LOG_LINE_CHARS),
+        droppedChars: droppedChars + Math.max(0, text.length - MAX_LOG_LINE_CHARS),
       };
-      if (entry.log.endsWith("\n")) {
+      if (ended) {
         this.held.delete(entry.stream);
         whole.push(joined);
       } else {
-        this.held.set(entry.stream, joined);
+        this.held.set(entry.stream, {
+          entry: joined,
+          endsWithCR: entry.log ? entry.log.endsWith("\r") : (pending?.endsWithCR ?? false),
+        });
       }
     }
     return whole;
   }
 
   finish(): BufferedLogEntry[] {
-    const last = [...this.held.values()].sort((a, b) => a.ts.localeCompare(b.ts));
+    const last = [...this.held.values()].map((p) => p.entry).sort((a, b) => a.ts.localeCompare(b.ts));
     this.held.clear();
     return last;
   }
