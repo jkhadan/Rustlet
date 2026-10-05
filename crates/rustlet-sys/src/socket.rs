@@ -80,8 +80,8 @@ fn close_truncated_rights(mut control: &[u8]) {
         let level = field(std::mem::offset_of!(libc::cmsghdr, cmsg_level));
         let kind = field(std::mem::offset_of!(libc::cmsghdr, cmsg_type));
         if level == libc::SOL_SOCKET && kind == libc::SCM_RIGHTS {
-            for bytes in control[header_len..length].chunks_exact(std::mem::size_of::<RawFd>()) {
-                let fd = RawFd::from_ne_bytes(bytes.try_into().expect("a whole received descriptor"));
+            for bytes in control[header_len..length].as_chunks::<{ std::mem::size_of::<RawFd>() }>().0 {
+                let fd = RawFd::from_ne_bytes(*bytes);
                 // SAFETY: these complete SCM_RIGHTS values were written by
                 // recvmsg and refer to descriptors the kernel installed.
                 // nix returned before decoding any of them, so none has an
