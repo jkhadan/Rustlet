@@ -37,7 +37,7 @@ export function TagDialog({ source, open, onOpenChange }: { source: string; open
     onOpenChange(false);
   };
   const submit = async () => {
-    if (!target.trim()) return;
+    if (busy || !target.trim()) return;
     setBusy(true);
     setError(null);
     try {
@@ -104,6 +104,7 @@ export function SaveDialog({ names, open, onOpenChange }: { names: string[]; ope
     onOpenChange(false);
   };
   const submit = async () => {
+    if (busy) return;
     const list = images.split(/[\s,]+/).filter(Boolean);
     const file = path.trim();
     if (!list.length || !file) return;
@@ -182,7 +183,7 @@ export function LoadDialog({ open, onOpenChange }: { open: boolean; onOpenChange
 
   const start = () => {
     const p = path.trim();
-    if (!p) return;
+    if (busy || !p) return;
     const mine = ++following.current;
     setLoad(initialLoad());
     api.images

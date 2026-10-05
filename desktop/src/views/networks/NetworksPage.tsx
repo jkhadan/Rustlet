@@ -288,6 +288,7 @@ function CreateNetwork({ open, onOpenChange }: { open: boolean; onOpenChange: (o
   const [internal, setInternal] = useState(false);
   const [busy, setBusy] = useState(false);
   const submit = async () => {
+    if (busy || !name.trim()) return;
     setBusy(true);
     const ok = await attempt("Creating the network failed", () =>
       api.networks.create({ name: name.trim(), subnet: subnet.trim() || null, gateway: gateway.trim() || null, ipv6, internal }),

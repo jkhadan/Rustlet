@@ -170,6 +170,7 @@ function CreateVolume({ open, onOpenChange }: { open: boolean; onOpenChange: (o:
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const submit = async () => {
+    if (busy) return;
     setBusy(true);
     const ok = await attempt("Creating the volume failed", () => api.volumes.create({ name: name.trim() || null }));
     setBusy(false);

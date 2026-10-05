@@ -78,6 +78,15 @@ const start: BuildEvent[] = [
 ];
 
 describe("the build view", () => {
+  it("ignores another form submission while a build is running", async () => {
+    mount();
+    await build();
+    fireEvent.submit(field("context").closest("form")!);
+    await act(async () => {});
+    expect(args("image_build")).toHaveLength(1);
+    expect(args("stream_cancel")).toEqual([]);
+  });
+
   it("builds what the form says, the rest left to the API's defaults", async () => {
     mount();
     fireEvent.change(field("tags"), { target: { value: "hits:latest, hits:1" } });

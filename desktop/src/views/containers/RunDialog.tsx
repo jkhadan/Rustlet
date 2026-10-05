@@ -128,6 +128,7 @@ export function RunDialog({ open, onOpenChange, image }: { open: boolean; onOpen
   // stops coming (the stream is cancelled), but rustletd pulls to the end
   // whether or not a client stays.
   const pulling = useRef<{ reference: string; abandon(): void } | null>(null);
+  const submitting = useRef(false);
 
   const reset = () => {
     setForm({ ...empty, image: image ?? "" });
@@ -185,6 +186,8 @@ export function RunDialog({ open, onOpenChange, image }: { open: boolean; onOpen
   };
 
   const submit = async () => {
+    if (submitting.current) return;
+    submitting.current = true;
     setError(null);
     try {
       setBusy("Checking");
@@ -223,6 +226,7 @@ export function RunDialog({ open, onOpenChange, image }: { open: boolean; onOpen
     } catch (e) {
       if (!(e instanceof Closed)) setError(e instanceof Error ? e.message : String(e));
     } finally {
+      submitting.current = false;
       setBusy(null);
     }
   };

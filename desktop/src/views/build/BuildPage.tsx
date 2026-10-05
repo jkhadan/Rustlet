@@ -46,6 +46,7 @@ export function BuildPage() {
   const set = <K extends keyof BuildForm>(k: K, v: BuildForm[K]) => setForm((f) => ({ ...f, [k]: v }));
 
   const submit = () => {
+    if (running) return;
     setError(null);
     if (!form.context.trim()) return;
     try {

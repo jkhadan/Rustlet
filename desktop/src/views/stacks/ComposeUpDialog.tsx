@@ -104,6 +104,7 @@ export function ComposeUpDialog({ request, up, onClose }: { request: UpRequest; 
   const busy = up.state?.phase === "running";
 
   const submit = () => {
+    if (busy) return;
     const files = several ? request.files : [file.trim()];
     if (!files[0]) return;
     // The stack's directory goes with the file its labels name: another

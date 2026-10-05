@@ -37,6 +37,9 @@ e2e/             a WebDriver client and the lifecycle scenario
   runs each `RUN` step in a container of its own (label `io.rustlet.build`): the
   lists hide those unless asked to show them, and the dashboard's counts leave
   them out.
+  Logs keep at most 50,000 rows and 8 MiB of text, with each logical line
+  capped at 64 KiB (including output waiting for its newline); oversized
+  lines say how many characters were discarded.
 - **Stacks**: the compose projects the daemon has containers of, found by their
   labels (the daemon knows no projects), live from the daemon's events: what runs,
   each service's containers, health and ports. *Down* removes a project's

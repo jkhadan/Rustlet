@@ -37,7 +37,7 @@ export function PullDialog({ open, onOpenChange }: { open: boolean; onOpenChange
 
   const start = () => {
     const ref = reference.trim();
-    if (!ref) return;
+    if (busy || !ref) return;
     unfollow(following.current);
     const f: Following = { closed: false };
     following.current = f;

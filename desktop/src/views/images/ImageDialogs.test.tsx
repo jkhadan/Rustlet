@@ -38,6 +38,27 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
+describe("repeated form submissions", () => {
+  it.each(["tag", "save", "load"])("starts only one %s while its command is pending", async (operation) => {
+    const command = `image_${operation}`;
+    h.handlers[command] = () => new Promise(() => {});
+    render(
+      <MemoryRouter>
+        {operation === "tag" ? <TagDialog open source="hits" onOpenChange={() => {}} /> :
+          operation === "save" ? <SaveDialog open names={["hits"]} onOpenChange={() => {}} /> :
+          <LoadDialog open onOpenChange={() => {}} />}
+      </MemoryRouter>,
+    );
+    const input = field(operation === "tag" ? "target" : "path");
+    fireEvent.change(input, { target: { value: operation === "tag" ? "hits:new" : "~/hits.tar" } });
+    fireEvent.click(screen.getByTestId(`${operation}-submit`));
+    await waitFor(() => expect(args(command)).toHaveLength(1));
+    fireEvent.submit(input.closest("form")!);
+    await act(async () => {});
+    expect(args(command)).toHaveLength(1);
+  });
+});
+
 describe("tag", () => {
   it("gives the image the name typed", async () => {
     h.handlers.image_tag = () => undefined;

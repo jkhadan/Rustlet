@@ -122,6 +122,23 @@ describe("a start that fails after the create", () => {
   });
 });
 
+describe("a run already under way", () => {
+  it("ignores another form submission until it completes", async () => {
+    let finish: (value: unknown) => void = () => {};
+    h.handlers.container_create = () => new Promise((resolve) => (finish = resolve));
+    h.handlers.container_start = () => undefined;
+    mount();
+    fireEvent.change(field('input[name="image"]'), { target: { value: "alpine" } });
+    fireEvent.click(screen.getByTestId("run-submit"));
+    await waitFor(() => expect(called("container_create")).toHaveLength(1));
+    fireEvent.submit(field('input[name="image"]').closest("form")!);
+    await act(async () => {});
+    expect(called("container_create")).toHaveLength(1);
+    await act(async () => finish({ id: "c1", name: "web", warnings: [] }));
+    expect(called("container_start")).toHaveLength(1);
+  });
+});
+
 describe("closing", () => {
   it("with Cancel starts the next opening afresh, as closing with Escape or X does", async () => {
     h.handlers.container_create = () => {

@@ -103,6 +103,17 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("stacks", () => {
+  it("ignores another form submission while an up is running", async () => {
+    h.handlers.compose_up = () => new Promise(() => {});
+    mount();
+    fireEvent.click(await screen.findByTestId("stack-up"));
+    await waitFor(() => expect(args("compose_up")).toHaveLength(1));
+    fireEvent.submit(document.querySelector('input[name="file"]')!.closest("form")!);
+    await act(async () => {});
+    expect(args("compose_up")).toHaveLength(1);
+    expect(args("stream_cancel")).toEqual([]);
+  });
+
   it("show each project with what runs, its services' health and ports", async () => {
     mount();
     const card = await screen.findByTestId("stack");
