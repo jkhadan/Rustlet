@@ -129,7 +129,7 @@ the two binaries (their libraries are installed with WebKitGTK and X); point
 virtual display, `E2E_SHOTS=dir` saves a screenshot after each step, and
 `E2E_RESTART='<command>'` adds a daemon restart to the scenario.
 
-For headless WebKit runs, use a language locale such as
-`LC_ALL=en_US.UTF-8` (installed on this development host). With
-`LC_ALL=C.UTF-8`, WebKit reports `navigator.language` as `C`, and uPlot's
-number formatter throws before the app renders.
+WebKit can report a POSIX locale such as `C` when running with
+`LC_ALL=C.UTF-8`. The app validates the browser's language before loading
+charts and falls back to `en-US` for invalid locale tags, so headless runs
+do not need a special language locale.

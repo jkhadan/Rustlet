@@ -2,6 +2,7 @@
 // points redrawn every second costs next to nothing.
 
 import "uplot/dist/uPlot.min.css";
+import "@/lib/locale";
 
 import { useEffect, useRef } from "react";
 import uPlot from "uplot";
