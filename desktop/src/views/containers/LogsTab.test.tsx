@@ -175,6 +175,16 @@ describe("rustletd restarting while the container runs", () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(called("container_logs").length).toBe(1);
   });
+
+  it("follows again when the old stream ends after the daemon already reconnected", async () => {
+    withDaemon(<LogsTab container={container} />);
+    await waitFor(() => expect(watch).toBeDefined());
+    await daemon(connected);
+    await waitFor(() => expect(channels.length).toBe(1));
+    await daemon(connected);
+    await send({ type: "end" });
+    await waitFor(() => expect(called("container_logs")).toHaveLength(2));
+  });
 });
 
 describe("the virtualized log after a filter", () => {

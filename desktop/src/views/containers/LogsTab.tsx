@@ -44,6 +44,8 @@ export function LogsTab({ container }: { container: ContainerInspect }) {
   // read afresh rather than added to, so no line shows twice, and what was
   // logged meanwhile (the shim keeps writing) is in it.
   const { generation } = useDaemon();
+  const latestGeneration = useRef(generation);
+  latestGeneration.current = generation;
   const cut = useRef(false);
   const [reopened, setReopened] = useState(0);
   useEffect(() => {
@@ -64,6 +66,13 @@ export function LogsTab({ container }: { container: ContainerInspect }) {
     setError(null);
     counter.current = 0;
     cut.current = false;
+    // The first connection belongs to the stream opened at app startup.
+    const openedGeneration = Math.max(1, latestGeneration.current);
+    const markCut = () => {
+      cut.current = true;
+      // The watch can reconnect before this connection notices EOF.
+      if (latestGeneration.current > openedGeneration) setReopened((n) => n + 1);
+    };
     // The shim cuts a line longer than 16 KiB into entries, and only the
     // last has the newline; `rustlet logs` prints them back to back. The
     // pieces wait here, per stream, for the one that ends the line (or the
@@ -95,11 +104,11 @@ export function LogsTab({ container }: { container: ContainerInspect }) {
           add(buffer.finish());
           // A follow ends by itself when the container exits, and `live`
           // changing opens the next stream; while it still runs, it was cut.
-          cut.current = following;
+          if (following) markCut();
           setStatus("ended");
         } else {
           add(buffer.finish());
-          cut.current = true;
+          markCut();
           setStatus("error");
           setError(m.error.message);
         }
@@ -113,7 +122,7 @@ export function LogsTab({ container }: { container: ContainerInspect }) {
       })
       .catch((e: unknown) => {
         if (!closed) {
-          cut.current = true;
+          markCut();
           setStatus("error");
           setError(e instanceof Error ? e.message : String(e));
         }

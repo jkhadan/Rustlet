@@ -117,4 +117,15 @@ describe("stats", () => {
     await waitFor(() => expect(called("container_stats").length).toBe(2));
     expect(screen.queryByText(/connection closed/)).toBeNull();
   });
+
+  it("sampling starts again when the old stream fails after the daemon reconnected", async () => {
+    mount();
+    await waitFor(() => expect(watch).toBeDefined());
+    await daemon(connected);
+    await waitFor(() => expect(channels.length).toBe(1));
+    await daemon(connected);
+    await send({ type: "error", error: { kind: "failed", message: "old connection closed" } });
+    await waitFor(() => expect(called("container_stats")).toHaveLength(2));
+    expect(screen.queryByText(/old connection closed/)).toBeNull();
+  });
 });

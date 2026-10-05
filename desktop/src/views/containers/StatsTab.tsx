@@ -25,6 +25,8 @@ export function StatsTab({ container, running }: { container: ContainerInspect; 
   // container still runs); the next connection (a new `generation`) starts
   // the charts again.
   const { generation } = useDaemon();
+  const latestGeneration = useRef(generation);
+  latestGeneration.current = generation;
   const cut = useRef(false);
   const [reopened, setReopened] = useState(0);
   useEffect(() => {
@@ -39,8 +41,15 @@ export function StatsTab({ container, running }: { container: ContainerInspect; 
     setVersion(0);
     setError(null);
     cut.current = false;
-    const fail = (message: string) => {
+    // The first connection belongs to the stream opened at app startup.
+    const openedGeneration = Math.max(1, latestGeneration.current);
+    const markCut = () => {
       cut.current = true;
+      // The watch can reconnect before this connection notices EOF.
+      if (latestGeneration.current > openedGeneration) setReopened((n) => n + 1);
+    };
+    const fail = (message: string) => {
+      markCut();
       setError(message);
     };
     api.containers
@@ -52,7 +61,7 @@ export function StatsTab({ container, running }: { container: ContainerInspect; 
         } else if (m.type === "error") {
           fail(m.error.message);
         } else {
-          cut.current = true;
+          markCut();
         }
       })
       .then((h) => (closed ? h.cancel() : (handle = h)))
