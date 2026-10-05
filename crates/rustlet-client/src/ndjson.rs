@@ -102,6 +102,12 @@ impl<T: DeserializeOwned> State<T> {
                 return None;
             }
             if let Some(line) = self.lines.next_line(self.eof) {
+                // The last frame may both cross the bound and finish the
+                // line; checking only the pending bytes below misses it.
+                if line.len() > MAX_LINE {
+                    self.done = true;
+                    return Some(Err(Error::Protocol(format!("a streamed line is longer than {MAX_LINE} bytes"))));
+                }
                 if line.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }

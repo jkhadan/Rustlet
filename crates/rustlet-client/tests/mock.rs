@@ -353,6 +353,30 @@ async fn ndjson_arrives_line_by_line_and_ends_with_its_error() {
 }
 
 #[tokio::test]
+async fn ndjson_rejects_a_line_that_crosses_its_limit_in_the_final_chunk() {
+    async fn logs() -> Response {
+        // A complete default entry padded to exactly the line limit. The
+        // final chunk makes it too long and supplies the newline together.
+        let mut first = b"{}".to_vec();
+        first.resize(16 << 20, b' ');
+        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+        tokio::spawn(async move {
+            tx.send(Ok(Bytes::from(first))).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tx.send(Ok(Bytes::from_static(b" \n"))).await.unwrap();
+        });
+        let body = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|chunk| (chunk, rx)) });
+        ([(header::CONTENT_TYPE, rustlet_spec::NDJSON)], Body::from_stream(body)).into_response()
+    }
+    let (_dir, client) = serve(Router::new().route(&routes::pattern::container_action("logs"), get(logs)));
+    let mut entries = within(client.logs("web", &LogsQuery::default())).await.unwrap();
+    assert!(
+        matches!(within(entries.next()).await, Some(Err(Error::Protocol(message))) if message.contains("longer than"))
+    );
+    assert!(within(entries.next()).await.is_none());
+}
+
+#[tokio::test]
 async fn dropping_a_stream_hangs_up() {
     // An endless stream (`events`): the only way to end it is to drop it,
     // and the daemon must see that, or it would feed a dead client forever.
