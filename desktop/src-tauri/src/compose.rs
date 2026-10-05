@@ -13,7 +13,7 @@
 //!  compose_up(files, name, dir) ──► load (the app's environment, .env)
 //!            ◄── stream id ──────── Compose::up, in a task of its own ─► networks, volumes, pulls,
 //!  onmessage({items: [progress]}) ◄─ ComposeEvents, batched                builds, containers
-//!  compose_down(project) ─────────► run::down_project ────────────────► stop, rm, network rm
+//!  compose_down(project) ────────► load current known files, down ──► stop, rm, network rm
 //! ```
 //!
 //! The library's types aren't `Serialize` (they are its own, not the
@@ -267,14 +267,37 @@ impl DownNotes {
     }
 }
 
-/// `compose -p PROJECT down`: the project's containers and networks, found
-/// by their labels (no file needed), and with `volumes` its volumes. The
-/// warnings it gives are the result: what stayed, and why.
+/// Removes a stack, loading its recorded files first so that current
+/// external declarations protect resources an earlier up created. Known
+/// files must be readable and valid before teardown begins. A stack with
+/// no recorded files is removed by its labels, as fileless CLI down is.
+/// The warnings it gives are the result: what stayed, and why.
 pub async fn down(client: &Client, project: &str, volumes: bool) -> CommandResult<Vec<String>> {
-    let options = DownOptions { volumes, ..DownOptions::default() };
+    let options = DownOptions { volumes, remove_orphans: true, ..DownOptions::default() };
     let notes = DownNotes::default();
     let log = |event: ComposeEvent| notes.note(project, event);
-    rustlet_compose::run::down_project(client, project, &options, &log).await.map_err(error)?;
+    let known = rustlet_compose::run::stacks(client)
+        .await
+        .map_err(error)?
+        .into_iter()
+        .find(|stack| stack.name == project && !stack.config_files.is_empty());
+    match known {
+        Some(stack) => {
+            let mut load = load_options(&stack.config_files, Some(project.to_owned()), stack.working_dir, app_env())?;
+            // Removing the whole stack includes containers started with
+            // profiles, regardless of the app's current environment.
+            load.profiles = vec!["*".into()];
+            let project = tokio::task::spawn_blocking(move || rustlet_compose::load(&load))
+                .await
+                .map_err(|e| CommandError::failed(format!("loading the compose file failed: {e}")))?
+                .map_err(error)?;
+            for warning in &project.warnings {
+                log(ComposeEvent::Warning(warning.clone()));
+            }
+            rustlet_compose::Compose::new(client.clone(), project).down(&options, &log).await.map_err(error)?;
+        }
+        None => rustlet_compose::run::down_project(client, project, &options, &log).await.map_err(error)?,
+    }
     Ok(notes.into_warnings())
 }
 

@@ -42,9 +42,11 @@ e2e/             a WebDriver client and the lifecycle scenario
   lines say how many characters were discarded.
 - **Stacks**: the compose projects the daemon has containers of, found by their
   labels (the daemon knows no projects), live from the daemon's events: what runs,
-  each service's containers, health and ports. *Down* removes a project's
-  containers and networks (and, if asked, its volumes; what stays because
-  something else uses it is said in a warning); *Up* brings it up again from the
+  each service's containers, health and ports. *Down* reads the current recorded
+  files to protect external resources, then removes the project's containers
+  and networks (and, if asked, its volumes; what stays because something else
+  uses it is said in a warning). Known missing or invalid files stop teardown
+  before any resources change. *Up* brings it up again from the
   files its labels name; *Up from file* takes a compose file's path, and shows
   what loading it noted (an unset `${VAR}`, an ignored key) before the progress.
 - **Build**: a context directory, its Containerfile, names, build args, target;
