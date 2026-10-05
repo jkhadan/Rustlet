@@ -65,8 +65,11 @@ pub fn list(root: &Path) -> Result<Vec<State>> {
 /// signal is sent PID by PID from `cgroup.procs`, with the cgroup *frozen*
 /// meanwhile (as runc does): a frozen process can't fork or exit, so the list
 /// can't go stale while we walk it and no PID can be recycled under us.
+/// Child cgroups are included for every signal.
 pub fn kill(root: &Path, id: &str, sig: Signal, all: bool) -> Result<()> {
-    let (_dir, state) = load(root, id)?;
+    let dir = StateDir::new(root, id)?;
+    let _lock = dir.lock()?;
+    let state = dir.load()?;
     if state.status == Status::Stopped {
         return Err(wrong_status(&state, "kill"));
     }
@@ -76,19 +79,31 @@ pub fn kill(root: &Path, id: &str, sig: Signal, all: bool) -> Result<()> {
         if sig == Signal::SIGKILL {
             return cg.kill();
         }
-        let was_frozen = cg.is_frozen()?;
-        if !was_frozen {
-            cg.freeze(FREEZE_TIMEOUT)?;
-        }
-        let mut result = Ok(());
-        for pid in cg.procs()? {
-            match nix::sys::signal::kill(pid, sig) {
-                Ok(()) | Err(Errno::ESRCH) => {}
-                Err(e) => result = Err(e).with_context(|| format!("kill {pid}")),
+        let was_frozen = cg.read("cgroup.freeze")? == "1";
+        // A prior request may still be in progress: wait for confirmed
+        // freezing in either case before trusting the process list.
+        cg.freeze(FREEZE_TIMEOUT).inspect_err(|_| {
+            if !was_frozen {
+                let _ = cg.thaw(FREEZE_TIMEOUT);
             }
-        }
+        })?;
+        let result = (|| {
+            let mut result = Ok(());
+            for pid in cg.all_procs()? {
+                match nix::sys::signal::kill(pid, sig) {
+                    Ok(()) | Err(Errno::ESRCH) => {}
+                    Err(e) => result = Err(e).with_context(|| format!("kill {pid}")),
+                }
+            }
+            result
+        })();
         if !was_frozen {
-            cg.thaw(FREEZE_TIMEOUT)?;
+            // Restore the original state even if listing or signalling
+            // failed; otherwise `kill --all` silently pauses the container.
+            let thawed = cg.thaw(FREEZE_TIMEOUT);
+            result?;
+            thawed?;
+            return Ok(());
         }
         return result;
     }
@@ -171,7 +186,7 @@ pub fn ps(root: &Path, id: &str) -> Result<Vec<Pid>> {
         return Ok(Vec::new());
     }
     match state.cgroup()? {
-        Some(cg) => cg.procs(),
+        Some(cg) => cg.all_procs(),
         None => Ok(vec![state.init_pid()]),
     }
 }

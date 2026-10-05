@@ -252,6 +252,31 @@ fn collect_children(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Process IDs from a cgroup directory, including any child cgroups.
+fn subtree_procs(dir: &Path) -> Result<Vec<Pid>> {
+    let mut dirs = vec![dir.to_owned()];
+    collect_children(dir, &mut dirs).with_context(|| format!("list child cgroups of {}", dir.display()))?;
+    let mut pids = BTreeSet::new();
+    for member in dirs {
+        let file = member.join("cgroup.procs");
+        let text = match std::fs::read_to_string(&file) {
+            Ok(text) => text,
+            // A threaded child has no readable cgroup.procs: its process
+            // IDs are reported by the ancestor threaded domain instead.
+            Err(e) if member != dir && errno_of(&e) == Some(Errno::EOPNOTSUPP) => continue,
+            Err(e) => return Err(e).with_context(|| format!("read {}", file.display())),
+        };
+        for line in text.lines() {
+            let pid = line
+                .trim()
+                .parse::<i32>()
+                .map_err(|_| stats::invalid_data(format!("parse {}", file.display()), format!("bad PID {line:?}")))?;
+            pids.insert(pid);
+        }
+    }
+    Ok(pids.into_iter().map(Pid::from_raw).collect())
+}
+
 /// cgroups under a systemd-delegated subtree (`trusted.delegate="1"`).
 ///
 /// Reading `trusted.*` xattrs needs `CAP_SYS_ADMIN`; without it the kernel
@@ -611,6 +636,13 @@ impl Cgroup {
             .collect()
     }
 
+    /// PIDs (host view) of every process in this cgroup and its descendants.
+    /// Freeze the subtree first when using this list to send signals, so
+    /// processes cannot exit, fork or move between the reads and signals.
+    pub fn all_procs(&self) -> Result<Vec<Pid>> {
+        subtree_procs(&self.path.host_path())
+    }
+
     /// Moves process `pid` (all its threads) into this cgroup by writing
     /// it to `cgroup.procs`. Children it forks later start here too.
     pub fn add_process(&self, pid: Pid) -> Result<()> {
@@ -785,6 +817,21 @@ mod tests {
 
     fn p(s: &str) -> CgroupPath {
         CgroupPath::parse(s).unwrap()
+    }
+
+    #[test]
+    fn subtree_processes_include_nested_cgroups_and_deduplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child");
+        let grandchild = child.join("grandchild");
+        std::fs::create_dir_all(&grandchild).unwrap();
+        for (path, text) in [(dir.path(), "12\n"), (&child, "34\n12\n"), (&grandchild, "56\n")] {
+            std::fs::write(path.join("cgroup.procs"), text).unwrap();
+        }
+        assert_eq!(subtree_procs(dir.path()).unwrap().iter().map(|p| p.as_raw()).collect::<Vec<_>>(), [12, 34, 56]);
+        std::fs::write(grandchild.join("cgroup.procs"), "invalid\n").unwrap();
+        let error = subtree_procs(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("grandchild/cgroup.procs") && error.contains("invalid"), "{error}");
     }
 
     #[test]

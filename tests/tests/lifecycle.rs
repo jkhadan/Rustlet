@@ -284,6 +284,48 @@ fn lc_kill_all_signals_every_process() {
     c.wait_for_status("stopped", PROMPT);
 }
 
+#[test]
+#[ignore = "needs root: run with `cargo xtask itest`"]
+fn lc_kill_all_and_ps_include_descendant_cgroups() {
+    for paused in [false, true] {
+        let mut s = sh("sleep 3600 & sleep 3600 & wait; touch /mnt/children-gone; while :; do sleep 0.1; done");
+        let host = bind_host_dir(&mut s, "/mnt");
+        let cg = set_cgroup(&mut s, "lc-kill-descendants");
+        let c = Container::started(&s);
+        wait_until("init and its two children", PROMPT, || cgroup_procs(&cg).len() == 3);
+        let child = cgroup_procs(&cg).into_iter().find(|&pid| pid != c.pid()).unwrap();
+        let nested = cgroup_dir(&cg).join("child/grandchild");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("cgroup.procs"), child.to_string()).unwrap();
+        assert_eq!(cgroup_procs(&cg).len(), 2);
+
+        // A threaded domain reports its processes itself; its threaded
+        // children reject cgroup.procs reads with EOPNOTSUPP.
+        let threaded = cgroup_dir(&cg).join("thread-domain/threaded");
+        std::fs::create_dir_all(&threaded).unwrap();
+        std::fs::write(threaded.join("cgroup.type"), "threaded").unwrap();
+
+        let out = c.cmd(&["ps", "--format", "json"]);
+        let pids = parse_json(out.ok(), "ps --format json");
+        assert!(pids.as_array().unwrap().iter().any(|pid| pid.as_i64() == Some(i64::from(child))), "{pids:?}");
+
+        if paused {
+            c.cmd(&["pause"]).ok();
+        }
+        c.kill(true, Some("TERM")).ok();
+        assert_eq!(cgroup_read(&cg, "cgroup.freeze"), if paused { "1" } else { "0" });
+        if paused {
+            assert_eq!(c.status(), "paused");
+            c.cmd(&["resume"]).ok();
+        }
+        wait_until("the child in a nested cgroup to die", PROMPT, || host.path().join("children-gone").exists());
+        c.kill(true, Some("KILL")).ok();
+        c.wait_for_status("stopped", PROMPT);
+        c.delete(false).ok();
+        assert!(!cgroup_dir(&cg).exists(), "delete left a descendant cgroup behind");
+    }
+}
+
 // ── list ─────────────────────────────────────────────────────────────────────
 
 #[test]
