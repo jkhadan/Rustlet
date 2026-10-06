@@ -212,12 +212,7 @@ fn review_a_user_overlay_attribute_is_the_containers_data() {
         c.start(&id).await.unwrap();
         // As a process in the container would: through its overlay.
         let etc = d.data.join("containers").join(&id).join("rootfs/etc");
-        let set = std::process::Command::new("setfattr")
-            .args(["-n", "user.overlay.opaque", "-v", "y"])
-            .arg(&etc)
-            .status()
-            .unwrap();
-        assert!(set.success());
+        rustlet_sys::xattr::lset(&etc, "user.overlay.opaque", b"y").unwrap();
         let request = CommitRequest { container: id.clone(), reference: Some("marked".into()), ..Default::default() };
         c.commit(&request).await.unwrap();
         c.remove_container(&id, true).await.unwrap();
